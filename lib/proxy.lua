@@ -16,8 +16,8 @@ API (docs/proxy.md section 4):
     proxy.buildConnect(opts)      -> request, requestRedacted
     proxy.newHandshake(opts)      -> hs
       hs.request / hs.requestRedacted
-      hs:feed(chunk [, nowMs])    -> status[, a[, b]]
-      hs:tick(nowMs)              -> status[, a[, b]]
+      hs:feed(chunk [, nowMs])    -> status, a, b
+      hs:tick(nowMs)              -> status, a, b
       hs:eof()                    -> 'error', msg, 'closed'
       hs.leftover                 -- early tunnel bytes once status == 'connected'
       hs.status hs.reason hs.statusLine hs.headers hs.headerList hs.realm

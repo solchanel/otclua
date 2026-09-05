@@ -96,6 +96,10 @@ snapshot(ms) -> table
   lootItems / wasteItems / killsByName (breakdowns), samplesBySeries,
   samplesDropped, outOfOrder.
 
+`lootItems`, `wasteItems` and `killsByName` are the engine's own tables, handed
+out by reference so that snapshot() stays allocation-light: read them, never
+write them.  Everything else in the snapshot is a fresh value.
+
 `moneySource` says where moneyPerHour came from: 'gold' when the caller feeds
 sampleBalance (real cash on hand -- coins looted minus coins spent, which is
 what PANEL.md's money/h asks for), 'balance' when it does not and the loot-minus-
@@ -115,9 +119,11 @@ local Ring = {}
 Ring.__index = Ring
 
 local function ringNew(maxN)
+    maxN = maxN or 20000
     return setmetatable({
-        cap = 8, n = 0, head = 0,        -- head is 0-based; slot = (head+i)%cap+1
-        maxN = maxN or 20000,
+        cap = (maxN < 8) and maxN or 8,  -- head is 0-based; slot = (head+i)%cap+1
+        n = 0, head = 0,
+        maxN = maxN,
         t = {}, a = {}, b = {},
         dropped = 0,
     }, Ring)
@@ -633,5 +639,4 @@ function M.loadPrices(path, decodeJson)
     return M.decodePrices(text, decodeJson)
 end
 
-M.Ring = nil   -- internal; not part of the contract
 return M

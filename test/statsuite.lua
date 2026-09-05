@@ -19,6 +19,7 @@ wall time and nothing ever sleeps.  Exits non-zero if any check fails.
   S10 the price table: JSON text, Lua text, a real file, junk
   S11 clock guards: out-of-order timestamps, junk arguments
   S12 reset() and sessionStart()
+  S13 the module defines no globals
 ============================================================================]]
 
 local ROOT
@@ -80,7 +81,9 @@ do
     near(snap.expPerHourSession, 1000000, 2000, 'expPerHourSession is ~1M/h')
     eq(snap.spanMs.exp, 15 * 60 * 1000, 'the window span is exactly 15 min once full')
     eq(snap.sessionMs, 30 * 60 * 1000, 'sessionMs is the real session length')
-    near(snap.expGained, 500000, 2, 'expGained == 30 min at 1M/h')
+    -- 499,723 exactly: the gain is measured from the FIRST sample, and that
+    -- sample already carried one second's worth of experience (277).
+    eq(snap.expGained, 499723, 'expGained == 30 min at 1M/h, minus the first sample')
     eq(snap.expTotal, EXP0 + math.floor(30 * 60 * perSec), 'expTotal is the raw value fed in')
     eq(snap.deaths, 0, 'no deaths')
     check(snap.samplesBySeries.exp >= 899 and snap.samplesBySeries.exp <= 903,
@@ -100,34 +103,41 @@ head('S2  a level-up mid-window')
 do
     eq(stats.expForLevel(2), 100, 'expForLevel(2) == 100 (vBot expLeft formula)')
     eq(stats.expForLevel(8), 4200, 'expForLevel(8) == 4200')
-    eq(stats.expForLevel(9), 6000, 'expForLevel(9) == 6000')
+    eq(stats.expForLevel(9), 6400, 'expForLevel(9) == 6400')
 
     local s = stats.new{ window = 15 * 60 * 1000 }
     s:sessionStart(BASE)
-    -- start just below level 9 and cross it: total experience never drops
-    local exp = stats.expForLevel(9) - 300
-    s:sampleLevel(BASE, 8, 90)
-    local before, after, t
+    -- level 20 climbing at 100 exp/s == 360,000 exp/h; level 21 needs 17,200
+    -- more, so the first ding lands ~3 minutes in, well past minSpanMs.
+    local level = 20
+    local exp = stats.expForLevel(level) + 100
+    s:sampleLevel(BASE, level, 0)
+    local before, after, dingT, t
     for sec = 1, 20 * 60 do
         t = BASE + sec * 1000
-        exp = exp + 10                       -- 36,000 exp/h, dead steady
+        exp = exp + 100
         s:sampleExperience(t, exp)
-        if exp >= stats.expForLevel(9) and s.level == 8 then
-            s:sampleLevel(t, 9, 0)
-            before = s:snapshot(t - 1000)
-            after  = s:snapshot(t)
+        while exp >= stats.expForLevel(level + 1) do
+            level = level + 1
+            if not before then before, dingT = s:snapshot(t), t end
+            s:sampleLevel(t, level, 0)
+            if not after then after = s:snapshot(t) end
         end
     end
     check(before ~= nil, 'the level-up happened inside the run')
-    eq(before.level, 8, 'level 8 before the ding')
-    eq(after.level, 9, 'level 9 after the ding')
-    check(after.expPerHour >= before.expPerHour * 0.99,
-          'the exp rate does not dip across the level-up',
-          ('%s -> %s'):format(fmt(before.expPerHour), fmt(after.expPerHour)))
+    check(dingT - BASE >= 60000, '   and after the minimum measurable span',
+          (dingT - BASE) .. ' ms')
+    eq(before.level, 20, 'level 20 before the ding')
+    eq(after.level, 21, 'level 21 after the ding')
+    eq(after.expPerHour, before.expPerHour,
+       'the exp rate does not blink across the level-up')
+    -- ~358k, not 360k: the window is only ~3 min old and its first sample
+    -- already carried one second of experience.  That is the honest number.
+    near(after.expPerHour, 360000, 2500, '   and is the true 360k/h at the ding')
     local snap = s:snapshot(t)
-    eq(snap.levelsGained, 1, 'levelsGained == 1')
-    near(snap.expPerHour, 36000, 60, 'the window rate is the true 36k/h')
-    eq(snap.expToLevel, stats.expForLevel(10) - snap.expTotal,
+    eq(snap.levelsGained, level - 20, 'levelsGained tracks every ding')
+    near(snap.expPerHour, 360000, 700, 'the window rate is the true 360k/h')
+    eq(snap.expToLevel, stats.expForLevel(snap.level + 1) - snap.expTotal,
        'expToLevel == expForLevel(level+1) - exp   (analyzer.lua expLeft)')
     near(snap.timeToLevelMs, snap.expToLevel * 3600000 / snap.expPerHour, 1,
          'timeToLevelMs == expToLevel / exp-per-hour')
@@ -138,9 +148,9 @@ do
     -- percent-only estimate, when no absolute experience was ever sampled
     local p = stats.new{}
     p:sessionStart(BASE)
-    p:sampleLevel(BASE, 8, 50)
+    p:sampleLevel(BASE, 20, 50)
     local ps = p:snapshot(BASE + 1000)
-    eq(ps.expToLevel, math.floor((stats.expForLevel(9) - stats.expForLevel(8)) * 0.5),
+    eq(ps.expToLevel, math.floor((stats.expForLevel(21) - stats.expForLevel(20)) * 0.5),
        'without an exp sample, expToLevel falls back to the level percentage')
 end
 
@@ -171,7 +181,7 @@ do
           fmt(at.expPerHour))
     check(at.expPerHourSession >= 0, 'session exp/h is not negative either',
           fmt(at.expPerHourSession))
-    near(at.expGained, 6000, 1, 'the drop did not subtract from expGained')
+    eq(at.expGained, 5990, 'the drop did not subtract from expGained')
     eq(at.expLost, 500000, 'the lost experience is reported separately')
 
     -- and it keeps working afterwards, measured from the NEW total
@@ -189,7 +199,7 @@ do
     check(worst >= 0, 'exp/h never went negative anywhere after the death', fmt(worst))
     local post = s:snapshot(t)
     near(post.expPerHour, 36000, 60, 'the rate is back to the true 36k/h ten minutes later')
-    near(post.expGained, 12000, 2, 'expGained counts only real gains')
+    eq(post.expGained, 11990, 'expGained counts only real gains')
     note(('at death: exp/h=%s  gained=%d  lost=%d  |  10 min later: exp/h=%s')
          :format(fmt(at.expPerHour), at.expGained, at.expLost, fmt(post.expPerHour)))
 
@@ -435,6 +445,12 @@ do
     note(('frozen clock: 30,000 pushes -> %d retained, %d dropped')
          :format(ps.samplesBySeries.exp, ps.samplesDropped))
 
+    -- a tiny cap must still be respected (the ring starts smaller than 8)
+    local tiny = stats.new{ window = 15 * 60 * 1000, maxSamples = 4 }
+    tiny:sessionStart(BASE)
+    for i = 1, 50 do tiny:sampleExperience(BASE, i) end
+    eq(tiny:snapshot(BASE).samplesBySeries.exp, 4, 'maxSamples = 4 is honoured exactly')
+
     -- amortised O(1): the second 50k samples must not cost more than the first
     local a = stats.new{ window = 15 * 60 * 1000 }
     a:sessionStart(BASE)
@@ -498,6 +514,9 @@ do
     s:sessionStart(BASE)
     s:addLoot(BASE + 1000, 3035, 7)
     eq(s:snapshot(BASE + 1000).loot, 700, 'the price table drives addLoot')
+    s:setPrices{ [3035] = 250 }
+    s:addLoot(BASE + 2000, 3035, 2)
+    eq(s:snapshot(BASE + 2000).loot, 1200, 'setPrices() changes later valuations only')
 end
 
 --=============================================================================
@@ -512,9 +531,10 @@ do
     eq(snap.expGained, 1000, '   and still accounted for at the clamped time')
     check(snap.expPerHour >= 0, '   with a sane rate', fmt(snap.expPerHour))
 
-    local before = s:snapshot(BASE + 120000)
     local behind = s:snapshot(BASE + 1)                -- snapshot in the past
-    eq(behind.sessionMs, before.sessionMs, 'snapshot() never travels backwards')
+    eq(behind.sessionMs, 10000, 'a snapshot older than the newest sample clamps to it')
+    eq(s:snapshot(BASE + 120000).sessionMs, 120000,
+       '   and reading the past does not move the clock for the next read')
 
     -- junk arguments are ignored, not fatal
     s:sampleExperience(nil, 5)
@@ -565,6 +585,33 @@ do
     eq(fresh.sessionMs, 60000, 'sessionStart() re-anchors the session clock')
     near(fresh.lootPerHour, 36000, 1, '   and the new window measures from there')
     eq(fresh.loot, 600, '   with only the new totals')
+end
+
+--=============================================================================
+head('S13 no globals')
+do
+    local created = {}
+    setmetatable(_G, { __newindex = function(t, k, v)
+        created[#created + 1] = tostring(k); rawset(t, k, v)
+    end })
+    package.loaded['lib.stats'] = nil
+    local fresh = require('lib.stats')          -- re-run the chunk under the guard
+    local s = fresh.new{ window = 60000, prices = { [3031] = 1 } }
+    s:sessionStart(1)
+    s:sampleExperience(2, 10)
+    s:sampleLevel(3, 8, 10)
+    s:addLoot(4, 3031, 5)
+    s:addWaste(5, 268, 1, 50)
+    s:addKill(6, 'Rat')
+    s:addDeath(7)
+    s:sampleBalance(8, 100)
+    s:snapshot(9)
+    s:reset()
+    fresh.decodePrices('{ [1] = 2 }')
+    fresh.expForLevel(30)
+    setmetatable(_G, nil)
+    check(#created == 0, 'lib/stats.lua touches no globals, in any code path',
+          table.concat(created, ', '))
 end
 
 --=============================================================================

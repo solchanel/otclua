@@ -1621,6 +1621,27 @@ end
 -- ---------------------------------------------------------------------------
 -- function waypoint (actions.lua:325-343)
 -- ---------------------------------------------------------------------------
+--- vBot scripts call these with a DOT (`TargetBot.setOn()`, `CaveBot.delay(500)`) because
+--- upstream CaveBot/TargetBot are plain tables of functions.  Ours are OO instances, so a
+--- dot call would pass the first argument as `self`.  This proxy binds the receiver and
+--- still tolerates a colon call, so both spellings work inside a `function` waypoint.
+--- (The user's real routes use `TargetBot.setOn()` / `TargetBot.setOff()` -- 8 sites.)
+local function dotProxy(obj)
+    if type(obj) ~= 'table' then return nil end
+    return setmetatable({}, {
+        __index = function(_, k)
+            local v = obj[k]
+            if type(v) ~= 'function' then return v end
+            return function(...)
+                if select('#', ...) > 0 and select(1, ...) == obj then return v(...) end
+                return v(obj, ...)
+            end
+        end,
+        __newindex = function(_, k, v) obj[k] = v end,
+    })
+end
+cavebot.dotProxy = dotProxy
+
 function CB:_actionFunction(src, retries, prev)
     local ctx = self.bot and self.bot.api
     local cb = self
@@ -1631,8 +1652,8 @@ function CB:_actionFunction(src, retries, prev)
         gotoLabel = function(n) return cb:gotoLabel(n) end,
         macro     = function() cb.log.warn('[CaveBot] macro() is not available inside a '
                                            .. 'function waypoint') end,
-        CaveBot   = cb,
-        TargetBot = (cb.bot and cb.bot.modules and cb.bot.modules.targetbot) or {
+        CaveBot   = dotProxy(cb),
+        TargetBot = dotProxy(cb.bot and cb.bot.modules and cb.bot.modules.targetbot) or {
             setOn = function() end, setOff = function() end, isOn = function() return false end,
         },
     }, { __index = function(_, k)

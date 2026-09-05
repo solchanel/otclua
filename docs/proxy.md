@@ -70,7 +70,9 @@ Proxy-Connection: keep-alive\r\n
 \r\n
 ```
 
-For a target of `game.example.net:7171` with no credentials, the literal 92 bytes are:
+For a target of `game.example.net:7171` with no credentials, the literal 123 bytes are (this
+hexdump is produced by `luajit test/proxysuite.lua --dump`, which also asserts that
+`lib/proxy.lua` emits exactly it):
 
 ```
 43 4F 4E 4E 45 43 54 20 67 61 6D 65 2E 65 78 61   CONNECT game.exa
@@ -84,11 +86,16 @@ For a target of `game.example.net:7171` with no credentials, the literal 92 byte
 ```
 
 With credentials `bob` / `s3cr3t`, one more header is inserted between `Proxy-Connection` and the
-terminating blank line:
+terminating blank line, taking the request to 168 bytes:
 
 ```
-Proxy-Authorization: Basic Ym9iOnMzY3IzdA==\r\n
+70 2D 61 6C 69 76 65 0D 0A 50 72 6F 78 79 2D 41   p-alive..Proxy-A
+75 74 68 6F 72 69 7A 61 74 69 6F 6E 3A 20 42 61   uthorization: Ba
+73 69 63 20 59 6D 39 69 4F 6E 4D 7A 59 33 49 7A   sic Ym9iOnMzY3Iz
+64 41 3D 3D 0D 0A 0D 0A                           dA==....
 ```
+
+i.e. `Proxy-Authorization: Basic Ym9iOnMzY3IzdA==\r\n`.
 
 There is **no** `Content-Length`, **no** `Connection`, **no** `Accept`, and no body. The header
 block ends with a bare `\r\n` (i.e. `...keep-alive\r\n\r\n`).

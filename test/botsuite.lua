@@ -755,6 +755,90 @@ do
 end
 
 -- ============================================================================
+S('a `function` waypoint sees the bot api, and TargetBot/CaveBot are DOT-callable')
+do
+    -- the user's real routes call `TargetBot.setOn()` / `TargetBot.setOff()` with a dot
+    -- (8 sites across cavebot_configs/*.cfg); our modules are OO instances, so the
+    -- sandbox has to bind the receiver or every one of those waypoints would raise.
+    local F = newWorld({ '..@..' })
+    local H = newHost(F, { wire = {
+        cavebot = { waypoints = {
+            { action = 'function', value = 'TargetBot.setOff()\nreturn true' },
+            { action = 'function', value = 'TargetBot.setOn()\nCaveBot.delay(10)\nreturn true' },
+            { action = 'function', value = 'storage.__probe = { hp(), pos().z, true }\nreturn true' },
+            { action = 'label', value = 'end' } },
+            config = { stayPathEnabled = false, antiLostEnabled = false } },
+        enableCavebot = true,
+        targetbot = { targeting = { { name = 'Dragon', priority = 1 } }, looting = {} },
+        enableTargetbot = true } })
+
+    eq(H.tb:isOn(), true, 'TargetBot starts on')
+    for _ = 1, 40 do
+        H:tick(1, 60)
+        if H.cb.index >= 4 then break end
+    end
+    ok(H.cb.index >= 3, 'the three function waypoints ran (index ' .. H.cb.index .. ')')
+    eq(H.tb:isOn(), true, 'TargetBot.setOff() then .setOn() left it on -- the DOT call worked')
+    eq(H.bot.stats.macroErrors, 0, 'and nothing raised')
+    local probe = H.bot.storage.__probe
+    ok(probe ~= nil, 'the sandbox exposes the bot/api.lua surface')
+    if probe then
+        eq(probe[1], 1000, 'hp() inside the waypoint')
+        eq(probe[2], 7, 'pos().z inside the waypoint')
+        eq(probe[3], true, 'storage is the bot storage, and writable from a waypoint')
+    end
+    H.bot.storage.__probe = nil
+
+    -- a broken body is contained, warned about, and the route keeps going
+    local G = newWorld({ '..@..' })
+    local H2 = newHost(G, { wire = {
+        cavebot = { waypoints = {
+            { action = 'function', value = 'this is not lua(' },
+            { action = 'label', value = 'end' } },
+            config = { stayPathEnabled = false, antiLostEnabled = false } },
+        enableCavebot = true } })
+    for _ = 1, 20 do H2:tick(1, 60) end
+    eq(H2.bot.stats.macroErrors, 0, 'a syntax error in a function waypoint kills nothing')
+end
+
+-- ============================================================================
+S('client -> bot contract fields the modules read off game/state.lua')
+do
+    local F = newWorld({ '.....', '..@..', '.....' })
+    local H = newHost(F)
+
+    -- proto/parser.lua 0x17 now publishes the server beat; walker:stepDuration rounds to it
+    H.st.serverBeat = 50
+    local d50 = H.bot.walker:stepDuration(1)
+    H.st.serverBeat = 200
+    local d200 = H.bot.walker:stepDuration(1)
+    ok(d50 % 50 == 40 or d50 > 0, 'stepDuration with beat 50 = ' .. tostring(d50))
+    ok(d200 ~= d50, 'a different serverBeat gives a different step duration ('
+                    .. tostring(d200) .. ')')
+    H.st.serverBeat = nil
+
+    -- state.ping (main.lua measures it off the 0x1E pong) reaches the walker
+    H.st.ping = 275
+    eq(H.bot.walker:pingMs(), 275, 'walker:pingMs() reads state.ping')
+    H.st.ping = nil
+    ok(H.bot.walker:pingMs() > 0, 'and falls back to the configured ping when absent')
+
+    -- proto/parser.lua 0x7A now keeps the NPC offer list; cavebot's buysupplies reads it
+    H.st.npcTrade = { open = true, items = {
+        { id = 3031, subType = 0, name = 'gold coin', buyPrice = 1, sellPrice = 1, weight = 10 },
+        { id = 23374, subType = 0, name = 'potion', buyPrice = 50, sellPrice = 25, weight = 100 } } }
+    local offers = H.cb:npcOffers()
+    ok(type(offers) == 'table' and #offers == 2, 'CaveBot sees the NPC offer list')
+    eq(H.cb:npcTradeOpen(), true, 'and knows the trade window is open')
+    H.st.npcTrade = { open = false, items = {} }
+    eq(H.cb:npcTradeOpen(), false, 'and that it closed')
+
+    -- state.inventoryCounts (opcode 0xC0) is what makes a CLOSED backpack count
+    H.st.inventoryCounts = { [23374 * 256] = 412 }
+    eq(H.sup:itemAmount(23374), 412, 'supplies counts the server-side inventory total')
+end
+
+-- ============================================================================
 S('bot/api.lua exposes the BOT.md script surface')
 do
     local F = newWorld({ '..@..' })

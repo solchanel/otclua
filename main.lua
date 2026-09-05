@@ -282,7 +282,10 @@ local function botStatusLine()
     end
 
     local sup = st.supplies
-    if sup and sup.refill then parts[#parts + 1] = 'refill: ' .. tostring(sup.refill) end
+    if sup and sup.rounds then
+        parts[#parts + 1] = ('supplies round %s%s'):format(tostring(sup.rounds),
+            sup.pouchPages and (', pouch ' .. tostring(sup.pouchPages) .. 'p') or '')
+    end
 
     log.info('bot: %s', table.concat(parts, ' | '))
 end
@@ -565,7 +568,7 @@ local function runDryRun(cfg)
         local b = LC.bot
         local macros = #b._macros
         for _ = 1, 50 do b:tick() end
-        botStatusLine()
+        if (cfg.botStatusMs or 5000) > 0 then botStatusLine() end
         log.info('dry-run: bot wired -- %d macros, %d ticks, %d macro errors, world %s',
                  macros, b.stats.ticks, b.stats.macroErrors,
                  tostring(b.world and b.world.itemDataLevel))

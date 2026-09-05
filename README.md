@@ -5,14 +5,18 @@ A standalone **LuaJIT** worker client for **Gunzodus** (Tibia protocol **1530**,
 No otclient at runtime, no C++, no OpenGL, no audio, no external Lua modules — one LuaJIT
 interpreter, FFI for the Windows APIs, and the pure-Lua protocol stack in this directory.
 It logs in over HTTPS, connects to the game world, completes the login handshake, keeps the
-session alive and parses every server packet into a game state plus an event bus.
+session alive and parses every server packet into a game state plus an event bus. On top of that
+sits a **bot layer that reproduces vBot 4.8's behaviour** — HealBot, AttackBot, CaveBot,
+TargetBot with looting and supplies — with no UI, reading the user's existing vBot config files
+unchanged. See [Bot layer](#bot-layer).
 
 The byte-level truth for every wire detail lives in [`docs/`](docs/); the module contract every
 file is written against is [`API.md`](API.md). In each doc the **`## VERIFIER (Corrections)`
 section overrides the spec body above it**.
 
-**Current status (measured 2026-09-05, both OSes):** `--selftest` **401 passed / 0 failed** on
-Windows 11 x64 and on Debian 13 x64 (WSL2). The offline end-to-end test — the real `main.lua`
+**Current status (measured 2026-09-06, both OSes):** `--selftest` **2184 passed / 0 failed** on
+Windows 11 x64 and on Debian 13 x64 (WSL2) — 401 client assertions plus 1783 in the bot layer
+(`test/botsuite.lua`, which also embeds the six per-module suites). The offline end-to-end test — the real `main.lua`
 logging into `test/fakeserver.lua` over a real loopback socket — is **37 checks / 0 failed** on
 both. The live HTTPS login is verified against `www.gunzodus.net` with an invalid account on
 both: it prints the server's own message and exits **2**. **No real authenticated game session
@@ -53,7 +57,13 @@ luajit main.lua --account=... --password=...
 | `--log-file=PATH` | append every log line to a file as well (flushed per line) |
 | `--capture=PATH` | append every inbound payload as a `.cam` `<` record (replayable) |
 | `--ping=MS` | keepalive interval, default `10000` |
-| `--dry-run` | offline wiring check: no sockets, no HTTPS |
+| `--bot` | enable the bot layer once the server says we are in the game |
+| `--bot-profile=DIR` | vBot profile directory. Default: the `vBot_4.8` profile next to this checkout when it exists, else `./profiles`. `LUACLIENT_BOT_PROFILE` overrides |
+| `--bot-vprofile=N` | selects `vBot_configs/profile_<N>` and `storage/profile_<N>.json` (default 1) |
+| `--cavebot=NAME` | select `cavebot_configs/<NAME>.cfg` **and** enable CaveBot (implies `--bot`) |
+| `--targetbot=NAME` | select `targetbot_configs/<NAME>.json` **and** enable TargetBot (implies `--bot`) |
+| `--bot-status-interval=MS` | one-line bot status at info level, default `5000`, `0` turns it off |
+| `--dry-run` | offline wiring check: no sockets, no HTTPS (with `--bot` it also builds, wires, ticks and stops the whole bot, read-only) |
 | `--selftest` | run `test/selftest.lua` and exit with its status |
 | `--replay=FILE` | run `test/replay.lua` over a capture and exit (path must not contain quotes) |
 | `-h`, `--help` | flag list |
@@ -122,7 +132,7 @@ Measured on both, same source tree, same commit:
 
 | | Windows 11 x64 | Debian 13 x64 (WSL2) |
 |---|---|---|
-| `--selftest` | 401 passed, 0 failed | 401 passed, 0 failed |
+| `--selftest` | 2184 passed, 0 failed | 2184 passed, 0 failed |
 | `test/fakeserver.lua` | 37 checks, 0 failed | 37 checks, 0 failed |
 | live invalid-account login | server message + exit 2 | server message + exit 2 |
 | `http.backend()` chosen | `winhttp` | `curl-ffi` |
@@ -140,7 +150,7 @@ The full API-by-API mapping and the acceptance criteria are in
 Windows:
 
 ```
-run.bat --selftest                                      401 assertions, 22 suites
+run.bat --selftest                                      2184 assertions, 23 suites
 run.bat --dry-run                                       end-to-end wiring, offline
 run.bat --replay=%TEMP%\some-capture.cam                replay a capture
 "…\luajit.exe" test\fakeserver.lua                      OFFLINE END-TO-END (see below)
@@ -152,18 +162,23 @@ Debian / any POSIX:
 ```
 ./run.sh --selftest
 ./run.sh --dry-run
+luajit test/botsuite.lua                                the bot layer on its own
 ./run.sh --replay=/tmp/some-capture.cam
 luajit test/fakeserver.lua
 luajit test/replay.lua --self
 luajit test/replay.lua FILE...                          replay real captures (.cam or .lcap)
 ```
 
-`test/selftest.lua` runs **401 assertions across 22 suites** (crypto vectors cross-checked
-against Python/zlib, buffer round-trips, framing round-trips including byte-at-a-time chunked
-delivery, hwid, item lookups, the 11-thing tile trim, the event bus, parser packet fixtures, a
-real 127.0.0.1 socket + scheduler round trip, and the whole offline boot sequence). It prints a
-PASS/FAIL line per module and exits non-zero on any failure. Latest run: **401 passed, 0 failed**
-on Windows 11 x64 *and* on Debian 13 x64.
+`test/selftest.lua` runs **2184 assertions across 23 suites**: 401 for the client itself (crypto
+vectors cross-checked against Python/zlib, buffer round-trips, framing round-trips including
+byte-at-a-time chunked delivery, hwid, item lookups, the 11-thing tile trim, the event bus,
+parser packet fixtures, a real 127.0.0.1 socket + scheduler round trip, and the whole offline
+boot sequence) plus 1783 for the bot layer through `test/botsuite.lua`. It prints a PASS/FAIL
+line per module and exits non-zero on any failure. Latest run: **2184 passed, 0 failed** on
+Windows 11 x64 *and* on Debian 13 x64.
+
+`test/botsuite.lua` can also be run on its own (`luajit test/botsuite.lua`), and with
+`_G.BOTSUITE_ONLY_INTEGRATION = true` it skips the six embedded per-module suites.
 
 ### `test/fakeserver.lua` — the offline end-to-end proof
 
@@ -205,6 +220,102 @@ driving the real framing code and replays that.
 
 ---
 
+## Bot layer
+
+```
+run.bat --account=... --password=... --character="Char" \
+        --cavebot=teeest --targetbot=def_target --bot-status-interval=5000
+```
+
+The bot is **off unless you ask for it**. `--bot` turns it on; `--cavebot=NAME` and
+`--targetbot=NAME` turn it on *and* select and enable that config. It is constructed and started
+when the server says we are in the game (`gameStart` / `login`), stopped on any shutdown path —
+which is also when its storage is persisted — and it ticks every 10 ms on the client's own
+scheduler. Nothing about it touches the network directly: it reads `LC.state` and sends through
+`LC.sender`, like every other consumer.
+
+### What it does
+
+| Module | Behaviour |
+|---|---|
+| `bot/healbot.lua` | Four independent polling loops (conditions 500 ms, conditions 50 ms, spells 50 ms, items 100 ms) driven by `HealBot.json`: spell rules, item rules, and the ConditionPanel cures/buffs (antidote, haste, utamo, utana, utura, paralysis). Priority is array order; the first matching rule fires. |
+| `bot/attackbot.lua` | One 50 ms loop over `AttackBot.json`'s attack table: spells and area runes, monster counting inside the real spell patterns, wave/beam direction picking, best-tile picking for area runes, PvP and blacklist guards, per-entry cooldowns. It never *selects* a target — it is a passenger on whatever TargetBot is attacking. |
+| `bot/cavebot.lua` | The waypoint engine for `cavebot_configs/*.cfg`: `goto label gotolabel delay node use usewith say npcsay follow function walkdelay turn exanihur poscheck opendoors cleartile lure supplycheck buysupplies sellall depositor stowdeposit bank travel`, plus Stay-Path, the anti-lost recovery machine and the supply-check → refill → return-to-hunt cycle. |
+| `bot/targetbot.lua` | Candidate gathering, the full scoring function (priority, danger, distance bonuses, hysteresis), chase / keep-distance / lure / rePosition movement, the danger aggregate CaveBot consults, and the CaveBot interlock. |
+| `bot/loot.lua` | Corpse discovery and the looting state machine: queueing, walking to the corpse, opening it, nested bags, stack merging, loot-bag selection. |
+| `bot/supplies.lua` | `Supplies.json` thresholds and the 12-branch round gate (force refill, hunt-round limit, imbuements, stamina, soft boots, supply minima, capacity, loot-pouch pages). |
+| `bot/walker.lua` | The step machine shared by CaveBot and TargetBot: one ledger, confirmation, refusal retries, `walkCancel` back-off, step duration from the ground speed and the server beat, floor-change geometry. |
+| `bot/path.lua` | The pathfinder — a faithful port of `Map::findEveryPath` (pure Dijkstra, 3× diagonals, the exact neighbour order and tie-break), with `maxDistance` / `maxComplexity` and the unseen / creature / non-pathable flags. |
+| `bot/api.lua` | The vBot-compatible script surface (`say use useWith findItem getMonsters canCast …`) that `function` waypoints run against. |
+
+Arbitration is `bot:isActionAllowed(who)`: **TargetBot suspends CaveBot** while it has a target
+or is looting (CaveBot yields by not advancing its waypoint), a lure grant re-opens the window
+for 150 ms, and **healing never yields**. Macro registration order *is* priority order and
+intra-tick send order: healbot → attackbot → targetbot → cavebot.
+
+### Config compatibility
+
+The bot reads the user's **existing vBot 4.8 files unchanged** — string thresholds, stale
+`index` fields, the misspelled `curePosion` key and all:
+
+```
+<profile>/vBot_configs/profile_<N>/HealBot.json      healing rules + ConditionPanel
+<profile>/vBot_configs/profile_<N>/AttackBot.json    attack entries
+<profile>/vBot_configs/profile_<N>/Supplies.json     supply thresholds
+<profile>/cavebot_configs/<name>.cfg                 waypoints, one "type:value" per line
+<profile>/targetbot_configs/<name>.json              { targeting = [...], looting = {...} }
+<profile>/storage/profile_<N>.json                   persisted runtime storage
+```
+
+Writes go through `bot/config.lua`, which preserves unknown fields and writes atomically
+(temp + rename). `--dry-run --bot` opens the profile **read-only** so an offline wiring check can
+never modify it.
+
+### Proven offline
+
+`test/botsuite.lua` (folded into `--selftest`) builds a synthetic world on the real
+`game/state.lua`, with the real `assets/items1530.bin` metadata and an ASCII map compiled into
+tiles, and drives the whole stack through `bot:tick()`. **1783 assertions, 0 failed, on Windows
+and Debian**, of which 127 are the integration tests in `botsuite.lua` itself and the rest come
+from the six embedded per-module suites:
+
+| Suite | Assertions | Covers |
+|---|---|---|
+| `test/f1_metadata.lua` | 446 | the v2 item table and the tile flag cache |
+| `test/bot_f2_path.lua` | 174 | the pathfinder and the walker |
+| `test/bot_f3.lua` | 259 | the bot core (macros, schedule, delay, storage) and `bot/api.lua` |
+| `test/bot_m1.lua` | 295 | HealBot + AttackBot against the user's real JSON |
+| `test/bot_m2_cavebot.lua` | 220 | CaveBot + supplies against the user's real routes |
+| `test/bot_m3_target.lua` | 259 | TargetBot selection/combat and the looting machine |
+
+The integration assertions specifically pin: the eight macros and their periods in BOT.md's
+registration order; one world / one pathfinder / one **walker** shared by CaveBot and TargetBot;
+one `bot/shared.lua` cooldown slot shared by HealBot and AttackBot; a heal fired through a full
+tick off the real `HealBot.json`; TargetBot attacking and AttackBot firing *because* of it; the
+CaveBot freeze and the lure grant; a route walked end to end with a label jump; an unreachable
+waypoint skipped; an unknown waypoint type warned about once; a corpse opened and emptied;
+`function` waypoints calling `TargetBot.setOn()` with a dot; the BOT.md status object
+json-encoding cleanly; and storage round-tripping without dropping unknown fields.
+
+Every one of those runs offline. There is no network in the bot test path at all.
+
+### Not proven — no live session has ever run the bot
+
+* **Nothing in the bot layer has ever driven a real character.** Every packet it would send has
+  been asserted against a capturing fake sender, never accepted by a server.
+* **The refill family** (`buysupplies`, `sellall`, `depositor`, `bank`, `travel`) is implemented
+  but only lightly exercised: the depot reach/open state machine has no synthetic fixture.
+* **`stowdeposit`, `forge`, `imbuing`, `tasker`, `rushlure` and the withdraw family** are
+  registered but log once and skip — they need `proto/sender.lua` builders that do not exist yet.
+* **The five AttackBot spell optimizers** are implemented as a flag and a hook only; every
+  optimized spell takes its legacy path. `opts.optimizers = true` is the switch.
+* **`state.ping`** is measured from the 0x1E pong of our own keepalive, which no offline test can
+  produce; the walker's use of it *is* tested by injecting the field.
+* **Anti-lost recovery** is unit-tested for arming, classification and the 60 s bounce guard, but
+  the full recovery walk across two floors is not driven end to end.
+
+---
+
 ## Regenerating assets
 
 `assets/items1530.bin` is the per-item attribute-flag table. The parser cannot decode a single map
@@ -240,17 +351,21 @@ under this project, so `proto/handshake.lua` currently falls back to the referen
 ## Layout
 
 ```
-main.lua              CLI, wiring, boot sequence, ping timer, status line   (_G.LC)
+main.lua              CLI, wiring, boot sequence, ping timer, status line, bot start/stop (_G.LC)
 lib/    log sys socket sched buffer xtea adler32 bigint rsa inflate http json events
 proto/  transport handshake login_http opcodes parser sender items
 game/   state
-test/   selftest.lua replay.lua fakeserver.lua
-tools/  extract_appearances.py
+bot/    init api config world path walker healbot attackbot cavebot targetbot loot supplies shared
+data/   spells1530.lua attackpatterns1530.lua        (generated from the real vBot sources)
+test/   selftest.lua botsuite.lua replay.lua fakeserver.lua
+        f1_metadata.lua bot_f2_path.lua bot_f3.lua bot_m1.lua bot_m2_cavebot.lua bot_m3_target.lua
+tools/  extract_appearances.py extract_vbot_data.lua
 assets/ items1530.bin
-docs/   the byte-level protocol specs
+docs/   the byte-level protocol specs, and docs/vbot/ for the bot behaviour specs
 ```
 
-`_G.LC` is the only global: `LC.log/sys/sched/events/items/state/transport/parser/sender/config`.
+`_G.LC` is the only global: `LC.log/sys/sched/events/items/state/transport/parser/sender/config`,
+plus `LC.bot` while the bot layer is running. The bot contract lives in [`BOT.md`](BOT.md).
 
 ---
 
@@ -283,6 +398,11 @@ docs/   the byte-level protocol specs
   enter-game frames (seq 1, 2) → `PlayerData` parsed into the state → text message → server ping
   answered with opcode 0x1C at seq 3 → `SessionEnd` → process exit 0. 37 checks, 0 failed, on
   Windows and on Debian.
+
+* **Bot layer** — the whole vBot 4.8 behaviour set, driven end to end through `bot:tick()`
+  against a synthetic world in `test/botsuite.lua` (1783 assertions on both OSes), consuming the
+  user's real `HealBot.json` / `AttackBot.json` / `Supplies.json` / `cavebot_configs/*.cfg` /
+  `targetbot_configs/*.json` unchanged. See [Bot layer](#bot-layer).
 
 ### Not proven, and honest about it
 
