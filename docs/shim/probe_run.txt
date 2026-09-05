@@ -1,0 +1,272 @@
+
+==============================================================================
+PHASE 1 -- load mods/game_bot/executor.lua
+==============================================================================
+  executor.lua: compiled+ran OK (defines executeBot)
+
+==============================================================================
+PHASE 2 -- executeBot('vBot_4.8')
+==============================================================================
+  loaded real storage/profile_1.json (44975 bytes)
+[01:15:13] [CONFIG] Changed Cooldown Time:  to: 0
+[01:15:13] [CONFIG] Changed Search Range:  to: 0
+[01:15:13] [SYSTEM] === AUTO TRAINING WEAPON SCRIPT LOADED ===
+[01:15:13] [SYSTEM] Version: 2.2 - Enhanced with Error Handling
+[01:15:13] [CONFIG] Target Object ID: 28559
+[01:15:13] [CONFIG] Cooldown Time: 0 seconds
+[01:15:13] [CONFIG] Search Range: 0 squares
+[01:15:13] [CONFIG] Items in container: 4
+[01:15:13] [SYSTEM] Hover Effects: ENABLED (except setup button and checkbox)
+[01:15:13] [SYSTEM] Error Handling: ENABLED
+[01:15:13] [SYSTEM] - Cannot throw: 10s retry
+[01:15:13] [SYSTEM] - Position change: 20s delay
+[01:15:13] [SYSTEM] Status: Ready for training
+[01:15:13] [SYSTEM] =====================================
+
+==============================================================================
+IMPORT OK in 31 ms
+==============================================================================
+
+==============================================================================
+PHASE 3 -- ticks (res.script())
+==============================================================================
+  context recovered: true   macros=48  scheduler=1  hotkeys=1  callbacks(sum)=83
+  tick 1: OK   (new bot-level errors: 0)
+  tick 2: OK   (new bot-level errors: 0)
+  tick 3: OK   (new bot-level errors: 0)
+  tick 4: OK   (new bot-level errors: 0)
+  tick 5: OK   (new bot-level errors: 0)
+
+==============================================================================
+REPORT
+==============================================================================
+bot messages: info=0 warn=1 error=0
+   [warn] CaveBot[Imbuing]: cannot reach connect() - imbuement tracker data unavailable
+
+-- files loaded via dofiles() (game_bot/functions, game_bot/panels) --
+  mods/game_bot/executor.lua                 OK
+  functions/callbacks.lua                    OK
+  functions/config.lua                       OK
+  functions/const.lua                        OK
+  functions/icon.lua                         OK
+  functions/main.lua                         OK
+  functions/map.lua                          OK
+  functions/npc.lua                          OK
+  functions/player.lua                       OK
+  functions/player_conditions.lua            OK
+  functions/player_inventory.lua             OK
+  functions/script_loader.lua                OK
+  functions/server.lua                       OK
+  functions/sound.lua                        OK
+  functions/test.lua                         OK
+  functions/tools.lua                        OK
+  functions/ui.lua                           OK
+  functions/ui_elements.lua                  OK
+  functions/ui_legacy.lua                    OK
+  functions/ui_windows.lua                   OK
+  panels/attacking.lua                       OK
+  panels/basic.lua                           OK
+  panels/healing.lua                         OK
+  panels/looting.lua                         OK
+  panels/tools.lua                           OK
+  panels/war.lua                             OK
+  panels/waypoints.lua                       OK
+  -> 27 ok, 0 failed
+
+-- vBot 4.8 sources, in load order --
+  /bot/vBot_4.8/_Loader.lua                      OK    1407B   31ms
+    /vBot/main.lua                                 OK     190B    0ms
+    /vBot/items.lua                                OK   42496B    0ms
+    /vBot/vlib.lua                                 OK   36134B    0ms
+    /vBot/new_cavebot_lib.lua                      OK   18249B    0ms
+    /vBot/configs.lua                              OK    2984B    0ms
+    /vBot/extras.lua                               OK   22856B    0ms
+    /vBot/cavebot.lua                              OK    1905B   15ms
+      /cavebot/actions.lua                           OK   21102B    0ms
+      /cavebot/config.lua                            OK    7939B    0ms
+      /cavebot/editor.lua                            OK    5935B    0ms
+      /cavebot/example_functions.lua                 OK    2718B    0ms
+      /cavebot/recorder.lua                          OK    2814B    0ms
+      /cavebot/walking.lua                           OK   17195B    0ms
+      /cavebot/minimap.lua                           OK     859B    0ms
+      /cavebot/sell_all.lua                          OK    2442B    0ms
+      /cavebot/depositor.lua                         OK    9039B    0ms
+      /cavebot/buy_supplies.lua                      OK    3384B    0ms
+      /cavebot/d_withdraw.lua                        OK    2830B    0ms
+      /cavebot/supply_check.lua                      OK    6550B    0ms
+      /cavebot/travel.lua                            OK    1007B    0ms
+      /cavebot/doors.lua                             OK    1639B    0ms
+      /cavebot/pos_check.lua                         OK    2594B    0ms
+      /cavebot/withdraw.lua                          OK    1575B    0ms
+      /cavebot/inbox_withdraw.lua                    OK    2631B    0ms
+      /cavebot/lure.lua                              OK     704B    0ms
+      /cavebot/bank.lua                              OK    2804B    0ms
+      /cavebot/clear_tile.lua                        OK    3682B    0ms
+      /cavebot/tasker.lua                            OK    5530B    0ms
+      /cavebot/imbuing.lua                           OK   27201B    0ms
+      /cavebot/stand_lure.lua                        OK    6165B    0ms
+      /cavebot/antilost.lua                          OK   35049B    0ms
+      /cavebot/route_tools.lua                       OK    9910B    0ms
+      /cavebot/cavebot.lua                           OK   20691B    0ms
+      /targetbot/creature.lua                        OK    3027B    0ms
+      /targetbot/creature_attack.lua                 OK    8935B    0ms
+      /targetbot/creature_editor.lua                 OK    4206B    0ms
+      /targetbot/creature_priority.lua               OK    1727B    0ms
+      /targetbot/looting.lua                         OK   11661B    0ms
+      /targetbot/walking.lua                         OK    1855B    0ms
+      /targetbot/target.lua                          OK    9340B    0ms
+    /vBot/playerlist.lua                           OK   12073B    0ms
+    /vBot/BotServer.lua                            OK    7467B    0ms
+    /vBot/alarms.lua                               OK    5936B    0ms
+    /vBot/Conditions.lua                           OK    9181B    0ms
+    /vBot/Equipper.lua                             OK   24576B    0ms
+    /vBot/pushmax.lua                              OK    7071B    0ms
+    /vBot/combo.lua                                OK   14398B    0ms
+    /vBot/HealBot.lua                              OK   33118B    0ms
+    /vBot/new_healer.lua                           OK   47910B    0ms
+    /vBot/AttackBot.lua                            OK   110054B    0ms
+    /vBot/Stances.lua                              OK   16269B    0ms
+    /vBot/ingame_editor.lua                        OK     914B    0ms
+    /vBot/Dropper.lua                              OK    3178B    0ms
+    /vBot/Containers.lua                           OK   19698B    0ms
+    /vBot/quiver_manager.lua                       OK    3375B    0ms
+    /vBot/quiver_label.lua                         OK    1270B    0ms
+    /vBot/tools.lua                                OK    2144B    0ms
+    /vBot/antiRs.lua                               OK     849B    0ms
+    /vBot/depot_withdraw.lua                       OK    2023B    0ms
+    /vBot/eat_food.lua                             OK    1414B    0ms
+    /vBot/equip.lua                                OK    1334B    0ms
+    /vBot/training.lua                             OK   27627B    0ms
+    /vBot/exeta.lua                                OK     987B    0ms
+    /vBot/analyzer.lua                             OK   56676B    0ms
+    /vBot/spy_level.lua                            OK     578B    0ms
+    /vBot/supplies.lua                             OK   12383B    0ms
+    /vBot/depositer_config.lua                     OK    8185B    0ms
+    /vBot/npc_talk.lua                             OK     209B    0ms
+    /vBot/xeno_menu.lua                            OK    1174B    0ms
+    /vBot/hold_target.lua                          OK     886B   16ms
+    /vBot/cavebot_control_panel.lua                OK    1597B    0ms
+    /vBot/navibot.lua                              OK     239B    0ms
+      /navibot/navibot.lua                           OK   22044B    0ms
+  -> 74 ok, 0 failed, 74 total
+
+-- macros registered at import time --
+  (anonymous)                              every    100ms  ON  runs=5   fails=0   
+  (anonymous)                              every   5000ms  ON  runs=5   fails=0   
+  (anonymous)                              every 600000ms  ON  runs=5   fails=0   
+  (anonymous)                              every    500ms  ON  runs=5   fails=0   
+  (anonymous)                              every    500ms  ON  runs=5   fails=0   
+  (anonymous)                              every     50ms  ON  runs=5   fails=0   
+  (anonymous)                              every    200ms  ON  runs=5   fails=0   
+  (anonymous)                              every    150ms  ON  runs=5   fails=0   
+  (anonymous)                              every     50ms  off runs=5   fails=0   
+  (anonymous)                              every    100ms  off runs=5   fails=0   
+  (anonymous)                              every   1000ms  ON  runs=5   fails=0   
+  (anonymous)                              every    500ms  ON  runs=5   fails=0   
+  (anonymous)                              every    100ms  ON  runs=5   fails=0   
+  (anonymous)                              every    500ms  ON  runs=5   fails=0   
+  (anonymous)                              every     50ms  ON  runs=5   fails=0   
+  (anonymous)                              every     50ms  ON  runs=5   fails=0   
+  (anonymous)                              every     50ms  ON  runs=5   fails=0   
+  (anonymous)                              every     50ms  ON  runs=5   fails=0   
+  (anonymous)                              every     50ms  ON  runs=5   fails=0   
+  (anonymous)                              every    100ms  ON  runs=5   fails=0   
+  (anonymous)                              every     50ms  ON  runs=5   fails=0   
+  (anonymous)                              every     50ms  ON  runs=5   fails=0   
+  (anonymous)                              every    100ms  ON  runs=5   fails=0   
+  (anonymous)                              every    100ms  ON  runs=5   fails=0   
+  (anonymous)                              every     50ms  ON  runs=5   fails=0   
+  (anonymous)                              every    200ms  ON  runs=5   fails=0   
+  ripper spectre switch                    every    100ms  off runs=5   fails=5   [string "macro(100, "ripper spectre switch", function(..."]:13: attempt to index a nil value
+  (anonymous)                              every    200ms  ON  runs=5   fails=0   
+  (anonymous)                              every   2500ms  ON  runs=1   fails=0   
+  Exchange money                           every   1000ms  ON  runs=5   fails=0   
+  Send message on trade                    every  60000ms  off runs=5   fails=5   functions/player.lua:74: attempt to call method 'lower' (a nil value)
+  AntiRS & Msg                             every     50ms  off runs=5   fails=0   
+  Depot Withdraw                           every     50ms  off runs=5   fails=0   
+  Eat Food                                 every  15000ms  off runs=5   fails=5   [string "/vBot/eat_food.lua"]:36: attempt to compare number with table
+  (anonymous)                              every    250ms  ON  runs=5   fails=0   
+  (anonymous)                              every   1000ms  ON  runs=5   fails=0   
+  Exeta when low hp                        every 100000ms  off runs=5   fails=0   
+  ExetaIfPlayer                            every    500ms  off runs=5   fails=0   
+  (anonymous)                              every    500ms  ON  runs=5   fails=0   
+  (anonymous)                              every    500ms  ON  runs=5   fails=0   
+  (anonymous)                              every  60000ms  ON  runs=5   fails=0   
+  (anonymous)                              every   2000ms  ON  runs=5   fails=0   
+  Hold Target                              every    100ms  ON  runs=5   fails=0   
+  (anonymous)                              every   1000ms  ON  runs=5   fails=0   
+  (anonymous)                              every    400ms  ON  runs=5   fails=0   
+  (anonymous)                              every    500ms  ON  runs=5   fails=0   
+  (anonymous)                              every    250ms  ON  runs=5   fails=0   
+  (anonymous)                              every    500ms  ON  runs=5   fails=0   
+  -> 48 macros
+
+-- non-lua files the bot asked for but the probe could not supply --
+     1  /bot/vBot_4.8/targetbot_configs/vBot_4.8.json
+
+-- otclient pure-Lua libs reused verbatim --
+  loaded: corelib/const.lua, corelib/bitwise.lua, gamelib/const.lua, gamelib/position.lua, gamelib/player.lua, gamelib/creature.lua, gamelib/textmessages.lua, gamelib/spells.lua, gamelib/items.lua, gamelib/thing.lua, gamelib/tile.lua, gamelib/util.lua
+
+-- otui styles importStyle()'d --
+  24 files
+
+-- REAL implementations that were actually exercised --
+     493  g_ui.createWidget
+      77  g_resources.readFileContents
+      37  g_ui.getRootWidget
+      24  g_ui.importStyle
+      21  g_game.getContainers
+      15  g_resources.directoryExists
+      11  g_map.getSpectators
+      10  game_interface.getRightPanel
+       6  g_resources.fileExists
+       4  g_game.getClientVersion
+       4  contentsPanel.config:getCurrentOption
+       4  g_resources.listDirectoryFiles
+       2  dofiles
+       2  g_game.getLocalPlayer
+       1  g_settings.getNumber
+       1  regexMatch
+       1  g_resources.writeFileContents
+       1  g_resources.makeDir
+       1  g_game.getFeature
+
+-- SINGLETON / GLOBAL APIs reached through the permissive shim --
+   these are the ones a real shim MUST provide.  [phase] = first touch
+     185  [target      ] Item.create()
+      10  [tick        ] g_game.isAttacking()
+       6  [analyzer    ] modules.game_skills.skillsWindow.contentsPanel.level.percent.getPercent()
+       5  [tick        ] Creature<ProbeChar>.getRegenerationTime()
+       5  [extras      ] g_game.enableTileThingLuaCallback()
+       5  [tick        ] g_map.getSpectatorsByPattern()
+       5  [tick        ] g_window.setTitle()
+       2  [cavebot     ] g_game.imbuementDurations()
+       2  [depositer_config] modules.game_npctrade.getSellExceptions()
+       1  [playerlist  ] Creature<ProbeChar>.isDead()
+       1  [antiRs      ] g_game.cancelAttackAndFollow()
+       1  [tick        ] modules.game_bot.connect()
+       1  [analyzer    ] modules.game_buttons.buttonsWindow.contentsPanel.buttons.botAnalyzersButton.destroy()
+       1  [functions   ] modules.game_cooldown.isCooldownIconActive()
+       1  [functions   ] modules.game_cooldown.isGroupCooldownIconActive()
+       1  [quiver_label] modules.game_inventory.getSlot5()
+       1  [analyzer    ] modules.game_mainpanel.addToggleButton()
+       1  [minimap     ] modules.game_minimap.getMiniMapUi()
+       1  [depositer_config] modules.game_npctrade.setSellExceptionsListener()
+       1  [training    ] modules.game_textmessage.displayGameMessage()
+  -> 20 distinct global API call paths
+
+-- WIDGET METHODS called on shim widgets (aggregated by method name) --
+  setText(624)  setItem(185)  setColor(109)  setChecked(102)  setTooltip(96)  setOn(81)  addOption(68)  setId(68)  setValue(53)  setHeight(51)  getWidth(44)  isOn(44)  hide(40)  setWidth(40)  destroyChildren(35)  getChildren(35)  setTTFFont(35)  getTab(32)  addValue(30)  getGraphsCount(30)  setItemId(26)  setVisible(24)  show(23)  focus(20)  raise(20)  getBackgroundColor(19)  getMaximum(18)  loadUIFromString(17)  getValue(15)  setRange(15)  getChildCount(12)  setStep(11)  destroy(10)  getChildById(10)  recursiveGetChildById(10)  setup(10)  setCurrentIndex(8)  getChildByIndex(6)  getParent(6)  setEnabled(6)  setOutfit(6)  setPercent(6)  getText(5)  isVisible(5)  setTitle(5)  addTab(4)  setImageColor(4)  clearOptions(3)  setContentMaximumHeight(3)  setOption(3)  setShowCount(3)  clear(2)  getCurrentOption(2)  getChildIndex(1)  getFocusedChild(1)  isChecked(1)  setContentWidget(1)
+  -> 57 distinct widget methods
+
+-- API paths FIRST touched during the tick phase (never at import) --
+      10  g_game.isAttacking()
+       5  g_window.setTitle()
+       5  Creature<ProbeChar>.getRegenerationTime()
+       5  g_map.getSpectatorsByPattern()
+       1  modules.game_bot.connect()
+  -> 5 tick-only API paths
+
+  (4194 distinct touched paths total)
+
+wrote docs/shim/probe_touched.txt

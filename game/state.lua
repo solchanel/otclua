@@ -26,6 +26,10 @@
 -- are exported so other modules never hand-roll it.  A packed integer key is also available
 -- as state.packKey(pos) for callers that want a numeric id (exact: (x*65536+y)*16+z < 2^37).
 
+local bit   = require('bit')
+local items = require('proto.items')
+local band, bor = bit.band, bit.bor
+
 local state = {}
 state.__index = state
 
@@ -78,30 +82,38 @@ local function copyPos(p)
 end
 state.copyPos = copyPos
 
--- Thing::getStackPriority without ThingType data.
--- We only know 'item' vs 'creature' from the parser.  Whether an item is ground /
--- ground-border / on-bottom / on-top needs the appearance flags, which assets/items1530.bin
--- does NOT carry (proto/items.lua exposes only CUMULATIVE/WEAROUT/EXPIRE/CONTAINER/CLASSIFY/
--- PODIUM/DECOKIT).  So a caller that knows better may set thing.stackPriority explicitly;
--- otherwise we fall back to CREATURE(4) for creatures and COMMON_ITEMS(5) for items, which is
--- the correct answer for every thing that arrives with an EXPLICIT stackpos (0x6A, tile
--- descriptions) -- auto-detect is only ever used by callers that pass nil/-1/255.
+-- items1530.bin v2 carries FLAGS2 (GROUND/GROUND_BORDER/ON_BOTTOM/ON_TOP), so
+-- Thing::getStackPriority (thing.cpp:54-77) is now exact for items.  A caller may still
+-- pin thing.stackPriority explicitly; creatures are always PRIO_CREATURE(4).
+--
+-- LEGACY FALLBACK: when the item table has not been loaded (proto/items.lua reports
+-- items.loaded == false -- e.g. a unit test that builds a state by hand), we keep the v1
+-- heuristic: every item is a common item, except the one at 0-based index 0 of a described
+-- tile, which the server always writes as the ground.  Without that an auto-placed creature
+-- would sort BELOW the ground.
+local function itemPriority(id)
+    if items.loaded and type(id) == 'number' and id >= 1 and id <= items.MAX_ID then
+        return items.stackPriority(id)
+    end
+    return nil
+end
+
 local function stackPriorityOf(thing)
     if type(thing.stackPriority) == 'number' then return thing.stackPriority end
     if thing.kind == 'creature' then return PRIO_CREATURE end
-    return PRIO_COMMON_ITEM
+    return itemPriority(thing.id) or PRIO_COMMON_ITEM
 end
 state.stackPriorityOf = stackPriorityOf
 
--- Same thing, but knowing WHERE on the tile it already sits.  The one piece of ground
--- information we can recover without ThingType flags is that the item at 0-based index 0 of a
--- described tile is the ground (the server always writes the ground item first), so give it
--- PRIO_GROUND.  Without this an auto-placed creature would sort BELOW the ground, because our
--- flagless fallback calls every item a common item (priority 5).
+-- Same thing, but knowing WHERE on the tile it already sits (only the legacy fallback
+-- cares -- with flags loaded the index is irrelevant).
 local function priorityAt(things, idx0, thing)
     if type(thing.stackPriority) == 'number' then return thing.stackPriority end
-    if idx0 == 0 and thing.kind ~= 'creature' then return PRIO_GROUND end
-    return stackPriorityOf(thing)
+    if thing.kind == 'creature' then return PRIO_CREATURE end
+    local p = itemPriority(thing.id)
+    if p then return p end
+    if idx0 == 0 then return PRIO_GROUND end
+    return PRIO_COMMON_ITEM
 end
 
 -- ---------------------------------------------------------------------------
@@ -181,6 +193,7 @@ function state:setTile(pos, tile)
     if tile then
         tile.pos    = tile.pos or copyPos(pos)
         tile.things = tile.things or {}
+        tile._flags = nil          -- derived-flag cache (see "tile derived queries")
     end
     self.map[key] = tile
     return tile
@@ -267,6 +280,7 @@ function state:addThing(pos, stackPos, thing)
     end
 
     table.insert(things, sp + 1, thing)
+    tile._flags = nil               -- the derived-flag cache is stale now
 
     -- creature bookkeeping: the creature is now on this tile
     if thing.kind == 'creature' and thing.creatureId then
@@ -302,6 +316,7 @@ function state:_removeAt(tile, idx)
     local thing = tile.things[idx + 1]
     if thing == nil then return nil end
     table.remove(tile.things, idx + 1)
+    tile._flags = nil               -- the derived-flag cache is stale now
     if thing.kind == 'creature' and thing.creatureId then
         local c = self.creatures[thing.creatureId]
         -- only clear the position if the creature was still believed to be HERE; a move that
@@ -507,8 +522,15 @@ function state:moveCreature(id, fromPos, fromStackPos, toPos)
 end
 
 -- ---------------------------------------------------------------------------
--- walkableAt
+-- walkableAt -- LEGACY (v1) API, deliberately frozen
 -- ---------------------------------------------------------------------------
+-- SUPERSEDED by state:isWalkable(pos, ignoreCreatures) below, which is exact now that
+-- assets/items1530.bin v2 carries FLAGS2.  walkableAt is kept, unchanged, because its
+-- four-value reason-string contract ('unknown-tile' / 'no-ground' / 'creature' /
+-- 'items-unknown') is public API that existing callers and tests depend on; it still
+-- never inspects item flags, so it still reports a wall as walkable.  NEW CODE MUST USE
+-- state:isWalkable.
+--
 -- Tile::isWalkable (tile.cpp) is:
 --     if (m_thingTypeFlag & NOT_WALKABLE || !getGround()) return false;
 --     for each creature on the tile: if (!passable && canBeSeen) return false;
@@ -556,6 +578,366 @@ function state:walkableAt(pos, ignoreCreatures)
         end
     end
     return true, 'items-unknown'
+end
+
+-- ===========================================================================
+-- tile derived queries  (docs/vbot/gaps.md P0-3, docs/vbot/pathfinding.md sec.4.2)
+-- ===========================================================================
+-- `Tile::m_thingTypeFlag` (tile.cpp:920-1012) folded into one cached bitmask per tile,
+-- recomputed lazily and invalidated by every add/remove/clean.  The cache lives on the
+-- tile table as `_flags` (bitmask), `_ground` (the ground thing or false) and
+-- `_elevation` (the C++ m_elevation counter).
+--
+-- Rules ported verbatim, with their C++ line numbers:
+--   * tile.cpp:996 `if (!thing->isItem()) return;` -- creatures contribute ONLY
+--     HAS_CREATURE; they never set NOT_WALKABLE / NOT_PATHABLE / BLOCK_PROJECTILE /
+--     FULL_GROUND.
+--   * FULL_GROUND is set by ANY item on the tile carrying `fullbank`, not just by the
+--     ground item.
+--   * there is no HAS_GROUND bit in C++; `Tile::getGround()` (tile.cpp:537) is live and is
+--     `things[0]` *only if that thing carries the GROUND flag*.  We cache the answer, which
+--     is the same thing.
+--   * `m_elevation` (tile.cpp:1011) counts items whose ThingType hasElevation() -- the FLAG,
+--     not `elevation > 0`; proto/items.lua carries it as FLAGS5 ELEVATION.
+--
+-- WITHOUT THE ITEM TABLE (`items.loaded == false`) this degrades to the v1 heuristic:
+-- an item at index 0 counts as the ground and no item ever blocks.  `state:tileFlagsExact()`
+-- reports whether the answers are flag-backed.
+local TF = {
+    NOT_WALKABLE     = 1,
+    NOT_PATHABLE     = 2,
+    BLOCK_PROJECTILE = 4,
+    HAS_CREATURE     = 8,
+    HAS_GROUND       = 16,
+    FULL_GROUND      = 32,
+    HAS_COMMON       = 64,
+    IGNORE_LOOK      = 128,
+}
+state.TF = TF
+
+function state:tileFlagsExact()
+    return items.loaded == true
+end
+
+function state:_recomputeTileFlags(tile)
+    local f, ground, elevation = 0, false, 0
+    local things = tile.things
+    local exact = items.loaded
+    for i = 1, #things do
+        local t = things[i]
+        if t.kind == 'creature' then
+            f = bor(f, TF.HAS_CREATURE)
+        else
+            local id = t.id
+            local ok = exact and type(id) == 'number' and id >= 1 and id <= items.MAX_ID
+            if ok then
+                local f2 = items.flags2(id)
+                if band(f2, 0x10) ~= 0 then f = bor(f, TF.NOT_WALKABLE) end
+                if band(f2, 0x20) ~= 0 then f = bor(f, TF.NOT_PATHABLE) end
+                if band(f2, 0x80) ~= 0 then f = bor(f, TF.BLOCK_PROJECTILE) end
+                if band(f2, 0x0F) == 0 then f = bor(f, TF.HAS_COMMON) end
+                if i == 1 and band(f2, 0x01) ~= 0 then
+                    ground = t
+                    f = bor(f, TF.HAS_GROUND)
+                end
+                local f4 = items.flags4(id)
+                if band(f4, 0x02) ~= 0 then f = bor(f, TF.FULL_GROUND) end
+                if band(f4, 0x04) ~= 0 then f = bor(f, TF.IGNORE_LOOK) end
+                if items.hasElevation(id) then elevation = elevation + 1 end
+            else
+                -- legacy fallback: index 0 is the ground, nothing blocks
+                if i == 1 then
+                    ground = t
+                    f = bor(f, TF.HAS_GROUND)
+                else
+                    f = bor(f, TF.HAS_COMMON)
+                end
+            end
+        end
+    end
+    tile._flags     = f
+    tile._ground    = ground
+    tile._elevation = elevation
+    return f
+end
+
+-- Force a recompute.  Only needed by code that mutates tile.things behind state's back.
+function state:invalidateTile(pos)
+    local t = self.map[tileKey(pos)]
+    if t then t._flags = nil end
+    return t ~= nil
+end
+
+-- The folded bitmask of a tile, or nil when the tile is unknown.
+function state:tileFlags(pos)
+    local t = self.map[tileKey(pos)]
+    if not t then return nil end
+    return t._flags or self:_recomputeTileFlags(t)
+end
+
+local function tileOf(self, pos)
+    local t = self.map[tileKey(pos)]
+    if t and not t._flags then self:_recomputeTileFlags(t) end
+    return t
+end
+
+-- Creature::canBeSeen() = !isInvisible() || isPlayer()  (creature.h:152,156).
+-- Outfit::isEffect() && auxId == 13 is set by ProtocolGame::getOutfit ONLY in the
+-- lookType == 0 && lookTypeEx == 0 case, so on the wire that IS the predicate.
+local function creatureCanBeSeen(c)
+    if not c then return true end            -- never seen a 0x8E for it: assume visible
+    if c.isPlayer then return true end
+    local o = c.outfit
+    if o and o.lookType == 0 and (o.lookTypeEx or 0) == 0 then return false end
+    return true
+end
+state.creatureCanBeSeen = creatureCanBeSeen
+
+-- Tile::isWalkable (tile.cpp:708-725).
+--   if (m_thingTypeFlag & NOT_WALKABLE || !getGround()) return false;
+--   if (!ignoreCreatures) for each creature: if (!isPassable() && canBeSeen()) return false;
+-- NOTE the deliberate asymmetry with hasBlockingCreature: isWalkable checks canBeSeen() but
+-- does NOT exclude the local player (so your own tile is not walkable), while
+-- hasBlockingCreature excludes the local player but does NOT check canBeSeen().
+-- Second return value is a reason string: 'unknown-tile' | 'item' | 'no-ground' | 'creature'.
+function state:isWalkable(pos, ignoreCreatures)
+    local t = tileOf(self, pos)
+    if not t then return false, 'unknown-tile' end
+    local f = t._flags
+    if band(f, TF.NOT_WALKABLE) ~= 0 then return false, 'item' end
+    if band(f, TF.HAS_GROUND) == 0 then return false, 'no-ground' end
+    if not ignoreCreatures and band(f, TF.HAS_CREATURE) ~= 0 then
+        local things = t.things
+        for i = 1, #things do
+            local th = things[i]
+            if th.kind == 'creature' then
+                local c = th.creatureId and self.creatures[th.creatureId]
+                -- Creature::m_passable defaults to FALSE (creature.h:359): unknown blocks.
+                if not (c and c.passable) and creatureCanBeSeen(c) then
+                    return false, 'creature'
+                end
+            end
+        end
+    end
+    return true
+end
+
+-- Tile::isPathable (tile.h:77).  An unknown tile is NOT pathable.
+function state:isPathable(pos)
+    local f = self:tileFlags(pos)
+    return f ~= nil and band(f, TF.NOT_PATHABLE) == 0
+end
+
+-- Tile::isLookPossible (tile.h:81) -- nothing on the tile carries `unsight`.
+function state:isLookPossible(pos)
+    local f = self:tileFlags(pos)
+    return f ~= nil and band(f, TF.BLOCK_PROJECTILE) == 0
+end
+
+-- Tile::hasCreatures() -- ANY creature, the local player included.
+function state:hasCreatures(pos)
+    local f = self:tileFlags(pos)
+    return f ~= nil and band(f, TF.HAS_CREATURE) ~= 0
+end
+state.hasCreature = state.hasCreatures
+
+-- Tile::hasBlockingCreature (tile.cpp:838-844): a non-passable creature that is NOT the
+-- local player.  No canBeSeen() test here -- that is isWalkable's job, not this one's.
+function state:hasBlockingCreature(pos)
+    local t = self.map[tileKey(pos)]
+    if not t then return false end
+    local myId = self.player and self.player.id
+    local things = t.things
+    for i = 1, #things do
+        local th = things[i]
+        if th.kind == 'creature' and th.creatureId ~= myId then
+            local c = th.creatureId and self.creatures[th.creatureId]
+            if not (c and c.passable) then return true end
+        end
+    end
+    return false
+end
+
+-- Tile::hasElevation(n) (tile.h:129) -- m_elevation >= n.
+function state:hasElevation(pos, n)
+    local t = tileOf(self, pos)
+    if not t then return false end
+    return t._elevation >= (n or 1)
+end
+
+function state:elevation(pos)
+    local t = tileOf(self, pos)
+    return t and t._elevation or 0
+end
+
+-- Tile::getGround (tile.cpp:537): things[0], but only when it carries the GROUND flag.
+function state:getGround(pos)
+    local t = tileOf(self, pos)
+    if not t then return nil end
+    return t._ground or nil
+end
+
+-- Tile::getGroundSpeed (tile.cpp:562-569):
+--     if (const auto& ground = getGround()) return ground->getGroundSpeed();
+--     return 100;
+-- The 100 is the NO-GROUND fallback ONLY.  A ground item whose `bank` has no `waypoints`
+-- has speed 0 and this returns 0 verbatim -- do not substitute.  (Creature::getStepDuration
+-- has its own, different, 150 substitution for a zero result; that belongs to the walker.)
+function state:getGroundSpeed(pos)
+    local g = self:getGround(pos)
+    if not g then return 100 end
+    local id = g.id
+    if not (items.loaded and type(id) == 'number' and id >= 1 and id <= items.MAX_ID) then
+        return 100
+    end
+    return items.groundSpeed(id)
+end
+
+-- Tile::getMinimapColorByte (tile.cpp:571-586):
+--     if (m_minimapColor != 0) return m_minimapColor;   -- per-tile override
+--     for (thing : reverse(m_things)) { if creature or isCommon: skip;
+--                                       c = getMinimapColor(); if c != 0 return c; }
+--     return 255;
+-- Returns nil for an unknown tile -- see state:getMinimapColor for the Map:: wrapper.
+function state:getMinimapColorByte(pos)
+    local t = tileOf(self, pos)
+    if not t then return nil end
+    if t._minimapColor and t._minimapColor ~= 0 then return t._minimapColor end
+    local things = t.things
+    for i = #things, 1, -1 do
+        local th = things[i]
+        if th.kind ~= 'creature' then
+            local id = th.id
+            if items.loaded and type(id) == 'number' and id >= 1 and id <= items.MAX_ID then
+                if not items.isCommon(id) then
+                    local c = items.minimapColor(id)
+                    if c ~= 0 then return c end
+                end
+            end
+        end
+    end
+    return 255
+end
+
+-- Map::getMinimapColor (map.cpp:1168-1179):
+--     int color = 0; if (tile) color = tile->getMinimapColorByte();
+--     if (color == 0) color = g_minimap.getTile(pos).color;
+-- `minimapFallback(pos)` stands in for g_minimap; a nil fallback yields the raw 0, and the
+-- future game/minimap.lua plugs itself in here.  Note getMinimapColorByte NEVER returns 0
+-- for an existing tile (255 is its "no colour"), so the fallback only fires on a tile we
+-- do not have.
+function state:getMinimapColor(pos, minimapFallback)
+    local c = self:getMinimapColorByte(pos) or 0
+    if c == 0 and minimapFallback then c = minimapFallback(pos) or 0 end
+    return c
+end
+
+-- Tile::getTopUseThing (tile.cpp:600-617).  THIS is what looting uses to find the corpse
+-- (targetbot/looting.lua:174,313).
+--   1. first thing with isForceUse() || (isCommon() && !isSplash())
+--   2. else scan BACKWARDS from the top down to index 1 (0-based), first non-splash
+--      non-creature
+--   3. else things[0]
+-- C++ does not creature-guard the forceuse test; we must, because a creature thing has no
+-- item id to look up.  No creature appearance carries forceuse, so the two agree.
+function state:getTopUseThing(pos)
+    local t = self.map[tileKey(pos)]
+    if not t or #t.things == 0 then return nil end
+    local things = t.things
+    local usable = items.loaded
+    for i = 1, #things do
+        local th = things[i]
+        if th.kind ~= 'creature' and usable
+           and type(th.id) == 'number' and th.id >= 1 and th.id <= items.MAX_ID then
+            if items.isForceUse(th.id)
+               or (items.isCommon(th.id) and not items.isSplash(th.id)) then
+                return th
+            end
+        end
+    end
+    for i = #things, 2, -1 do
+        local th = things[i]
+        if th.kind ~= 'creature' then
+            local splash = usable and type(th.id) == 'number'
+                           and th.id >= 1 and th.id <= items.MAX_ID and items.isSplash(th.id)
+            if not splash then return th end
+        end
+    end
+    return things[1]
+end
+
+-- Tile::getTopMoveThing (tile.cpp:654-675): the first isCommon thing; if that thing is not
+-- at index 0 and is NOT_MOVEABLE, return the thing BEFORE it; else the first creature; else
+-- things[0].
+function state:getTopMoveThing(pos)
+    local t = self.map[tileKey(pos)]
+    if not t or #t.things == 0 then return nil end
+    local things = t.things
+    for i = 1, #things do
+        local th = things[i]
+        if th.kind ~= 'creature' and items.loaded
+           and type(th.id) == 'number' and th.id >= 1 and th.id <= items.MAX_ID
+           and items.isCommon(th.id) then
+            if i > 1 and items.isNotMoveable(th.id) then return things[i - 1] end
+            return th
+        end
+    end
+    for i = 1, #things do
+        if things[i].kind == 'creature' then return things[i] end
+    end
+    return things[1]
+end
+
+-- Tile::getTopCreature (tile.cpp:617-651), SIMPLIFIED: the first non-local-player creature,
+-- else the local player, else nil.  The C++ additionally consults m_walkingCreatures and,
+-- with checkAround, the 8 neighbouring tiles for a creature mid-step onto this one; a
+-- headless client has no render-time walking list, so those clauses are dropped on purpose.
+function state:getTopCreature(pos)
+    local t = self.map[tileKey(pos)]
+    if not t then return nil end
+    local myId = self.player and self.player.id
+    local mine
+    local things = t.things
+    for i = 1, #things do
+        local th = things[i]
+        if th.kind == 'creature' then
+            if th.creatureId == myId then mine = th else return th end
+        end
+    end
+    return mine
+end
+
+-- Map::isSightClear (map.cpp:1181-1225) -- the exact loop, including the two traps:
+--   * a MISSING tile is transparent (`if (tile && !tile->isLookPossible()) return false;`),
+--   * and so is a missing tile in the vertical tail.
+-- Used by canShoot (which additionally gates on Chebyshev distance from the LOCAL PLAYER --
+-- that part is not derivable here) and by AttackBot line-of-sight.
+function state:isSightClear(fromPos, toPos)
+    if samePos(fromPos, toPos) then return true end
+    local start = (fromPos.z > toPos.z) and copyPos(toPos) or copyPos(fromPos)
+    local dest  = (fromPos.z > toPos.z) and fromPos or toPos
+    local mx = (start.x < dest.x) and 1 or ((start.x == dest.x) and 0 or -1)
+    local my = (start.y < dest.y) and 1 or ((start.y == dest.y) and 0 or -1)
+    local A, B = dest.y - start.y, start.x - dest.x
+    local C = -(A * dest.x + B * dest.y)
+    while start.x ~= dest.x or start.y ~= dest.y do
+        local h = math.abs(A * (start.x + mx) + B * start.y        + C)
+        local v = math.abs(A * start.x        + B * (start.y + my) + C)
+        local x = math.abs(A * (start.x + mx) + B * (start.y + my) + C)
+        if start.y ~= dest.y and (start.x == dest.x or h > v or h > x) then
+            start.y = start.y + my
+        end
+        if start.x ~= dest.x and (start.y == dest.y or v > h or v > x) then
+            start.x = start.x + mx
+        end
+        local f = self:tileFlags(start)
+        if f and band(f, TF.BLOCK_PROJECTILE) ~= 0 then return false end
+    end
+    while start.z ~= dest.z do
+        if self:thingCount(start) > 0 then return false end
+        start.z = start.z + 1
+    end
+    return true
 end
 
 -- ---------------------------------------------------------------------------

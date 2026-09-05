@@ -65,6 +65,16 @@ Runtime
   --capture=PATH           append every inbound payload as a .cam '<' record
   --ping=MS                keepalive interval in ms             (default: 10000)
 
+Bot layer (vBot 4.8 behaviour: HealBot, AttackBot, CaveBot, TargetBot)
+  --bot                    enable the bot layer once the game has started
+  --bot-profile=DIR        vBot profile directory (HealBot.json, cavebot_configs/,
+                           targetbot_configs/, storage/ ...).  Default: the vBot_4.8
+                           profile next to this checkout when it exists, else ./profiles
+  --bot-vprofile=N         vBot_configs/profile_<N> and storage/profile_<N>.json (1)
+  --cavebot=NAME           cavebot_configs/<NAME>.cfg -- selects it AND enables CaveBot
+  --targetbot=NAME         targetbot_configs/<NAME>.json -- selects it AND enables it
+  --bot-status-interval=MS one-line bot status at info level (default 5000, 0 = off)
+
 Modes
   --dry-run                offline: no sockets, no HTTPS; exercises the whole
                            wiring (items, login packet, framing, parser, events)
@@ -108,6 +118,8 @@ local function parseArgs(argv)
         or name == 'assets' or name == 'log-level' or name == 'log-file'
         or name == 'capture' or name == 'port' or name == 'ping'
         or name == 'content-revision' or name == 'replay' or name == 'login-url'
+        or name == 'bot-profile' or name == 'bot-vprofile' or name == 'cavebot'
+        or name == 'targetbot' or name == 'bot-status-interval'
         or name == 'session-key' then
             v, err = valueOf(name, inline)
             if not v then return nil, err end
@@ -134,6 +146,12 @@ local function parseArgs(argv)
         elseif name == 'ping'      then cfg.pingMs = tonumber(v) or 10000
         elseif name == 'replay'    then cfg.replay = v
         elseif name == 'dry-run'   then cfg.dryRun = true
+        elseif name == 'bot'       then cfg.bot = true
+        elseif name == 'bot-profile' then cfg.botProfile = v
+        elseif name == 'bot-vprofile' then cfg.botVProfile = tonumber(v)
+        elseif name == 'cavebot'   then cfg.cavebot = v; cfg.bot = true
+        elseif name == 'targetbot' then cfg.targetbot = v; cfg.bot = true
+        elseif name == 'bot-status-interval' then cfg.botStatusMs = tonumber(v)
         elseif name == 'selftest'  then cfg.selftest = true
         elseif name == 'help'      then cfg.help = true
         else return nil, ('unknown flag --%s (try --help)'):format(name)
@@ -177,6 +195,7 @@ local function shutdown(code)
     if shuttingDown then return end
     shuttingDown = true
     LC.exitCode = code or LC.exitCode or 0
+    if LC.stopBot then pcall(LC.stopBot) end   -- saves the bot storage
     if LC.pingTimer then pcall(sched.cancel, LC.pingTimer); LC.pingTimer = nil end
     if LC.transport then pcall(function() LC.transport:close() end) end
     if LC.captureFile then pcall(function() LC.captureFile:close() end); LC.captureFile = nil end
@@ -208,6 +227,115 @@ local function statusLine(force)
         pl.health or 0, pl.maxHealth or 0, pl.mana or 0, pl.maxMana or 0, pl.level or 0,
         pos and ('(%d,%d,%d)'):format(pos.x, pos.y, pos.z) or '(unknown)')
 end
+
+-- =============================================================== bot layer
+-- The vBot-compatible bot (BOT.md).  It is OFF unless --bot / --cavebot /
+-- --targetbot is given, is started once the server says we are in the game, and
+-- is stopped (which saves its storage) on any shutdown path.
+
+-- Default profile directory: the user's real vBot_4.8 profile when this checkout
+-- sits next to it, otherwise ./profiles.  LUACLIENT_BOT_PROFILE overrides both.
+local function defaultBotProfile()
+    local env = sys.getEnv and sys.getEnv('LUACLIENT_BOT_PROFILE')
+    if env and #env > 0 then return env end
+    local candidates = {
+        SCRIPT_DIR .. '/../../otclient_mehah1530/otclient/profiles/bot/vBot_4.8',
+        'D:/Claude/otclient_mehah1530/otclient/profiles/bot/vBot_4.8',
+        '/mnt/d/Claude/otclient_mehah1530/otclient/profiles/bot/vBot_4.8',
+    }
+    for _, c in ipairs(candidates) do
+        local f = io.open(c .. '/vBot_configs/profile_1/HealBot.json', 'r')
+        if f then f:close(); return (c:gsub('\\', '/')) end
+    end
+    return SCRIPT_DIR .. '/profiles'
+end
+
+-- One line, info level: hp/mana/pos, the CaveBot waypoint and the TargetBot target.
+local function botStatusLine()
+    local b = LC.bot
+    if not b then return end
+    local ok, st = pcall(b.status, b)
+    if not ok or not st then return end
+    local pl = st.player or {}
+    local pos = pl.pos
+    local parts = { ('hp %s/%s  mana %s/%s  pos %s'):format(
+        tostring(pl.hp or 0), tostring(pl.maxHp or 0),
+        tostring(pl.mana or 0), tostring(pl.maxMana or 0),
+        pos and ('(%d,%d,%d)'):format(pos.x, pos.y, pos.z) or '(unknown)') }
+
+    local cb = st.cavebot
+    if cb then
+        parts[#parts + 1] = ('cavebot %s %s wp %s/%s %s'):format(
+            cb.on and 'on' or 'off', tostring(cb.config or cb.route or '-'),
+            tostring(cb.waypointIndex or cb.index or 0),
+            tostring(cb.waypointCount or 0),
+            tostring(cb.currentAction or cb.status or '-'))
+    end
+
+    local tb = st.targetbot
+    if tb then
+        local t = tb.target
+        parts[#parts + 1] = ('target %s%s  danger %s'):format(
+            t and tostring(t.name) or 'none',
+            (t and t.hpPercent) and (' (' .. tostring(t.hpPercent) .. '%%)') or '',
+            tostring(tb.danger or 0))
+    end
+
+    local sup = st.supplies
+    if sup and sup.refill then parts[#parts + 1] = 'refill: ' .. tostring(sup.refill) end
+
+    log.info('bot: %s', table.concat(parts, ' | '))
+end
+
+local function startBot(cfg)
+    if not cfg.bot or LC.bot then return end
+    local okmod, botmod = pcall(require, 'bot.init')
+    if not okmod then
+        log.error('bot: cannot load bot/init.lua: %s', tostring(botmod))
+        return
+    end
+    local dir = cfg.botProfile or defaultBotProfile()
+    local okb, b = pcall(botmod.new, LC, {
+        profileDir = dir,
+        vprofile   = cfg.botVProfile or 1,
+        cavebot    = cfg.cavebot,
+        targetbot  = cfg.targetbot,
+        -- --dry-run must never write into the user's real vBot profile.
+        readOnlyProfile = cfg.dryRun and true or nil,
+    })
+    if not okb then
+        log.error('bot: construction failed: %s', tostring(b))
+        return
+    end
+    LC.bot = b
+    log.info('bot: profile %s (vprofile %d)%s%s', dir, cfg.botVProfile or 1,
+             cfg.cavebot and (', cavebot ' .. cfg.cavebot) or '',
+             cfg.targetbot and (', targetbot ' .. cfg.targetbot) or '')
+    b:wireModules{
+        cavebot   = cfg.cavebot,
+        targetbot = cfg.targetbot,
+        enableCavebot   = cfg.cavebot   and true or nil,
+        enableTargetbot = cfg.targetbot and true or nil,
+    }
+    b:start()
+
+    local every = cfg.botStatusMs or 5000
+    if every > 0 and sched.every then
+        LC.botStatusTimer = sched.every(every, botStatusLine)
+    end
+end
+
+-- Stop + persist.  Safe to call twice and safe when the bot never came up.
+local function stopBot()
+    local b = LC.bot
+    if not b then return end
+    if LC.botStatusTimer then pcall(sched.cancel, LC.botStatusTimer); LC.botStatusTimer = nil end
+    pcall(function() b:unwireModules() end)
+    pcall(function() b:stop() end)          -- stop() saves storage
+    LC.bot = nil
+end
+LC.stopBot  = stopBot
+LC.startBot = function() return startBot(LC.config or {}) end
 
 -- =============================================================== capture
 local function openCapture(path)
@@ -300,9 +428,14 @@ local function buildGame(cfg, t)
         if LC.pingTimer then return end
         log.info('%s -- arming the %d ms keepalive ping (opcode 29)', what, cfg.pingMs or 10000)
         LC.pingTimer = sched.every(cfg.pingMs or 10000, function()
-            if LC.transport and not LC.transport.dead then LC.sender:ping() end
+            if LC.transport and not LC.transport.dead then
+                LC.pingSentAt = sys.nowMs()
+                LC.sender:ping()
+            end
         end)
         statusLine(true)
+        -- BOT.md: the bot starts once the server says we are in the game.
+        if LC.startBot then LC.startBot() end
     end
     events.on('gameStart', function() armPing('game started') end)
     events.on('login', function(d)
@@ -314,7 +447,14 @@ local function buildGame(cfg, t)
         if LC.transport and not LC.transport.dead then LC.sender:pingBack() end
     end)
     events.on('pingBack', function()
-        log.debug('pong from server (latency sample)')
+        -- 0x1E is the PONG for our keepalive: turn it into the RTT the bot layer's
+        -- step timing, smooth-walk pacer and cooldown ping compensation all read.
+        if LC.pingSentAt then
+            local rtt = sys.nowMs() - LC.pingSentAt
+            LC.pingSentAt = nil
+            if rtt >= 0 and rtt < 5000 and LC.state then LC.state.ping = math.floor(rtt) end
+        end
+        log.debug('pong from server (latency %s ms)', tostring(LC.state and LC.state.ping))
     end)
 
     events.on('loginError', function(d) fatal(2, 'login refused: %s', tostring(d.message)) end)
@@ -415,6 +555,23 @@ local function runDryRun(cfg)
     if not ok3 then error('dry-run: ping frame rejected') end
     assert(#wire == before + 1, 'dry-run: the server ping was not answered')
     log.info('dry-run: server ping answered with opcode 28 (%d frames on the wire total)', #wire)
+
+    -- 5. the bot layer, when asked for: construct, wire, tick, stop.  Everything the
+    --    live path does except the socket, so --bot --dry-run is a real wiring check.
+    if cfg.bot then
+        LC.state.player.pos = LC.state.player.pos or { x = 32369, y = 32241, z = 7 }
+        startBot(cfg)
+        if not LC.bot then error('dry-run: the bot layer failed to start') end
+        local b = LC.bot
+        local macros = #b._macros
+        for _ = 1, 50 do b:tick() end
+        botStatusLine()
+        log.info('dry-run: bot wired -- %d macros, %d ticks, %d macro errors, world %s',
+                 macros, b.stats.ticks, b.stats.macroErrors,
+                 tostring(b.world and b.world.itemDataLevel))
+        if b.stats.macroErrors > 0 then error('dry-run: a bot macro raised') end
+        stopBot()
+    end
 
     log.info('--dry-run OK: items, login packet, framing, parser, events and the ping rules all wired')
     return 0

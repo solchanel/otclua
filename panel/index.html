@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="referrer" content="no-referrer">
+<title>luaclient hub</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='4' fill='%230d1117'/%3E%3Ccircle cx='8' cy='8' r='3.4' fill='%234c9aff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<a class="sr" href="#main">Skip to content</a>
+
+<div id="app">
+  <!-- filled by app.js -->
+</div>
+
+<div id="modal-back" hidden></div>
+<div id="toasts" role="status" aria-live="polite"></div>
+
+<!--
+  Mock mode: open this file with ?mock=1 (works straight off the filesystem).
+  document.write keeps the script order deterministic without a bundler; the
+  mock installs window.HubMock, and app.js picks it up if present.
+-->
+<script>
+(function () {
+  try {
+    if (/[?&]mock=1(?:&|$)/.test(window.location.search)) {
+      document.write('<script src="mock/api.js"><\/script>');
+    }
+  } catch (e) { /* nothing we can do this early */ }
+})();
+</script>
+<script src="app.js"></script>
+
+</body>
+</html>

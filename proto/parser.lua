@@ -855,6 +855,8 @@ S[0x17] = function(self, R)                       -- LoginSuccess (parseLogin)
   local pl = self:player()
   pl.id = d.playerId
   self.serverBeat = d.serverBeat
+  -- the bot layer's step timer rounds to this (bot/walker.lua:stepDuration)
+  self.state.serverBeat = d.serverBeat
   self.speedA, self.speedB, self.speedC = d.speedA, d.speedB, d.speedC
   self.emit('login', d)
 end
@@ -884,7 +886,16 @@ end
 S[0x1F] = function(self, R)                       -- Challenge
   local ts  = R:u32()
   local rnd = R:u8()
-  if self.clientVersion >= 1405 then R:u8() end   -- skipped byte
+  -- The C++ reference reads one more byte here at >= 1405, but that byte is the
+  -- trailing PADDING of the first (pre-XTEA) frame: ProtocolGame::onRecv consumes
+  -- the leading padding-count byte without shrinking the message, so the padding
+  -- tail is still inside the buffer when parseLoginChallenge runs.  Our transport
+  -- strips both ends of the padding (docs/framing-crypto.md, Corrections), so the
+  -- byte is normally already gone.  Consume it only if the server actually sent a
+  -- non-empty tail, which keeps us correct against either framing.
+  -- Verified against the live server 2026-09-06: the challenge arrives as exactly
+  -- 6 bytes (1F + u32 + u8) and an unconditional skip over-read by one.
+  if R:remaining() > 0 then R:u8() end
   self.emit('challenge', { timestamp = ts, random = rnd })
 end
 
@@ -1449,12 +1460,21 @@ end
 
 -- --- npc trade / trade -----------------------------------------------------
 S[0x7A] = function(self, R)                       -- OpenNpcTrade
+  -- The offer list is what bot/cavebot.lua's `buysupplies` / `sellall` waypoints need
+  -- to know what this NPC actually trades, so it is KEPT on the state (it used to be
+  -- parsed and discarded).  Cleared by 0x7C CloseNpcTrade.
   if self:feat(F_NAME_ON_NPC_TRADE) then R:string() end
   if self.clientVersion >= 1281 then R:u16(); R:string() end
   local n = (self.clientVersion >= 900) and R:u16() or R:u8()
+  local list = {}
   for _ = 1, n do
-    R:u16(); R:u8(); R:string(); R:u32(); R:u32(); R:u32()
+    local id, sub, name = R:u16(), R:u8(), R:string()
+    local weight, buy, sell = R:u32(), R:u32(), R:u32()
+    list[#list + 1] = { id = id, subType = sub, name = name,
+                        weight = weight, buyPrice = buy, sellPrice = sell }
   end
+  self.state.npcTrade = { open = true, items = list }
+  self.emit('npcTrade', self.state.npcTrade)
 end
 
 S[0x7B] = function(self, R)                       -- PlayerGoods
@@ -1468,7 +1488,10 @@ S[0x7B] = function(self, R)                       -- PlayerGoods
   end
 end
 
-S[0x7C] = function(self, R) end                   -- CloseNpcTrade (empty)
+S[0x7C] = function(self, R)                       -- CloseNpcTrade (empty payload)
+  self.state.npcTrade = { open = false, items = {} }
+  self.emit('npcTradeClose', self.state.npcTrade)
+end
 
 S[0x7D] = function(self, R)                       -- OwnTrade
   R:string()
