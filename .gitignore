@@ -1,0 +1,5 @@
+*.log
+*.cap
+*.lcap
+capture-*
+scratch/

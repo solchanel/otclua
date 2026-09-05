@@ -1,0 +1,599 @@
+--[[============================================================================
+main.lua -- entry point, CLI, module wiring and the boot sequence.
+
+  run.bat --account=you@example.com --password=... --character="Char Name"
+
+Boot order (API.md, and the ordering constraints the module agents flagged):
+
+  parse flags
+    -> package.path
+    -> load proto/items.lua           (the parser cannot decode a tile without it)
+    -> HTTPS account login            (proto/login_http via proto/handshake)
+    -> pick world + character
+    -> transport.new{worldName=...}   world name is set BEFORE connect()
+    -> connect (async) -> raw "<world>\n" preamble
+    -> server 0x1F challenge  -> buildLoginPacket -> transport:send()  (seq 0, XTEA OFF)
+                              -> transport:enableXtea(key)   AFTER the packet is queued
+    -> server 0x0A pending    -> the TWO enter-game frames, sent separately (seq 1, 2)
+    -> server 0x0A/0x17...    -> gameStart; arm the 10 s keepalive ping
+    -> sched.run() parse loop
+
+Ping rules (docs/state-events.md §14, GameClientPing ON at 1530):
+  * server 0x1E is the PONG for our ping  -> latency sample only
+  * server 0x1D is a ping REQUEST         -> we must answer immediately with
+    opcode 28 (ClientPingBackGunz, because OS is 61 and cv >= 1200)
+  * our own keepalive is opcode 29 (ClientPing) every 10 s.
+
+The only global is `_G.LC` (API.md).
+============================================================================]]
+
+io.stdout:setvbuf('line')
+
+-- ---------------------------------------------------------------- package.path
+local SCRIPT_DIR
+do
+    local src = debug.getinfo(1, 'S').source
+    if src:sub(1, 1) == '@' then
+        SCRIPT_DIR = src:sub(2):match('^(.*)[/\\][^/\\]*$')
+    end
+    SCRIPT_DIR = (SCRIPT_DIR or '.'):gsub('\\', '/')
+    package.path = SCRIPT_DIR .. '/?.lua;' .. SCRIPT_DIR .. '/?/init.lua;' .. package.path
+end
+
+-- =============================================================== CLI parsing
+local USAGE = [[
+luaclient -- standalone LuaJIT worker client for Gunzodus (protocol 1530, OS 61)
+
+  run.bat [flags]                (or: luajit main.lua [flags])
+
+Account / session
+  --account=EMAIL          account (email) for the HTTPS login
+  --password=PASS          account password        (never logged)
+  --token=DIGITS           authenticator token, when the account has 2FA
+  --character=NAME         character to enter with (default: the first one)
+  --session-key=KEY        skip the HTTPS login and use this session key
+                           (needs --character and --host=HOST:PORT)
+  --world=NAME             restrict the character choice to this world
+  --host=HOST[:PORT]       override the game-server address from the login reply
+  --port=N                 override the game-server port
+
+Runtime
+  --assets=DIR             directory holding items1530.bin (default: ./assets)
+  --content-revision=N     override the login packet's content revision string
+  --log-level=LEVEL        debug | info | warn | error          (default: info)
+  --log-file=PATH          append every log line to PATH as well
+  --capture=PATH           append every inbound payload as a .cam '<' record
+  --ping=MS                keepalive interval in ms             (default: 10000)
+
+Modes
+  --dry-run                offline: no sockets, no HTTPS; exercises the whole
+                           wiring (items, login packet, framing, parser, events)
+  --selftest               run test/selftest.lua and exit with its status
+  --replay=FILE            run test/replay.lua over FILE and exit
+  -h, --help               this text
+
+Exit codes: 0 ok, 1 usage/config error, 2 login refused by the server,
+            3 protocol/runtime failure.
+]]
+
+local function parseArgs(argv)
+    local cfg = {
+        logLevel = 'info',
+        pingMs   = 10000,
+    }
+    local i = 1
+    local function valueOf(name, inlineValue)
+        if inlineValue then return inlineValue end
+        i = i + 1
+        local v = argv[i]
+        if v == nil then
+            return nil, ('--%s needs a value'):format(name)
+        end
+        return v
+    end
+
+    while i <= #argv do
+        local a = argv[i]
+        local name, inline = a:match('^%-%-([%w%-]+)=(.*)$')
+        if not name then name = a:match('^%-%-([%w%-]+)$') end
+        if a == '-h' then name = 'help' end
+
+        if not name then
+            return nil, ('unexpected argument %q'):format(a)
+        end
+
+        local v, err
+        if name == 'account' or name == 'password' or name == 'token'
+        or name == 'character' or name == 'world' or name == 'host'
+        or name == 'assets' or name == 'log-level' or name == 'log-file'
+        or name == 'capture' or name == 'port' or name == 'ping'
+        or name == 'content-revision' or name == 'replay' or name == 'login-url'
+        or name == 'session-key' then
+            v, err = valueOf(name, inline)
+            if not v then return nil, err end
+        elseif inline ~= nil and inline ~= '' then
+            return nil, ('--%s takes no value'):format(name)
+        end
+
+        if     name == 'account'   then cfg.account = v
+        elseif name == 'password'  then cfg.password = v
+        elseif name == 'token'     then cfg.token = v
+        elseif name == 'character' then cfg.character = v
+        elseif name == 'world'     then cfg.world = v
+        elseif name == 'host'      then
+            local h, p = v:match('^(.-):(%d+)$')
+            if h then cfg.host, cfg.port = h, tonumber(p) else cfg.host = v end
+        elseif name == 'port'      then cfg.port = tonumber(v)
+        elseif name == 'assets'    then cfg.assets = v
+        elseif name == 'content-revision' then cfg.contentRevision = v
+        elseif name == 'log-level' then cfg.logLevel = v
+        elseif name == 'log-file'  then cfg.logFile = v
+        elseif name == 'capture'   then cfg.capture = v
+        elseif name == 'login-url' then cfg.loginUrl = v
+        elseif name == 'session-key' then cfg.sessionKey = v
+        elseif name == 'ping'      then cfg.pingMs = tonumber(v) or 10000
+        elseif name == 'replay'    then cfg.replay = v
+        elseif name == 'dry-run'   then cfg.dryRun = true
+        elseif name == 'selftest'  then cfg.selftest = true
+        elseif name == 'help'      then cfg.help = true
+        else return nil, ('unknown flag --%s (try --help)'):format(name)
+        end
+        i = i + 1
+    end
+    return cfg
+end
+
+-- =========================================================== module wiring
+local log      = require('lib.log')
+local sys      = require('lib.sys')
+local events   = require('lib.events')
+local sched    = require('lib.sched')
+local state    = require('game.state')
+local items    = require('proto.items')
+local transport = require('proto.transport')
+local handshake = require('proto.handshake')
+local parser   = require('proto.parser')
+local sender   = require('proto.sender')
+
+local LC = {
+    log       = log,
+    sys       = sys,
+    sched     = sched,
+    events    = events,
+    items     = items,
+    state     = nil,
+    transport = nil,
+    parser    = nil,
+    sender    = nil,
+    config    = nil,
+    dir       = SCRIPT_DIR,
+    exitCode  = 0,
+}
+_G.LC = LC
+
+-- ---------------------------------------------------------------- shutdown
+local shuttingDown = false
+local function shutdown(code)
+    if shuttingDown then return end
+    shuttingDown = true
+    LC.exitCode = code or LC.exitCode or 0
+    if LC.pingTimer then pcall(sched.cancel, LC.pingTimer); LC.pingTimer = nil end
+    if LC.transport then pcall(function() LC.transport:close() end) end
+    if LC.captureFile then pcall(function() LC.captureFile:close() end); LC.captureFile = nil end
+    pcall(sched.stop)
+end
+
+-- fatal(msg) -- one clean line, no stack trace, then unwind the loop.
+local function fatal(code, fmt, ...)
+    log.error(fmt, ...)
+    shutdown(code)
+end
+
+-- ------------------------------------------------------------- status line
+-- "log `player: hp/mana/level/pos` whenever any of them changes"
+local lastStatus = {}
+local function statusLine(force)
+    local pl = LC.state and LC.state.player
+    if not pl then return end
+    local pos = pl.pos
+    local key = table.concat({
+        tostring(pl.health), tostring(pl.maxHealth),
+        tostring(pl.mana), tostring(pl.maxMana),
+        tostring(pl.level),
+        pos and (pos.x .. ',' .. pos.y .. ',' .. pos.z) or '-',
+    }, '|')
+    if not force and key == lastStatus.key then return end
+    lastStatus.key = key
+    log.info('player: hp %d/%d  mana %d/%d  level %d  pos %s',
+        pl.health or 0, pl.maxHealth or 0, pl.mana or 0, pl.maxMana or 0, pl.level or 0,
+        pos and ('(%d,%d,%d)'):format(pos.x, pos.y, pos.z) or '(unknown)')
+end
+
+-- =============================================================== capture
+local function openCapture(path)
+    if not path then return end
+    local f, err = io.open(path, 'a')
+    if not f then
+        log.warn('capture: cannot open %s (%s) -- continuing without it', path, tostring(err))
+        return
+    end
+    LC.captureFile = f
+    LC.captureStart = sys.nowMs()
+    log.info('capture: appending inbound payloads to %s', path)
+end
+
+local HEXD = {}
+for b = 0, 255 do HEXD[string.char(b)] = ('%02x'):format(b) end
+local function toHex(s) return (s:gsub('.', HEXD)) end
+
+local function captureIn(payload)
+    local f = LC.captureFile
+    if not f then return end
+    f:write('< ', tostring(math.floor(sys.nowMs() - (LC.captureStart or 0))), ' ',
+            toHex(payload), '\n')
+    f:flush()
+end
+
+-- =============================================================== game wiring
+-- Build state/parser/sender/transport and hook the event bus. `t` may be nil in
+-- dry-run mode (the parser and the event bus are still fully exercised).
+local function buildGame(cfg, t)
+    local st = state.new()
+    LC.state = st
+    LC.transport = t
+
+    local p = parser.new(st, function(name, data)
+        events.emit(name, data)
+    end)
+    LC.parser = p
+
+    local s = sender.new(t)
+    LC.sender = s
+
+    -- every event may have moved hp/mana/level/pos
+    events.onAny(function() statusLine(false) end)
+
+    -- TEST HOOK, never for production use: LUACLIENT_TEST_XTEA=<32 hex chars>
+    -- pins the session key so an offline fake server (which has no RSA private
+    -- key and therefore cannot read the real one) can decrypt our frames.
+    local function fixedXteaKey()
+        local hex = sys.getEnv('LUACLIENT_TEST_XTEA')
+        if not hex or #hex ~= 32 or hex:match('%X') then return nil end
+        log.warn('LUACLIENT_TEST_XTEA is set: using a FIXED, NON-SECRET XTEA key (testing only)')
+        local k = {}
+        for i = 0, 3 do k[i + 1] = tonumber(hex:sub(i * 8 + 1, i * 8 + 8), 16) end
+        return k
+    end
+
+    events.on('challenge', function(d)
+        log.info('challenge: ts=%d random=%d -- sending login packet', d.timestamp, d.random)
+        local body, key = handshake.buildLoginPacket{
+            xteaKey         = fixedXteaKey(),
+            sessionKey      = cfg.sessionKey,
+            accountName     = cfg.account,
+            characterName   = cfg.characterName,
+            challengeTs     = d.timestamp,
+            challengeRand   = d.random,
+            contentRevision = cfg.contentRevision,
+            assetsDir       = cfg.assetsRoot,
+        }
+        local ok, err = t:send(body)
+        if not ok then return fatal(3, 'failed to send the login packet: %s', tostring(err)) end
+        -- XTEA turns on only AFTER the login packet has been framed in plaintext.
+        t:enableXtea(key)
+        log.info('login packet sent (%d body bytes); XTEA enabled', #body)
+    end)
+
+    events.on('pending', function()
+        log.info('server accepted the login (pending) -- entering game')
+        local frames = handshake.buildEnterGameFrames(cfg.account or '')
+        for _, body in ipairs(frames) do
+            local ok, err = t:send(body)
+            if not ok then return fatal(3, 'failed to send an enter-game frame: %s', tostring(err)) end
+        end
+    end)
+
+    -- The keepalive is armed by whichever of the two "we are in" packets arrives
+    -- first: 0x0F EnterGame (-> gameStart) or 0x17 LoginSuccess (-> login).
+    local function armPing(what)
+        LC.inGame = true
+        if LC.pingTimer then return end
+        log.info('%s -- arming the %d ms keepalive ping (opcode 29)', what, cfg.pingMs or 10000)
+        LC.pingTimer = sched.every(cfg.pingMs or 10000, function()
+            if LC.transport and not LC.transport.dead then LC.sender:ping() end
+        end)
+        statusLine(true)
+    end
+    events.on('gameStart', function() armPing('game started') end)
+    events.on('login', function(d)
+        armPing(('login success (player id %s)'):format(tostring(d and d.playerId)))
+    end)
+
+    -- 0x1D: the server asks US to answer -> pong immediately (opcode 28).
+    events.on('ping', function()
+        if LC.transport and not LC.transport.dead then LC.sender:pingBack() end
+    end)
+    events.on('pingBack', function()
+        log.debug('pong from server (latency sample)')
+    end)
+
+    events.on('loginError', function(d) fatal(2, 'login refused: %s', tostring(d.message)) end)
+    events.on('loginWait',  function(d) log.warn('login wait: %s (%s s)', tostring(d.message), tostring(d.time)) end)
+    events.on('loginAdvice', function(d) log.info('server: %s', tostring(d.message)) end)
+    events.on('sessionEnd', function(d) fatal(0, 'session ended by the server (reason %s)', tostring(d.reason)) end)
+    events.on('death', function() log.warn('the character has died') end)
+    events.on('talk', function(d)
+        log.info('talk [%s] %s: %s', tostring(d.mode), tostring(d.name), tostring(d.text))
+    end)
+    events.on('textMessage', function(d)
+        log.info('message [%s] %s', tostring(d.mode), tostring(d.text))
+    end)
+
+    return st, p, s
+end
+
+-- =============================================================== dry run
+-- Everything except sockets and HTTPS: items table, login-packet construction,
+-- outgoing framing, the receive path (fed one byte at a time), parser dispatch
+-- and the event bus. Exercises the exact wiring the live path uses.
+local function runDryRun(cfg)
+    log.info('--dry-run: offline wiring check (no sockets, no HTTPS)')
+
+    local nItems = items.MAX_ID
+    log.info('items: %d ids, %d with an appearance, revision %s',
+        nItems, items.COUNT, tostring(items.CONTENT_REVISION))
+
+    -- A transport that never touches a socket: capture the frames it builds.
+    local wire = {}
+    local t = transport.new{
+        host = '127.0.0.1', port = 0, worldName = cfg.world or 'Gunzodus',
+        onMessage = function(payload)
+            local ok, err = pcall(function() LC.parser:parse(payload) end)
+            if not ok then error(err, 0) end
+        end,
+        onError = function(msg) fatal(3, 'transport: %s', msg) end,
+    }
+    t._write = function(self, bytes) wire[#wire + 1] = bytes; return true end
+
+    buildGame({
+        account = cfg.account or 'dryrun@example.invalid',
+        characterName = cfg.character or 'DryRun',
+        sessionKey = 'DRYRUN-SESSION-KEY',
+        contentRevision = cfg.contentRevision,
+        assetsRoot = cfg.assetsRoot,
+        pingMs = cfg.pingMs,
+    }, t)
+
+    -- The server side of the same framing code, so a frame we build is a frame
+    -- we can read back.
+    local peer = transport.new{ gunzOs = false, onMessage = function() end }
+
+    -- 1. challenge -> login packet
+    local challenge = string.char(0x1F) .. string.char(0x44, 0x33, 0x22, 0x11)
+                      .. string.char(0x5A) .. string.char(0)
+    local frame = peer:buildFrame(challenge)
+    for k = 1, #frame do
+        local ok, err = t:feed(frame:sub(k, k))
+        if not ok then error('dry-run: transport rejected the challenge frame: ' .. tostring(err)) end
+    end
+    assert(#wire == 1, 'dry-run: expected exactly one outgoing frame after the challenge')
+    local loginFrame = wire[1]
+    assert(#loginFrame == 158, ('dry-run: login frame is %d bytes, expected 158'):format(#loginFrame))
+    assert(t.xteaOn, 'dry-run: XTEA was not enabled after the login packet')
+    log.info('dry-run: login frame %d bytes, %d blocks, sequence 0, XTEA now on',
+        #loginFrame, loginFrame:byte(1) + loginFrame:byte(2) * 256)
+
+    -- 2. pending -> the two enter-game frames (separately framed, seq 1 and 2)
+    peer:enableXtea(t.xteaKey)
+    local ok, err = t:feed(peer:buildFrame(string.char(0x0A)))
+    if not ok then error('dry-run: pending frame rejected: ' .. tostring(err)) end
+    assert(#wire == 3, ('dry-run: expected 2 enter-game frames, got %d'):format(#wire - 1))
+    assert(t.stats.seq == 3, 'dry-run: sequence should be 3 after login + 2 enter-game frames')
+    log.info('dry-run: enter-game frames sent (hwid %s), sequence now %d',
+        handshake.hwid(cfg.account or 'dryrun@example.invalid'), t.stats.seq)
+
+    -- 3. a gameplay packet through the real parser + event bus
+    local seen = {}
+    events.onAny(function(name) seen[name] = (seen[name] or 0) + 1 end)
+    -- 0xA0 PlayerData: exactly 60 payload bytes at 1530
+    local w = require('lib.buffer').writer()
+    w:u8(0xA0)
+    w:u32(150):u32(200):u32(87650):u64(1234):u16(8):u16(4200)
+    w:u16(0):u16(0):u16(0):u16(0)
+    w:u32(30):u32(60):u8(100):u16(2400):u16(220):u16(0):u16(0)
+    w:u16(0):u8(0)
+    w:u32(0):u32(0)
+    local ok2, err2 = t:feed(peer:buildFrame(w:data()))
+    if not ok2 then error('dry-run: PlayerData frame rejected: ' .. tostring(err2)) end
+    assert(seen.healthChange == 1, 'dry-run: healthChange did not fire')
+    assert(LC.state.player.health == 150 and LC.state.player.level == 8,
+        'dry-run: player state was not updated')
+
+    -- 4. the ping rules: a server 0x1D must produce a pong on the wire
+    local before = #wire
+    local ok3 = t:feed(peer:buildFrame(string.char(0x1D)))
+    if not ok3 then error('dry-run: ping frame rejected') end
+    assert(#wire == before + 1, 'dry-run: the server ping was not answered')
+    log.info('dry-run: server ping answered with opcode 28 (%d frames on the wire total)', #wire)
+
+    log.info('--dry-run OK: items, login packet, framing, parser, events and the ping rules all wired')
+    return 0
+end
+
+-- =============================================================== live boot
+local function pickCharacter(cfg, login)
+    local chars = login.characters or {}
+    if #chars == 0 then return nil, 'the account has no characters' end
+    local wanted = cfg.character and cfg.character:lower()
+    local world  = cfg.world and cfg.world:lower()
+    local names = {}
+    for _, c in ipairs(chars) do
+        names[#names + 1] = ('%s (%s)'):format(tostring(c.name), tostring(c.worldName or c.world))
+        local nameOk  = (not wanted) or (c.name and c.name:lower() == wanted)
+        local worldOk = (not world) or ((c.worldName or c.world or ''):lower() == world)
+        if nameOk and worldOk then return c end
+    end
+    return nil, ('no character matched (available: %s)'):format(table.concat(names, ', '))
+end
+
+local function runLive(cfg)
+    local login
+
+    if cfg.sessionKey then
+        -- Skip the HTTPS round trip and use a session key we already hold.
+        -- Requires --host/--port and --character, since there is no reply to
+        -- read the world address out of.
+        if not cfg.character then return 1, '--session-key also needs --character' end
+        if not cfg.host or not cfg.port then return 1, '--session-key also needs --host=HOST:PORT' end
+        login = {
+            sessionKey = cfg.sessionKey,
+            worlds = {},
+            characters = { { name = cfg.character, worldName = cfg.world or 'Gunzodus',
+                             host = cfg.host, port = cfg.port } },
+        }
+        log.info('using the session key supplied on the command line (no HTTPS login)')
+    else
+        -- 1. HTTPS account login --------------------------------------------
+        if not cfg.account or cfg.account == '' then
+            return 1, '--account is required (try --help)'
+        end
+        if not cfg.password then
+            return 1, '--password is required (try --help)'
+        end
+        log.info('logging in as %s ...', cfg.account)
+        local msg, code
+        login, msg, code = handshake.httpLogin{
+            account  = cfg.account,
+            password = cfg.password,
+            token    = cfg.token,
+            url      = cfg.loginUrl,
+        }
+        cfg.password = nil                            -- never keep it around
+        if not login then
+            if code == 6 then
+                return 2, ('login refused: %s (pass --token=DIGITS)'):format(tostring(msg))
+            end
+            return 2, ('login refused: %s'):format(tostring(msg))
+        end
+        log.info('login ok: %d character(s)', #(login.characters or {}))
+    end
+
+    -- 2. world + character ---------------------------------------------------
+    local ch, err = pickCharacter(cfg, login)
+    if not ch then return 1, err end
+    local host = cfg.host or ch.host
+    local port = cfg.port or ch.port
+    local worldName = ch.worldName or ch.world
+    if not host or not port then
+        return 1, ('the login reply has no address for world %s'):format(tostring(worldName))
+    end
+    log.info('character: %s @ %s (%s:%d)', tostring(ch.name), tostring(worldName), host, port)
+
+    -- 3. transport -----------------------------------------------------------
+    local t
+    t = transport.new{
+        host = host, port = port,
+        worldName = worldName,                         -- set BEFORE connect()
+        onConnect = function()
+            log.info('connected to %s:%d, world preamble sent', host, port)
+        end,
+        onMessage = function(payload)
+            captureIn(payload)
+            local ok, perr = pcall(function() LC.parser:parse(payload) end)
+            if not ok then
+                fatal(3, 'parser desync -- disconnecting.\n%s', tostring(perr))
+            end
+        end,
+        onError = function(m)
+            m = tostring(m)
+            -- A peer disconnect after we were in the game is a normal end of
+            -- session, not a protocol failure.
+            local closed = m:find('closed', 1, true) or m:find('CONNRESET', 1, true)
+            if closed and LC.inGame then
+                log.warn('the server closed the connection')
+                return shutdown(0)
+            end
+            fatal(3, 'transport: %s', m)
+        end,
+    }
+
+    buildGame({
+        account         = cfg.account,
+        characterName   = ch.name,
+        sessionKey      = login.sessionKey,
+        contentRevision = cfg.contentRevision,
+        assetsRoot      = cfg.assetsRoot,
+        pingMs          = cfg.pingMs,
+    }, t)
+    login.sessionKey = nil
+
+    local ok, cerr = t:connect()
+    if not ok then return 3, ('connect failed: %s'):format(tostring(cerr)) end
+
+    -- 4. loop ----------------------------------------------------------------
+    sched.run()
+    return LC.exitCode or 0
+end
+
+-- =============================================================== entry point
+local function main(argv)
+    local cfg, perr = parseArgs(argv)
+    if not cfg then
+        io.stderr:write('luaclient: ', perr, '\n')
+        return 1
+    end
+    LC.config = cfg
+
+    if cfg.help then
+        io.stdout:write(USAGE)
+        return 0
+    end
+
+    log.setLevel(cfg.logLevel)
+    if cfg.logFile then
+        local ok, ferr = log.setFile(cfg.logFile)
+        if not ok then io.stderr:write('luaclient: --log-file: ', tostring(ferr), '\n'); return 1 end
+    end
+
+    if cfg.selftest then
+        return (dofile(SCRIPT_DIR .. '/test/selftest.lua')) or 0
+    end
+    if cfg.replay then
+        LC.replayTarget = cfg.replay
+        return (dofile(SCRIPT_DIR .. '/test/replay.lua')) or 0
+    end
+
+    -- items table (both modes need it: the parser cannot decode a tile without it)
+    cfg.assetsRoot = cfg.assets or (SCRIPT_DIR .. '/assets')
+    local ok, ierr = pcall(items.load, cfg.assets or (SCRIPT_DIR .. '/assets/items1530.bin'))
+    if not ok then
+        io.stderr:write('luaclient: ', tostring(ierr), '\n')
+        return 1
+    end
+
+    openCapture(cfg.capture)
+
+    if cfg.dryRun then
+        return runDryRun(cfg) or 0
+    end
+
+    local code, lerr = runLive(cfg)
+    if lerr then log.error('%s', lerr) end
+    return code or 0
+end
+
+local ok, res = xpcall(function() return main(arg or {}) end, function(e)
+    -- Graceful shutdown on an unexpected error: one line, no stack trace on stdout.
+    -- The traceback goes to the debug log only.
+    log.debug('traceback: %s', debug.traceback(tostring(e), 2))
+    return tostring(e)
+end)
+
+shutdown(ok and res or 3)
+pcall(sys.shutdown)
+
+if not ok then
+    log.error('fatal: %s', tostring(res))
+    os.exit(3)
+end
+os.exit(tonumber(res) or 0)
