@@ -66,6 +66,12 @@ local OP = {
     Attack                = 0xA1,
     Follow                = 0xA2,
     CancelAttackAndFollow = 0xBE,
+    SeekInContainer       = 0xCC,
+    RequestOutfit         = 0xD2,
+    ChangeOutfit          = 0xD3,
+    BuyItem               = 0x7A,
+    SellItem              = 0x7B,
+    CloseNpcTrade         = 0x7C,
     AnswerModalDialog     = 0xF9,
 }
 sender.OPCODES = OP
@@ -168,6 +174,24 @@ local function isValidPos(p)
 end
 sender.isValidPos = isValidPos
 
+-- boolean | number | nil -> a byte value.  Used by every builder whose wire field is a
+-- 0/1 flag or a small enum, so `true` and `1` are always interchangeable.
+local function boolByte(v)
+    if type(v) == 'boolean' then return v and 1 or 0 end
+    if type(v) ~= 'number' then return 0 end
+    return math.floor(v)
+end
+sender.boolByte = boolByte
+
+-- stackpos / count / index arguments: floor them so the byte written and any later exact
+-- comparison against the same value can never disagree (see sender:talk's aimMode).
+local function u8arg(v, default)
+    if v == nil then return default or 0 end
+    if type(v) == 'boolean' then return v and 1 or 0 end
+    if type(v) ~= 'number' then error('sender: expected a number, got ' .. type(v), 3) end
+    return math.floor(v)
+end
+
 local function writePos(w, p)
     if type(p) ~= 'table' then error('sender: expected a position table {x=,y=,z=}', 3) end
     w:u16(p.x); w:u16(p.y); w:u8(p.z)
@@ -176,9 +200,13 @@ end
 -- ---------------------------------------------------------------------------
 -- construction / plumbing
 -- ---------------------------------------------------------------------------
-function sender.new(transport)
+-- sender.new(transport [, opts])
+--   opts.accountName -- used to derive the gunz hwid fingerprint that enterGame() appends
+function sender.new(transport, opts)
+    opts = opts or {}
     return setmetatable({
         transport = transport,
+        accountName = opts.accountName,
         -- Game::attack/follow set m_seq to the TARGET CREATURE ID at protocolVersion >= 963
         -- (docs/state-events.md VERIFIER: "m_seq is the target creature's id, not a counter").
         -- On a cancel (creatureId == 0) the C++ leaves m_seq UNCHANGED, so we do too.
@@ -191,11 +219,17 @@ function sender:writer()
     return buffer.writer()
 end
 
--- assemble + hand off.  Returns the body string so tests can assert on the bytes.
+-- Assemble + hand off.  Returns the body string so tests can assert on the bytes -- or
+-- `nil, err` when the transport refused it (dead transport, failed socket write).  Silently
+-- swallowing that used to make every builder report success on a connection that was already
+-- gone, and count it in self.sent; the caller had no way to tell.
 function sender:_send(w)
     local body = w:data()
+    if self.transport then
+        local ok, err = self.transport:send(body)
+        if not ok then return nil, err or 'send failed' end
+    end
     self.sent = self.sent + 1
-    if self.transport then self.transport:send(body) end
     return body
 end
 
@@ -213,8 +247,18 @@ end
 -- (protocolgamesend.cpp:227-249); pass the fingerprint to emit that second frame too.
 -- proto/handshake.lua's buildEnterGameFrames() builds the same pair for the boot path.
 function sender:enterGame(hwid)
-    local body = self:_send(op(self, OP.EnterGame))
-    if hwid ~= nil then
+    -- sendEnterGame emits BOTH frames unconditionally on a gunz OS, so the fingerprint frame
+    -- must not be opt-in: the documented `s:enterGame()` call has to produce the same pair
+    -- that proto/handshake.buildEnterGameFrames() does.  Pass hwid = false to suppress it.
+    if hwid == nil then
+        local ok, hs = pcall(require, 'proto.handshake')
+        if ok and type(hs) == 'table' and hs.hwid then
+            hwid = hs.hwid(self.accountName or '')
+        end
+    end
+    local body, err = self:_send(op(self, OP.EnterGame))
+    if not body then return nil, err end
+    if hwid then
         local w = op(self, OP.ExtendedOpcode)
         w:u8(10)
         w:string(hwid)
@@ -273,13 +317,18 @@ end
 function sender:autoWalk(dirs)
     if type(dirs) ~= 'table' then error('sender:autoWalk: dirs must be an array', 2) end
     local n = #dirs
-    if n > 127 then n = 127 end
+    if n > 127 then n = 127 end       -- the count is a u8 and the client-side limit is 127
     local w = op(self, OP.AutoWalk)
     w:u8(n)
     for i = 1, n do
         w:u8(AUTOWALK_BYTE[dirs[i]] or 0)
     end
-    return self:_send(w)
+    -- Second return value = the number of steps actually sent.  When it is < #dirs the path
+    -- was clamped and the CALLER must re-issue autoWalk for the remainder; returning the same
+    -- single value as a complete send hid the truncation entirely.
+    local body, err = self:_send(w)
+    if not body then return nil, err end
+    return body, n
 end
 
 -- ---------------------------------------------------------------------------
@@ -305,6 +354,10 @@ function sender:talk(mode, channelId, receiver, text, aimMode, aimPos)
     if type(aimMode) ~= 'number' or aimMode < 0 or aimMode > 3 then
         return nil, 'invalid spell aim mode'
     end
+    -- w:u8 floors, but the "does a Position follow?" test below is an exact == 1 / == 2.
+    -- Without this a fractional 1.4 would put wire byte 1 (crosshair) on the wire and OMIT
+    -- the 5-byte Position, leaving the server 5 bytes short for the rest of the session.
+    aimMode = math.floor(aimMode)
     if (aimMode == 1 or aimMode == 2) and not isValidPos(aimPos) then
         return nil, 'spell aim mode requires a valid map position'
     end
@@ -339,8 +392,8 @@ function sender:use(pos, itemId, stackpos, index)
     local w = op(self, OP.UseItem)
     writePos(w, pos)
     w:u16(itemId)
-    w:u8(stackpos or 0)
-    w:u8(index or 0)
+    w:u8(u8arg(stackpos))
+    w:u8(u8arg(index))
     return self:_send(w)
 end
 
@@ -349,10 +402,10 @@ function sender:useWith(fromPos, itemId, fromStack, toPos, toId, toStack)
     local w = op(self, OP.UseItemWith)
     writePos(w, fromPos)
     w:u16(itemId)
-    w:u8(fromStack or 0)
+    w:u8(u8arg(fromStack))
     writePos(w, toPos)
     w:u16(toId)
-    w:u8(toStack or 0)
+    w:u8(u8arg(toStack))
     return self:_send(w)
 end
 
@@ -361,7 +414,7 @@ function sender:useOnCreature(pos, itemId, stackpos, creatureId)
     local w = op(self, OP.UseOnCreature)
     writePos(w, pos)
     w:u16(itemId)
-    w:u8(stackpos or 0)
+    w:u8(u8arg(stackpos))
     w:u32(creatureId)
     return self:_send(w)
 end
@@ -372,9 +425,9 @@ function sender:move(fromPos, itemId, stackpos, toPos, count)
     local w = op(self, OP.Move)
     writePos(w, fromPos)
     w:u16(itemId)
-    w:u8(stackpos or 0)
+    w:u8(u8arg(stackpos))
     writePos(w, toPos)
-    w:u8(count or 1)
+    w:u8(u8arg(count, 1))
     return self:_send(w)
 end
 
@@ -383,7 +436,7 @@ function sender:look(pos, itemId, stackpos)
     local w = op(self, OP.Look)
     writePos(w, pos)
     w:u16(itemId)
-    w:u8(stackpos or 0)
+    w:u8(u8arg(stackpos))
     return self:_send(w)
 end
 
@@ -399,7 +452,7 @@ end
 function sender:equipItem(itemId, tier)
     local w = op(self, OP.EquipItem)
     w:u16(itemId)
-    w:u8(tier or 0)
+    w:u8(u8arg(tier))
     return self:_send(w)
 end
 
@@ -410,21 +463,29 @@ end
 -- 0xA1: u32 creatureId, u32 seq   (GameAttackSeq ON)
 function sender:attack(creatureId)
     creatureId = creatureId or 0
+    local prev = self.seq
     if creatureId ~= 0 then self.seq = creatureId end   -- cancel leaves m_seq alone
     local w = op(self, OP.Attack)
     w:u32(creatureId)
     w:u32(self.seq)
-    return self:_send(w)
+    local body, err = self:_send(w)
+    -- A frame that never left must not advance the client-side m_seq, or a later 0xA3
+    -- ClearTarget is compared against a target the server never learned about.
+    if not body then self.seq = prev; return nil, err end
+    return body
 end
 
 -- 0xA2: u32 creatureId, u32 seq
 function sender:follow(creatureId)
     creatureId = creatureId or 0
+    local prev = self.seq
     if creatureId ~= 0 then self.seq = creatureId end
     local w = op(self, OP.Follow)
     w:u32(creatureId)
     w:u32(self.seq)
-    return self:_send(w)
+    local body, err = self:_send(w)
+    if not body then self.seq = prev; return nil, err end
+    return body
 end
 
 function sender:cancelAttackAndFollow()
@@ -439,10 +500,11 @@ end
 -- `fight` (1 Offensive, 2 Balanced, 3 Defensive) is accepted for API symmetry and DISCARDED.
 function sender:setFightMode(fight, chase, safe, pvp)
     local w = op(self, OP.ChangeFightModes)
-    w:u8(chase or 0)
-    if type(safe) == 'boolean' then safe = safe and 1 or 0 end
-    w:u8(safe or 0)
-    w:u8(pvp or 0)
+    -- All three accept booleans: coercing only `safe` made the API asymmetric in a way that
+    -- crashed inside w:u8 -> math.floor for anyone who passed chase = true.
+    w:u8(boolByte(chase))
+    w:u8(boolByte(safe))
+    w:u8(boolByte(pvp))
     return self:_send(w)
 end
 
@@ -465,6 +527,76 @@ end
 function sender:upContainer(id)
     local w = op(self, OP.UpContainer)
     w:u8(id)
+    return self:_send(w)
+end
+
+-- 0xCC: u8 containerId, u16 index, u8 filter (always 0 -- docs/opcode-map.md §5 row 0xCC).
+-- This is how a paged container is scrolled; proto/parser.lua already decodes 0x6E's
+-- hasPages/firstIndex, so without it a bot can see the pages but not turn them.
+function sender:seekInContainer(containerId, index, filter)
+    local w = op(self, OP.SeekInContainer)
+    w:u8(u8arg(containerId))
+    w:u16(math.floor(index or 0))
+    w:u8(u8arg(filter))
+    return self:_send(w)
+end
+
+-- ---------------------------------------------------------------------------
+-- npc trade
+-- ---------------------------------------------------------------------------
+
+-- 0x7A: u16 itemId, u8 subType, u16 amount, u8 ignoreCapacity, u8 buyWithBackpack
+function sender:buyItem(itemId, subType, amount, ignoreCapacity, buyWithBackpack)
+    local w = op(self, OP.BuyItem)
+    w:u16(itemId)
+    w:u8(u8arg(subType))
+    w:u16(math.floor(amount or 1))
+    w:u8(boolByte(ignoreCapacity))
+    w:u8(boolByte(buyWithBackpack))
+    return self:_send(w)
+end
+
+-- 0x7B: u16 itemId, u8 subType, u16 amount, u8 ignoreEquipped
+function sender:sellItem(itemId, subType, amount, ignoreEquipped)
+    local w = op(self, OP.SellItem)
+    w:u16(itemId)
+    w:u8(u8arg(subType))
+    w:u16(math.floor(amount or 1))
+    w:u8(boolByte(ignoreEquipped))
+    return self:_send(w)
+end
+
+-- 0x7C, empty
+function sender:closeNpcTrade()
+    return self:_send(op(self, OP.CloseNpcTrade))
+end
+
+-- ---------------------------------------------------------------------------
+-- outfit
+-- ---------------------------------------------------------------------------
+
+-- 0xD2, empty
+function sender:requestOutfit()
+    return self:_send(op(self, OP.RequestOutfit))
+end
+
+-- 0xD3 -- docs/opcode-map.md §5.3, the 1530 form:
+--   u8 0x00 (normal outfit window), u16 lookType, 4x u8 colours, u8 addons,
+--   u16 mount, 4x u8 mount colours (always 0), u8 hasMount, u16 familiar, u8 randomizeMount.
+-- GameWingsAurasEffectsShader is OFF at 1530, so there is no wings/auras block.
+function sender:changeOutfit(outfit)
+    outfit = outfit or {}
+    local w = op(self, OP.ChangeOutfit)
+    w:u8(0x00)
+    w:u16(math.floor(outfit.id or outfit.lookType or 0))
+    w:u8(u8arg(outfit.head)); w:u8(u8arg(outfit.body))
+    w:u8(u8arg(outfit.legs)); w:u8(u8arg(outfit.feet))
+    w:u8(u8arg(outfit.addons))
+    w:u16(math.floor(outfit.mount or 0))
+    w:u8(0); w:u8(0); w:u8(0); w:u8(0)
+    w:u8(boolByte(outfit.hasMount))
+    w:u16(math.floor(outfit.familiar or 0))
+    w:u8(boolByte(outfit.randomizeMount))
     return self:_send(w)
 end
 

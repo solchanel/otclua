@@ -487,6 +487,13 @@ local function runLive(cfg)
     if not host or not port then
         return 1, ('the login reply has no address for world %s'):format(tostring(worldName))
     end
+    -- The world name is the raw preamble on the game socket, so a nil one is a wrong-bytes-
+    -- on-the-wire defect, not a cosmetic gap.  It can be nil while host/port are fine when
+    -- the character's worldid has no matching entry in playdata.worlds AND --host was given.
+    if not worldName or worldName == '' then
+        return 1, ('the login reply has no world name for character %s (pass --world=NAME)')
+            :format(tostring(ch.name))
+    end
     log.info('character: %s @ %s (%s:%d)', tostring(ch.name), tostring(worldName), host, port)
 
     -- 3. transport -----------------------------------------------------------

@@ -123,6 +123,18 @@ local F_TASKBOARD                = 134
 local F_MAP_MOVE_POSITION        = 31
 local F_MINIMAP_REMOVE           = 38
 local F_CHANNEL_PLAYER_LIST      = 11
+local F_DOUBLE_FREE_CAPACITY     = 6
+local F_DOUBLE_EXPERIENCE        = 7
+local F_SKILLS_BASE              = 9
+local F_PLAYER_REGENERATION_TIME = 10
+local F_OFFLINE_TRAINING_TIME    = 20
+local F_DOUBLE_HEALTH            = 28
+local F_PLAYER_STAMINA           = 43
+local F_LEVEL_U16                = 78
+local F_SOUL                     = 79
+local F_LEECH_AMOUNT             = 109
+local F_PVP_MODE                 = 50
+local F_TACTICS_NO_FIGHT_MODE    = 136
 
 -- docs/opcode-map.md §1 "ON at 1530", minus the six explicit disables.
 local FEATURES_ON_1530 = {
@@ -162,6 +174,14 @@ local TALK_NONE_BYTES    = { [4]=true,[5]=true,[11]=true,[13]=true,[15]=true }
 local MARKET_DESC_FIRST  = 1
 local MARKET_DESC_LAST   = 26
 local MARKET_DESC_AUGMENT = 16
+
+-- Otc::GameStoreInfoType_t / GameStoreInfoStatesType_t (const.h:947-960)
+local STORE_SHOW_NONE     = 0
+local STORE_SHOW_MOUNT    = 1
+local STORE_SHOW_OUTFIT   = 2
+local STORE_SHOW_ITEM     = 3
+local STORE_SHOW_HIRELING = 4
+local STORE_STATE_SALE    = 2
 
 -- ===========================================================================
 -- reader helpers
@@ -207,6 +227,17 @@ local function packedCount1500(R)
 end
 
 local function posKey(p) return p.x .. ',' .. p.y .. ',' .. p.z end
+
+-- items.flags() raises for id == 0 or id > MAX_ID, which is right inside readItem (the C++
+-- getItem really does throw there) but WRONG at the five sites where the C++ uses
+-- Item::create(id) / g_things.getThingType(id): those return the null ThingType, whose
+-- classification is 0, so no tier byte is read and nothing is thrown.  parseItemsPrice even
+-- documents it: "vanilla client allows made-up client ids / their classification is assumed
+-- as 0".  hasClassify() is that tolerant form.
+local function hasClassify(IT, id)
+  if type(id) ~= 'number' or id < 1 or id > IT.MAX_ID then return false end
+  return math.floor(IT.flags(id) / IT.CLASSIFY) % 2 == 1
+end
 
 -- ===========================================================================
 -- construction
@@ -383,6 +414,10 @@ end
 
 function P:setCentral(p)
   self.central = { x = p.x, y = p.y, z = p.z }
+  -- Map::setCentralPosition -> removeUnawareThings(): drop the tiles that just left the
+  -- aware range, exactly like the C++ (GameKeepUnawareTiles is never enabled).
+  local st = self.state
+  if st and st.setCentralPosition then st:setCentralPosition(self.central) end
   local pl = self:player()
   local old = pl.pos
   pl.pos = { x = p.x, y = p.y, z = p.z }
@@ -901,13 +936,13 @@ end
 S[0x33] = function(self, R)                       -- ChangeMapAwareRange
   local xr, yr = R:u8(), R:u8()
   -- the C++ casts each expression to uint8_t (map-parsing Correction #7)
-  local a = {
-    left   = (math.floor(xr / 2) - ((xr + 1) % 2)) % 256,
-    top    = (math.floor(yr / 2) - ((yr + 1) % 2)) % 256,
-    right  = math.floor(xr / 2) % 256,
-    bottom = math.floor(yr / 2) % 256,
-  }
-  self.aware = a
+  -- Mutate the EXISTING table: game/state.lua and this parser share one awareRange table
+  -- (parser.new aliases it), and re-pointing either side breaks that alias forever.
+  local a = self.aware
+  a.left   = (math.floor(xr / 2) - ((xr + 1) % 2)) % 256
+  a.top    = (math.floor(yr / 2) - ((yr + 1) % 2)) % 256
+  a.right  = math.floor(xr / 2) % 256
+  a.bottom = math.floor(yr / 2) % 256
   if self.state.world then self.state.world.awareRange = a end
   self.emit('awareRangeChange', a)
 end
@@ -1355,7 +1390,9 @@ end
 
 S[0x71] = function(self, R)                       -- ContainerUpdateItem
   local cid  = R:u8()
-  local slot = self:feat(F_CONTAINER_PAGINATION) and R:u16() or 0
+  -- `slot = getFeature(GameContainerPagination) ? getU16() : getU8()` -- the non-pagination
+  -- branch still consumes ONE byte, it is not absent.
+  local slot = self:feat(F_CONTAINER_PAGINATION) and R:u16() or R:u8()
   local item = self:readItem(R)
   local st = self.state
   local c = st.container and st:container(cid) or (st.containers and st.containers[cid])
@@ -1368,10 +1405,16 @@ end
 
 S[0x72] = function(self, R)                       -- ContainerRemoveItem
   local cid  = R:u8()
-  local slot = self:feat(F_CONTAINER_PAGINATION) and R:u16() or 0
-  local lastId = R:u16()
-  local last
-  if lastId ~= 0 then last = self:readItem(R, lastId) end
+  -- The whole `u16 slot; u16 lastItemId; [Item]` group lives INSIDE the pagination branch;
+  -- without the feature the C++ reads only a u8 slot and no lastItemId at all.
+  local slot, last
+  if self:feat(F_CONTAINER_PAGINATION) then
+    slot = R:u16()
+    local lastId = R:u16()
+    if lastId ~= 0 then last = self:readItem(R, lastId) end
+  else
+    slot = R:u8()
+  end
   local st = self.state
   local c = st.container and st:container(cid) or (st.containers and st.containers[cid])
   if c then
@@ -1396,7 +1439,7 @@ S[0xF5] = function(self, R)                       -- PlayerInventory (count cach
     local attribute = R:u8()
     local amount    = (self.protocolVersion < 1500) and R:u16() or packedCount1500(R)
     local tier = 0
-    if math.floor(IT.flags(itemId) / IT.CLASSIFY) % 2 == 1 then tier = attribute end
+    if hasClassify(IT, itemId) then tier = attribute end
     local key = itemId * 256 + tier
     counts[key] = (counts[key] or 0) + amount
   end
@@ -1461,10 +1504,17 @@ S[0x83] = function(self, R)                       -- GraphicalEffect (protocol >
       R:u8(); R:u16()
     elseif t == 7 then                            -- sound secondary
       R:u8(); R:u8(); R:u16()
-    else
-      -- the C++ `default: break;` consumes NOTHING and re-reads, which walks
-      -- the cursor over payload bytes.  Refuse instead of corrupting the stream.
+    elseif self.strictEffects then
       error(string.format('unknown magic-effect subtype %d', t), 0)
+    else
+      -- The C++ `default: break;` consumes nothing and simply reads the next byte as the
+      -- next subtype, so it recovers as soon as it walks onto the 0x00 terminator
+      -- (docs/opcode-map.md VERIFIER).  0x83 is one of the highest-frequency packets in a
+      -- live session, so mirror that instead of hard-disconnecting on an unknown subtype.
+      -- The loop still consumes >= 1 byte per turn, so it always terminates; if it runs off
+      -- the end the reader raises and the frame desyncs, exactly as the C++ eventually would.
+      self.emit('parseWarning', { opcode = 0x83, message =
+        string.format('unknown magic-effect subtype %d (C++ default: break)', t) })
     end
     t = R:u8()
   end
@@ -1686,14 +1736,20 @@ S[0x9F] = function(self, R)                       -- PlayerDataBasic
   if self.clientVersion >= 1281 then pl.magicShieldActive = R:u8() ~= 0 end
 end
 
-S[0xA0] = function(self, R)                       -- PlayerData (exactly 60 bytes)
+S[0xA0] = function(self, R)                       -- PlayerData (60 bytes at 1530)
+  -- Every field below is feature-gated exactly the way parsePlayerStats gates it.  At 1530
+  -- the gates all resolve to the wide form, which is why the packet is 60 bytes -- but
+  -- 0x43 GameServerFeatures can flip any of them at runtime, and an ungated read then
+  -- desyncs the frame.  The mana-shield tail is the sharpest case: with GameDoubleHealth
+  -- off the C++ still consumes FOUR bytes (u16 + u16), not zero.
   local pl = self:player()
   local oldHp, oldMp = pl.health, pl.mana
-  pl.health      = R:u32()
-  pl.maxHealth   = R:u32()
-  pl.freeCapacity = R:u32() / 100
-  pl.exp         = R:u64()
-  pl.level       = R:u16()
+  local dbl = self:feat(F_DOUBLE_HEALTH)
+  pl.health      = dbl and R:u32() or R:u16()
+  pl.maxHealth   = dbl and R:u32() or R:u16()
+  pl.freeCapacity = (self:feat(F_DOUBLE_FREE_CAPACITY) and R:u32() or R:u16()) / 100
+  pl.exp         = self:feat(F_DOUBLE_EXPERIENCE) and R:u64() or R:u32()
+  pl.level       = self:feat(F_LEVEL_U16) and R:u16() or R:u8()
   pl.levelPercent = self:feat(F_LEVEL_PERCENT_U16) and (R:u16() / 100) or R:u8()
   if self:feat(F_EXPERIENCE_BONUS) then
     pl.baseXpGain      = R:u16()
@@ -1701,20 +1757,24 @@ S[0xA0] = function(self, R)                       -- PlayerData (exactly 60 byte
     pl.storeBoostAddend = R:u16()
     pl.huntingBoostFactor = R:u16()
   end
-  pl.mana        = R:u32()
-  pl.maxMana     = R:u32()
-  pl.soul        = R:u8()
-  pl.stamina     = R:u16()
-  pl.baseSpeed   = R:u16()
-  pl.regeneration = R:u16()
-  pl.offlineTrainingTime = R:u16()
+  pl.mana        = dbl and R:u32() or R:u16()
+  pl.maxMana     = dbl and R:u32() or R:u16()
+  if self:feat(F_SOUL) then pl.soul = R:u8() else pl.soul = 0 end
+  if self:feat(F_PLAYER_STAMINA) then pl.stamina = R:u16() else pl.stamina = 0 end
+  if self:feat(F_SKILLS_BASE) then pl.baseSpeed = R:u16() else pl.baseSpeed = 0 end
+  if self:feat(F_PLAYER_REGENERATION_TIME) then pl.regeneration = R:u16() else pl.regeneration = 0 end
+  if self:feat(F_OFFLINE_TRAINING_TIME) then pl.offlineTrainingTime = R:u16()
+  else pl.offlineTrainingTime = 0 end
   if self.clientVersion >= 1097 then
     pl.storeExpBoostTime = R:u16()
     pl.canBuyXpBoost = R:u8() ~= 0
   end
-  if self.clientVersion >= 1281 and self:feat(28) then   -- GameDoubleHealth
-    pl.manaShield    = R:u32()
-    pl.maxManaShield = R:u32()
+  if self.clientVersion >= 1281 then
+    if dbl then
+      pl.manaShield, pl.maxManaShield = R:u32(), R:u32()
+    else
+      pl.manaShield, pl.maxManaShield = R:u16(), R:u16()
+    end
   end
   if oldHp ~= pl.health then
     self.emit('healthChange', { health = pl.health, maxHealth = pl.maxHealth, old = oldHp })
@@ -1740,12 +1800,17 @@ S[0xA1] = function(self, R)                       -- PlayerSkills
   end
   -- GameAdditionalSkills OFF -> no critical/leech block
   if self:feat(F_ADDITIONAL_SKILLS) then
-    for _ = 1, 5 do R:u16(); R:u16() end
+    -- `for (skill = CriticalChance(7); skill <= ManaLeechAmount(12); ++skill)` with a
+    -- `continue` past LifeLeechAmount(10)/ManaLeechAmount(12) when GameLeechAmount(109) is
+    -- off -> 6 entries with the feature on, 4 with it off.  Never 5.
+    for _ = 1, (self:feat(F_LEECH_AMOUNT) and 6 or 4) do R:u16(); R:u16() end
   end
   if self:feat(F_CONCOCTIONS) then R:u8() end
   -- GameForgeSkillStats OFF -> no forge block, no 2 x u32 capacity
   if self:feat(F_FORGE_SKILL_STATS) then
-    local last = (self.clientVersion >= 1332) and 11 or 6
+    -- `for (skill = Fatal(13); skill < lastSkill; ++skill)` with lastSkill = LastSkill(17)
+    -- at cv >= 1332 and Momentum(15)+1 = 16 below it -> 4 and 3 entries (const.h:136-156).
+    local last = (self.clientVersion >= 1332) and 4 or 3
     for _ = 1, last do R:u16(); R:u16() end
     R:u32(); R:u32()
   end
@@ -1813,11 +1878,19 @@ S[0xA6] = function(self, R)                       -- MultiUseDelay
   self.emit('multiUseCooldown', { delay = R:u32() })
 end
 
-S[0xA7] = function(self, R)                       -- PlayerModes (3 bytes, no fightMode)
+S[0xA7] = function(self, R)                       -- PlayerModes
+  -- GameTacticsWithoutFightMode(136) is ON at 1530 -> the 3-byte chase/safe/pvp layout.
+  -- With it off the C++ reads u8 fightMode, u8 chaseMode, u8 safeMode and then pvpMode only
+  -- when GamePVPMode(50) is on -- and 0x43 GameServerFeatures can flip 136 at runtime.
   local st = self.state
+  if not self:feat(F_TACTICS_NO_FIGHT_MODE) then st.fightMode = R:u8() end
   st.chaseMode = R:u8()
   st.safeMode  = R:u8() ~= 0
-  st.pvpMode   = R:u8()
+  if self:feat(F_TACTICS_NO_FIGHT_MODE) then
+    st.pvpMode = R:u8()
+  else
+    st.pvpMode = self:feat(F_PVP_MODE) and R:u8() or 0
+  end
 end
 
 S[0xA8] = function(self, R) R:u8() end            -- SetStoreDeepLink
@@ -2062,11 +2135,14 @@ S[0xC4] = function(self, R)                       -- WeaponProficiencyInfo
   if self.clientVersion >= 1530 then
     local detailCount = R:u8()
     if detailCount ~= 0 then
-      -- gunzotc reads the count and logs it without parsing any list; the entry
-      -- layout is UNVERIFIED, so a non-zero count WILL desync. Fail loudly.
-      error(string.format(
-        'WeaponProficiencyInfo (0xC4) detail list count=%d but the entry layout is unknown ' ..
-        '(docs/opcode-map.md marks it UNVERIFIED)', detailCount), 0)
+      -- The C++ only logs `g_logger.warning("WeaponProficiency 0xC4 detail list count={} ' ..
+      -- '(layout unknown)")` and reads nothing more, so the reference client SURVIVES this
+      -- packet.  Mirror that: warn instead of killing the session.  If a list really does
+      -- follow, the outer loop still raises a desync naming 0xC4 -- same diagnostic, without
+      -- pre-emptively disconnecting on a field that is very likely just empty.
+      self.emit('parseWarning', { opcode = 0xC4, message = string.format(
+        'WeaponProficiencyInfo detail list count=%d, layout unknown ' ..
+        '(docs/opcode-map.md UNVERIFIED)', detailCount) })
     end
   end
 end
@@ -2165,7 +2241,7 @@ S[0xCD] = function(self, R)                       -- SendItemsPrice
   for _ = 1, R:u16() do
     local id = R:u16()
     if self.clientVersion >= 1281 then
-      if math.floor(IT.flags(id) / IT.CLASSIFY) % 2 == 1 then R:u8() end
+      if hasClassify(IT, id) then R:u8() end
       R:u64()
     else
       R:u32()
@@ -2332,10 +2408,15 @@ end
 
 CYCLO[2] = function(self, R)                      -- COMBATSTATS
   if self:feat(F_ADDITIONAL_SKILLS) then
-    for _ = 1, 5 do R:u16(); R:u16() end
+    -- `for (skill = CriticalChance(7); skill <= ManaLeechAmount(12); ++skill)` with a
+    -- `continue` past LifeLeechAmount(10)/ManaLeechAmount(12) when GameLeechAmount(109) is
+    -- off -> 6 entries with the feature on, 4 with it off.  Never 5.
+    for _ = 1, (self:feat(F_LEECH_AMOUNT) and 6 or 4) do R:u16(); R:u16() end
   end
   if self:feat(F_FORGE_SKILL_STATS) then
-    local last = (self.clientVersion >= 1332) and 11 or 6
+    -- `for (skill = Fatal(13); skill < lastSkill; ++skill)` with lastSkill = LastSkill(17)
+    -- at cv >= 1332 and Momentum(15)+1 = 16 below it -> 4 and 3 entries (const.h:136-156).
+    local last = (self.clientVersion >= 1332) and 4 or 3
     for _ = 1, last do R:u16(); R:u16() end
   end
   R:u16(); R:u16(); R:u16()
@@ -2362,7 +2443,7 @@ CYCLO[6] = function(self, R)                      -- ITEMSUMMARY
   local function block()
     for _ = 1, R:u16() do
       local id = R:u16()
-      if math.floor(IT.flags(id) / IT.CLASSIFY) % 2 == 1 then R:u8() end
+      if hasClassify(IT, id) then R:u8() end
       R:u32()
     end
   end
@@ -2635,7 +2716,7 @@ S[0xEB] = function(self, R)                       -- SendImbuementWindow
   elseif windowType == 1 then                     -- SELECT_ITEM
     if modern then R:u8() end
     local itemId = R:u16()
-    if math.floor(IT.flags(itemId) / IT.CLASSIFY) % 2 == 1 then R:u8() end
+    if hasClassify(IT, itemId) then R:u8() end
     local slots = R:u8()
     for _ = 1, slots do
       if R:u8() == 0x01 then
@@ -2704,7 +2785,7 @@ end
 function P:readMarketItemTier(R, itemId)
   if self.clientVersion < 1281 then return 0 end
   local IT = self.items
-  if math.floor(IT.flags(itemId) / IT.CLASSIFY) % 2 ~= 1 then return 0 end
+  if not hasClassify(IT, itemId) then return 0 end
   return R:u8()
 end
 
@@ -2843,10 +2924,11 @@ local function parseStoreOffersBody(self, R)
       end
       R:u8()
       local t = R:u8()
-      if t == 0 then R:string()
-      elseif t == 1 then R:u16()
-      elseif t == 2 then R:u16()
-      elseif t == 3 then R:u16(); R:u8(); R:u8(); R:u8(); R:u8() end
+      -- Otc::GameStoreInfoType_t (const.h:947-953): NONE 0, MOUNT 1, OUTFIT 2, ITEM 3.
+      if t == STORE_SHOW_NONE then R:string()
+      elseif t == STORE_SHOW_MOUNT then R:u16()
+      elseif t == STORE_SHOW_OUTFIT then R:u16(); R:u8(); R:u8(); R:u8(); R:u8()
+      elseif t == STORE_SHOW_ITEM then R:u16() end
       R:u8()                                      -- tryOnType
       R:string()                                  -- collection
       R:u16(); R:u32(); R:u8(); R:u16()
@@ -2869,14 +2951,15 @@ local function parseStoreOffersBody(self, R)
         end
       end
       local state = R:u8()
-      if state == 1 then R:u32(); R:u32() end     -- STATE_SALE
+      -- Otc::GameStoreInfoStatesType_t (const.h:956-960): NONE 0, NEW 1, SALE 2.
+      if state == STORE_STATE_SALE then R:u32(); R:u32() end
     end
     local t = R:u8()
-    if t == 0 then R:string()
-    elseif t == 1 then R:u16()
-    elseif t == 2 then R:u16()
-    elseif t == 3 then R:u16(); R:u8(); R:u8(); R:u8(); R:u8()
-    elseif t == 4 then R:u8(); R:u16(); R:u16(); R:u8(); R:u8(); R:u8(); R:u8() end
+    if t == STORE_SHOW_NONE then R:string()
+    elseif t == STORE_SHOW_MOUNT then R:u16()
+    elseif t == STORE_SHOW_OUTFIT then R:u16(); R:u8(); R:u8(); R:u8(); R:u8()
+    elseif t == STORE_SHOW_ITEM then R:u16()
+    elseif t == STORE_SHOW_HIRELING then R:u8(); R:u16(); R:u16(); R:u8(); R:u8(); R:u8(); R:u8() end
     R:u8()                                        -- tryOnType
     R:string()                                    -- collection
     R:u16(); R:u32(); R:u8()

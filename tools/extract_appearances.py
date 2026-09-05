@@ -271,15 +271,37 @@ def sha256_of(path):
 def main(argv=None):
     here = os.path.dirname(os.path.abspath(__file__))
     repo = os.path.dirname(here)
-    ap = argparse.ArgumentParser(description="extract item flag table from appearances-*.dat")
-    ap.add_argument("--things-dir",
-                    default="D:/Claude/otclient_mehah1530/otclient/data/things/1530")
+    ap = argparse.ArgumentParser(
+        description="extract item flag table from appearances-*.dat",
+        epilog="THINGS_DIR may also be given as --things-dir or in $LUACLIENT_THINGS_DIR; "
+               "with none of the three, the reference install is used if it exists.")
+    # The input directory is a CLI argument, not a baked-in Windows path: this
+    # script has to run on Linux too (docs/portability.md).  Resolution order:
+    #   positional  >  --things-dir  >  $LUACLIENT_THINGS_DIR  >  reference install
+    ap.add_argument("things_dir", nargs="?", default=None, metavar="THINGS_DIR",
+                    help="directory holding appearances-*.dat and assets.json.sha256")
+    ap.add_argument("--things-dir", dest="things_dir_opt", default=None,
+                    help="same as the positional THINGS_DIR")
     ap.add_argument("--out", default=os.path.join(repo, "assets", "items1530.bin"))
     ap.add_argument("--dump", type=int, nargs="+", metavar="ID",
                     help="dump decoded flags (and name) for these object ids and exit")
     args = ap.parse_args(argv)
 
-    dat = find_appearances_file(args.things_dir)
+    REFERENCE_THINGS_DIR = "D:/Claude/otclient_mehah1530/otclient/data/things/1530"
+    things_dir = (args.things_dir or args.things_dir_opt
+                  or os.environ.get("LUACLIENT_THINGS_DIR"))
+    if not things_dir:
+        if os.path.isdir(REFERENCE_THINGS_DIR):
+            things_dir = REFERENCE_THINGS_DIR
+        else:
+            raise SystemExit(
+                "no things directory given.  Pass it as an argument:\n"
+                "    python tools/extract_appearances.py /path/to/data/things/1530\n"
+                "or set LUACLIENT_THINGS_DIR.")
+    things_dir = os.path.expanduser(things_dir)
+    args.things_dir = things_dir
+
+    dat = find_appearances_file(things_dir)
     with open(dat, "rb") as f:
         buf = f.read()
 

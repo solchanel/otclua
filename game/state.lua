@@ -115,7 +115,9 @@ local function newPlayer()
         magicLevel = 0, baseMagicLevel = 0, magicLevelPercent = 0,
         soul = 0, stamina = 0, capacity = 0, maxCapacity = 0,
         speed = 0, baseSpeed = 0,
-        states = 0, statesHi = 0,
+        -- proto/parser.lua S[0xA2] writes statesLo/statesHigh; declare exactly those names
+        -- (the 0xA0 PlayerState mask is a u64 at >=1405, split into two u32 halves).
+        states = 0, statesLo = 0, statesHigh = 0,
         skills = {},          -- [skillId] = {level=, baseLevel=, percent=}
         inventory = {},       -- [slot] = item
         direction = 0,
@@ -139,14 +141,25 @@ function state:reset()
     self.map        = {}   -- ["x,y,z"] = tile
     self.containers = {}   -- [id] = container
     self.channels   = {}   -- [id] = name
-    self.world      = {
-        name = nil,
+    -- MUTATE world and world.awareRange IN PLACE.  proto/parser.lua aliases the awareRange
+    -- table (`self.aware = state.world.awareRange`), so replacing it here would leave the
+    -- parser sizing every later map packet with the PRE-reset range while state reported the
+    -- 8/6/9/7 default -- an unrecoverable desync on the first packet after a relogin.
+    local w = self.world
+    if not w then
+        w = {}
+        self.world = w
+    end
+    w.name, w.worldTime, w.light = nil, nil, nil
+    local a = w.awareRange
+    if a then
         -- Map::resetAwareRange defaults (map.cpp:78); opcode 0x33 overwrites, and a
         -- logout/relogin RESETS back to these (docs/map-parsing.md Additions).
-        awareRange = { left = 8, top = 6, right = 9, bottom = 7 },
-        worldTime = nil,
-        light = nil,
-    }
+        a.left, a.top, a.right, a.bottom = 8, 6, 9, 7
+    else
+        w.awareRange = { left = 8, top = 6, right = 9, bottom = 7 }
+    end
+    self.central   = nil
     self.tileCount = 0
     return self
 end
@@ -270,10 +283,15 @@ function state:addThing(pos, stackPos, thing)
     -- it deletes 0-based index 10 (which is the 11th slot), leaving 11 things behind.
     if size > TILE_MAX_THINGS then
         self:_removeAt(tile, TILE_MAX_THINGS)
-        -- the trimmed thing may have been below us; recompute where we actually are
+        -- The trim may have deleted the thing we just inserted (that happens exactly when it
+        -- landed at 0-based index 10).  Recompute AUTHORITATIVELY: start from nil and only
+        -- report an index when the thing actually survived, so we never hand the caller a
+        -- stackpos that now addresses somebody else.
+        local found
         for i = 1, #things do
-            if things[i] == thing then sp = i - 1 break end
+            if things[i] == thing then found = i - 1 break end
         end
+        sp = found
     end
 
     return sp
@@ -324,6 +342,93 @@ function state:creatureStackPos(pos, creatureId)
         if t.kind == 'creature' and t.creatureId == creatureId then return i - 1 end
     end
     return nil
+end
+
+-- ---------------------------------------------------------------------------
+-- aware range / central position  (Map::setCentralPosition -> removeUnawareThings)
+-- ---------------------------------------------------------------------------
+-- docs/opcode-map.md:89 lists 72 GameKeepUnawareTiles in the "NEVER enabled" set, so the C++
+-- Map::setCentralPosition ALWAYS calls removeUnawareThings() (map.cpp:549-614), which drops
+-- every tile outside the aware range on each central-position change.  Without this a
+-- long-running headless session grows self.map without bound AND keeps answering
+-- state:tile()/state:walkableAt() from tiles the real client has already forgotten.
+--
+-- data/setup.otml: max-z 15, sea-floor 7, aware-underground-floor-range 2.
+local MAP_MAX_Z            = 15
+local MAP_SEA_FLOOR        = 7
+local MAP_AWARE_UNDER_RANGE = 2
+state.MAP_MAX_Z = MAP_MAX_Z
+
+-- Map::getFirstAwareFloor / getLastAwareFloor (map.cpp:815-829)
+local function firstAwareFloor(cz)
+    if cz <= MAP_SEA_FLOOR then return 0 end
+    return cz - MAP_AWARE_UNDER_RANGE
+end
+local function lastAwareFloor(cz)
+    if cz <= MAP_SEA_FLOOR then return MAP_SEA_FLOOR end
+    local v = cz + MAP_AWARE_UNDER_RANGE
+    return (v < MAP_MAX_Z) and v or MAP_MAX_Z
+end
+state.firstAwareFloor = firstAwareFloor
+state.lastAwareFloor  = lastAwareFloor
+
+-- Map::isAwareOfPosition (map.cpp:776-798) -- project `pos` onto the central floor with
+-- Position::coveredUp/coveredDown (x,y shift by 1 per z step, map.cpp/position.cpp:49-72),
+-- then test the rectangle.  `central` defaults to the local player's position.
+function state:isAwareOf(pos, central)
+    central = central or self.central or (self.player and self.player.pos)
+    if not (central and pos) then return false end
+    local cz = central.z
+    if pos.z < firstAwareFloor(cz) or pos.z > lastAwareFloor(cz) then return false end
+
+    local x, y, z = pos.x, pos.y, pos.z
+    local guard = 0
+    while z ~= cz do
+        guard = guard + 1
+        if guard > MAP_MAX_Z + 1 then break end
+        if z > cz then
+            -- coveredUp: x+1, y+1, z-1 (refused, and the C++ breaks, at the 65535 edge)
+            if x >= 65535 or y >= 65535 or z - 1 < 0 then break end
+            x, y, z = x + 1, y + 1, z - 1
+        else
+            -- coveredDown: x-1, y-1, z+1 (refused at the 0 edge)
+            if x <= 0 or y <= 0 or z + 1 > MAP_MAX_Z then break end
+            x, y, z = x - 1, y - 1, z + 1
+        end
+    end
+    if z ~= cz then return false end          -- isInRange returns false when the z differs
+
+    local a = self.world.awareRange
+    return x >= central.x - a.left and x <= central.x + a.right
+       and y >= central.y - a.top  and y <= central.y + a.bottom
+end
+
+-- Map::setCentralPosition: record the new centre and evict everything we are no longer aware
+-- of.  Returns the number of tiles removed.  Calling it with the position we already hold is
+-- a no-op, exactly like the C++ early return.
+function state:setCentralPosition(pos)
+    if not pos then return 0 end
+    if samePos(self.central, pos) then return 0 end
+    self.central = copyPos(pos)
+
+    local doomed
+    for key, tile in pairs(self.map) do
+        local p = tile.pos or parseKey(key)
+        if p and not self:isAwareOf(p, self.central) then
+            doomed = doomed or {}
+            doomed[#doomed + 1] = p
+        end
+    end
+    if not doomed then return 0 end
+    for i = 1, #doomed do self:cleanTile(doomed[i]) end
+
+    -- creatures we are no longer aware of lose their tile binding too (removeUnawareThings
+    -- calls Map::removeThing on them); cleanTile already did that for described tiles, this
+    -- catches creatures whose tile was never in self.map.
+    for _, c in pairs(self.creatures) do
+        if c.pos and not self:isAwareOf(c.pos, self.central) then c.pos = nil end
+    end
+    return #doomed
 end
 
 -- ---------------------------------------------------------------------------
@@ -423,9 +528,13 @@ end
 -- What it CAN decide exactly:
 --     * unknown tile (never described, or cleanTile'd)                       -> false
 --     * a creature standing there whose 0x92 CreatureUnpass said unpassable  -> false
--- The second return value names the residual uncertainty so callers can decide how much to
--- trust a `true`:  'exact' (a definite false), or 'items-unknown' (true, but item blocking
--- was not checked).  A path finder must treat 'items-unknown' as "probably walkable".
+-- The second return value names the reason, and is one of exactly four strings:
+--     'unknown-tile'   -> false, definite: the tile was never described (or was cleaned)
+--     'no-ground'      -> false, definite: nothing, or no item, at stack index 0
+--     'creature'       -> false, definite: a non-passable creature stands there
+--     'items-unknown'  -> true,  BUT item blocking was not checked (see above)
+-- So: 'items-unknown' means "probably walkable" and every other value is a definite refusal.
+-- A path finder must treat 'items-unknown' as walkable and the rest as blocked.
 function state:walkableAt(pos, ignoreCreatures)
     local tile = self.map[tileKey(pos)]
     if not tile then return false, 'unknown-tile' end

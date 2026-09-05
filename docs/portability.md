@@ -94,3 +94,47 @@ wsl -d Debian -e sh -c 'cd /mnt/d/Claude/otclient_web/luaclient && ./run.sh --se
 
 and the live invalid-account login (`--account=zzz-not-a-real-account --password=x`) must print the
 server's own error and exit 2 on both.
+
+### Measured results
+
+Run **2026-09-05**, one source tree, Windows 11 Pro x64 (LuaJIT 2.1 from the vcpkg build) and
+Debian 13 x64 under WSL2 (`luajit` + `curl` from apt), against the working tree described in
+`README.md`. **All acceptance criteria met.**
+
+| Check | Windows | Debian 13 (WSL2) |
+|---|---|---|
+| `--selftest` | `TOTAL: 401 passed, 0 failed -> PASS`, exit 0 | `TOTAL: 401 passed, 0 failed -> PASS`, exit 0 |
+| live invalid-account login | `login refused: Account name or password is not correct.`, exit **2** | identical message, exit **2** |
+| `test/fakeserver.lua` end-to-end | `37 checks, 0 failed -> PASS`, exit 0 | `37 checks, 0 failed -> PASS`, exit 0 |
+| `test/replay.lua --self` | `2 file(s), 0 failure(s) -> PASS` | `2 file(s), 0 failure(s) -> PASS` |
+| `run.{bat,sh} --replay=FILE` | PASS | PASS |
+| `http.backend()` | `winhttp` | `curl-ffi` |
+| `--dry-run` | PASS | PASS |
+
+Everything in the table above uses the *same* Lua sources; the only per-OS artefacts are
+`run.bat` / `run.sh`.
+
+The stronger end-to-end criterion — the real `main.lua` completing a full login handshake over a
+real TCP socket — is met offline by `test/fakeserver.lua` (see `README.md` → Tests). It binds an
+ephemeral loopback port, spawns `main.lua` as a child process, and implements the 1530 framing
+independently of `proto/transport.lua`, so it validates rather than mirrors the client. It passes
+identically on both OSes, which additionally exercises `socket.listen`/`accept`/`select` on both
+the `select()` (Windows) and `poll()` (Linux) reactor paths and the whole
+`connect → preamble → challenge → login → pending → enter-game → gameplay → ping → SessionEnd`
+sequence.
+
+### Portability defects found and fixed during acceptance
+
+* `test/replay.lua` carried a private `tempDir()` that only consulted `TEMP`/`TMP` and fell back to
+  `'.'`, so on Linux `--self` wrote `luaclient-replay-selftest.cam/.lcap` into the **project root**
+  instead of `/tmp`. It now delegates to `lib/sys.tempDir()`, which knows `TMPDIR` and `/tmp`.
+* `main.lua --replay=FILE` never replayed anything: `test/replay.lua` re-parsed the raw `arg`
+  table, which still held `main.lua`'s own flags, and died with
+  `replay: unknown flag --replay=FILE`. When `LC.replayTarget` is set (the actual handoff), `argv`
+  is now ignored.
+
+### Still not proven on either OS
+
+No real authenticated game session has ever been established — that needs the account owner's
+credentials. Everything past the HTTPS reply is exercised only against fixtures and
+`test/fakeserver.lua`.

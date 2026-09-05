@@ -1,18 +1,31 @@
---[[ lib/http.lua — blocking HTTPS POST for the login flow.
+--[[ lib/http.lua — blocking HTTPS POST for the login flow.  Windows + Linux.
 
   API (see API.md):
       http.post(url, headersTable, body [, opts]) -> {status=, body=, headers=} | nil, err
+      http.backend()  -> 'winhttp' | 'curl-ffi' | 'curl-cli' | nil, err
+                         the backend actually selected on this machine
 
   `headers` is a plain name->value table; the request headers are emitted in
   case-insensitive alphabetical order, which is the order the C++ reference
   (cpp-httplib, a multimap) puts them on the wire.  `res.headers` comes back
   with LOWER-CASE keys.  `opts` (optional): { timeoutMs=, backend='auto'|
-  'winhttp'|'curl', noAcceptEncodingRetry=true }.
+  'winhttp'|'curl-ffi'|'curl-cli'|'curl', noAcceptEncodingRetry=true }.
 
-  Backends, per docs/lua-runtime.md §3:
-    * WinHTTP through FFI  (primary, ~525 ms for the login POST)
-    * curl.exe via io.popen (automatic fallback when winhttp.dll cannot be
-      loaded, or when a WinHTTP request fails at transport level)
+  Backends, per docs/lua-runtime.md §3 and docs/portability.md:
+
+     platform | primary                        | fallback        | last resort
+     ---------+--------------------------------+-----------------+-------------
+     Windows  | WinHTTP through FFI (~525 ms)  | curl.exe (CLI)  | —
+     Linux    | libcurl.so.4 through FFI       | curl (CLI)      | error:
+              | (easy interface + WRITEFUNCTION)|                | "apt install curl"
+
+  Selection is automatic at load-time probe and cached; `http.backend()` names
+  the winner for the boot log line.
+
+  CREDENTIALS: the login body carries the account password, so it NEVER reaches
+  a command line — `ps`/`/proc/<pid>/cmdline` is world-readable.  Both CLI paths
+  write the body to a temp file (created 0600 on Linux, before a single byte is
+  written) and pass `--data-binary @file`, then delete it.
 
   TLS: the C++ reference disables BOTH certificate and hostname verification
   for this POST (httplogin.cpp:410-411), so we do the same — see the
@@ -20,13 +33,15 @@
 
   Redirects are never followed (the reference client does not follow them).
 
-  Content-Encoding: WinHTTP is asked to auto-decompress gzip/deflate; if the
-  response still carries an encoding we cannot decode (e.g. `br`), the request
-  is retried ONCE with no Accept-Encoding header.
+  Content-Encoding: if the response carries an encoding we cannot decode (e.g.
+  `br`), the request is retried ONCE with no Accept-Encoding header.
 ]]
 
 local ffi = require('ffi')
 local bit = require('bit')
+
+local IS_WINDOWS = (ffi.os == 'Windows')
+local IS_LINUX   = (ffi.os == 'Linux')
 
 -- lib/log.lua is written by another work item; degrade gracefully if absent.
 local log
@@ -49,8 +64,8 @@ end
 local http = {}
 
 http.DEFAULT_TIMEOUT_MS = 20000
-http.backend = 'auto'          -- 'auto' | 'winhttp' | 'curl'
-http.curlPath = 'C:\\Windows\\System32\\curl.exe'
+http.preferBackend = 'auto'    -- 'auto' | 'winhttp' | 'curl-ffi' | 'curl-cli'
+http.curlPath = IS_WINDOWS and 'C:\\Windows\\System32\\curl.exe' or 'curl'
 http.userAgent = 'Mozilla/5.0' -- only used when the caller supplies no User-Agent
 
 --------------------------------------------------------------------------- util
@@ -135,11 +150,31 @@ local function undecodedBody(res)
   return not looksLikeText(res.body)
 end
 
+local warnedInsecure = false
+local function warnInsecureOnce(u)
+  if u.scheme == 'https' and not warnedInsecure then
+    warnedInsecure = true
+    log.warn('http: TLS certificate/hostname verification is DISABLED (matches the C++ reference client)')
+  end
+end
+
+local function readFile(path)
+  local f = io.open(path, 'rb')
+  if not f then return nil end
+  local d = f:read('*a')
+  f:close()
+  return d
+end
+
 --------------------------------------------------------------------- WinHTTP ---
+-- Windows only.  Nothing below this comment is declared on Linux: ffi.cdef is
+-- process-global and a wrong-OS declaration would poison every other module.
 
 local W = {}          -- winhttp backend namespace
 local wh, k32         -- lazily loaded libraries
 local whLoadError
+
+if IS_WINDOWS then
 
 ffi.cdef [[
 typedef void*          HINTERNET;
@@ -172,10 +207,8 @@ local WINHTTP_QUERY_FLAG_NUMBER      = 0x20000000
 local WINHTTP_OPTION_SECURITY_FLAGS  = 31
 local WINHTTP_OPTION_DISABLE_FEATURE = 63
 local WINHTTP_OPTION_REDIRECT_POLICY = 88
-local WINHTTP_OPTION_DECOMPRESSION   = 118
 local WINHTTP_DISABLE_REDIRECTS      = 0x00000002
 local WINHTTP_REDIRECT_POLICY_NEVER  = 0
-local WINHTTP_DECOMPRESSION_FLAG_ALL = 0x00000003
 local ERROR_INSUFFICIENT_BUFFER      = 122
 -- SECURITY_FLAG_IGNORE_UNKNOWN_CA|_CERT_DATE_INVALID|_CERT_CN_INVALID|_CERT_WRONG_USAGE
 local IGNORE_ALL_CERT_ERRORS         = 0x00003300
@@ -192,7 +225,7 @@ local function whErr(what)
   return string.format('%s failed (winhttp error %d%s)', what, code, name and (': ' .. name) or '')
 end
 
-local function loadWinhttp()
+function W.load()
   if wh then return true end
   if whLoadError then return false, whLoadError end
   local ok, a = pcall(ffi.load, 'winhttp')
@@ -222,8 +255,6 @@ local function setDword(h, option, value)
   local v = ffi.new('DWORD_[1]', value)
   return wh.WinHttpSetOption(h, option, v, 4) ~= 0
 end
-
-local warnedInsecure = false
 
 function W.post(u, headers, body, timeoutMs)
   local S, Cn, R
@@ -262,10 +293,7 @@ function W.post(u, headers, body, timeoutMs)
     -- The C++ reference disables certificate AND hostname verification for the
     -- login POST (httplogin.cpp:410-411); match it so we never fail a login the
     -- reference completes.
-    if not warnedInsecure then
-      warnedInsecure = true
-      log.warn('http: TLS certificate/hostname verification is DISABLED (matches the C++ reference client)')
-    end
+    warnInsecureOnce(u)
     setDword(R, WINHTTP_OPTION_SECURITY_FLAGS, IGNORE_ALL_CERT_ERRORS)
   end
 
@@ -325,30 +353,224 @@ function W.post(u, headers, body, timeoutMs)
            headers = parseRawHeaders(rawHeaders), backend = 'winhttp' }
 end
 
------------------------------------------------------------------------- curl ---
+end -- IS_WINDOWS
+
+--------------------------------------------------------------------- libcurl ---
+-- Linux only.  libcurl's "easy" interface, blocking, one handle per request.
+
+local L = {}
+local curl, curlLoadError
+
+if IS_LINUX then
+
+ffi.cdef [[
+typedef size_t (*lc_curl_write_cb)(char*, size_t, size_t, void*);
+struct lc_curl_slist;
+void  *curl_easy_init(void);
+int    curl_easy_setopt(void*, int, ...);
+int    curl_easy_perform(void*);
+int    curl_easy_getinfo(void*, int, ...);
+void   curl_easy_cleanup(void*);
+const char *curl_easy_strerror(int);
+struct lc_curl_slist *curl_slist_append(struct lc_curl_slist*, const char*);
+void   curl_slist_free_all(struct lc_curl_slist*);
+int    chmod(const char*, unsigned int);
+]]
+
+-- CURLOPT_*: 10000+ = pointer/string, 20000+ = function pointer, bare = long.
+local CURLOPT_URL             = 10002
+local CURLOPT_POSTFIELDSIZE   = 60
+local CURLOPT_COPYPOSTFIELDS  = 10165
+local CURLOPT_HTTPHEADER      = 10023
+local CURLOPT_WRITEFUNCTION   = 20011
+local CURLOPT_WRITEDATA       = 10001
+local CURLOPT_HEADERFUNCTION  = 20079
+local CURLOPT_HEADERDATA      = 10029
+local CURLOPT_TIMEOUT_MS      = 155
+local CURLOPT_CONNECTTIMEOUT_MS = 156
+local CURLOPT_SSL_VERIFYPEER  = 64
+local CURLOPT_SSL_VERIFYHOST  = 81
+local CURLOPT_FOLLOWLOCATION  = 52
+local CURLOPT_NOSIGNAL        = 99
+local CURLOPT_NOPROGRESS      = 43
+local CURLOPT_HTTP_VERSION    = 84
+local CURL_HTTP_VERSION_1_1   = 2
+local CURLINFO_RESPONSE_CODE  = 0x200000 + 2      -- CURLINFO_LONG | 2
+local CURLE_OK                = 0
+
+-- Several sonames: Debian/Ubuntu ship libcurl.so.4 (a symlink to .4.x.y); the
+-- unversioned libcurl.so only exists with the -dev package installed.
+local SONAMES = { 'libcurl.so.4', 'libcurl.so.4.8.0', 'libcurl.so.4.7.0', 'libcurl.so', 'curl' }
+
+function L.load()
+  if curl then return true end
+  if curlLoadError then return false, curlLoadError end
+  local tried = {}
+  for i = 1, #SONAMES do
+    local ok, lib = pcall(ffi.load, SONAMES[i])
+    if ok then
+      -- resolving one symbol proves it is really libcurl and not a stub
+      local ok2 = pcall(function() return lib.curl_easy_init end)
+      if ok2 then curl = lib; return true end
+      tried[#tried + 1] = SONAMES[i] .. ' (no curl_easy_init)'
+    else
+      tried[#tried + 1] = SONAMES[i]
+    end
+  end
+  curlLoadError = 'none of {' .. table.concat(tried, ', ') .. '} could be loaded'
+  return false, curlLoadError
+end
+
+-- One accumulator + one callback pair for the whole process: http.post is
+-- blocking and single-threaded, so there is never more than one live transfer.
+-- (FFI callbacks are a scarce, manually-freed resource — never make them per call.)
+local bodyParts, headerParts = {}, {}
+
+local writeCb = ffi.cast('lc_curl_write_cb', function(ptr, size, nmemb, _)
+  local n = tonumber(size) * tonumber(nmemb)
+  if n > 0 then bodyParts[#bodyParts + 1] = ffi.string(ptr, n) end
+  return n
+end)
+
+local headerCb = ffi.cast('lc_curl_write_cb', function(ptr, size, nmemb, _)
+  local n = tonumber(size) * tonumber(nmemb)
+  if n > 0 then headerParts[#headerParts + 1] = ffi.string(ptr, n) end
+  return n
+end)
+
+-- LuaJIT passes a plain Lua number to a C vararg as a DOUBLE; libcurl reads a
+-- long (or a pointer) out of the integer registers.  EVERY setopt value must
+-- therefore be an explicitly typed cdata — this is the single most common way
+-- to get silent garbage out of an FFI libcurl binding.
+local function setoptL(h, opt, v) return curl.curl_easy_setopt(h, opt, ffi.cast('long', v)) end
+local function setoptP(h, opt, v) return curl.curl_easy_setopt(h, opt, v) end
+
+function L.post(u, headers, body, timeoutMs)
+  local ok, err = L.load()
+  if not ok then return nil, 'libcurl not loadable: ' .. tostring(err) end
+
+  local h = curl.curl_easy_init()
+  if h == nil then return nil, 'curl_easy_init() returned NULL' end
+
+  local slist = nil
+  local function cleanup()
+    if slist ~= nil then curl.curl_slist_free_all(slist) end
+    curl.curl_easy_cleanup(h)
+  end
+
+  body = body or ''
+  local url = u.scheme .. '://' .. u.host .. ':' .. u.port .. u.path
+  -- CURLOPT_URL and CURLOPT_COPYPOSTFIELDS both copy into the handle, so neither
+  -- Lua string has to survive until perform() (CURLOPT_POSTFIELDS would NOT copy
+  -- — that is exactly why COPYPOSTFIELDS is used here).
+
+  setoptP(h, CURLOPT_URL, ffi.cast('const char*', url))
+  setoptL(h, CURLOPT_POSTFIELDSIZE, #body)          -- must precede COPYPOSTFIELDS
+  setoptP(h, CURLOPT_COPYPOSTFIELDS, ffi.cast('const char*', body))
+  setoptL(h, CURLOPT_FOLLOWLOCATION, 0)             -- reference client never follows
+  setoptL(h, CURLOPT_NOSIGNAL, 1)                   -- no SIGALRM/SIGPIPE from libcurl
+  setoptL(h, CURLOPT_NOPROGRESS, 1)
+  setoptL(h, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1)
+  setoptL(h, CURLOPT_TIMEOUT_MS, timeoutMs or http.DEFAULT_TIMEOUT_MS)
+  setoptL(h, CURLOPT_CONNECTTIMEOUT_MS, timeoutMs or http.DEFAULT_TIMEOUT_MS)
+  -- match the C++ reference: certificate AND hostname verification off
+  setoptL(h, CURLOPT_SSL_VERIFYPEER, 0)
+  setoptL(h, CURLOPT_SSL_VERIFYHOST, 0)
+  warnInsecureOnce(u)
+
+  setoptP(h, CURLOPT_WRITEFUNCTION, writeCb)
+  setoptP(h, CURLOPT_WRITEDATA, nil)
+  setoptP(h, CURLOPT_HEADERFUNCTION, headerCb)
+  setoptP(h, CURLOPT_HEADERDATA, nil)
+
+  local list = sortedHeaderList(headers)
+  for i = 1, #list do
+    slist = curl.curl_slist_append(slist, list[i][1] .. ': ' .. list[i][2])
+  end
+  -- suppress the two headers libcurl would add on its own and the reference does
+  -- not send: "Expect: 100-continue" (bodies > 1 KB) and, when the caller gave
+  -- none, nothing else -- an explicit header in `headers` already overrides curl's.
+  slist = curl.curl_slist_append(slist, 'Expect:')
+  if slist ~= nil then setoptP(h, CURLOPT_HTTPHEADER, slist) end
+
+  for i = #bodyParts, 1, -1 do bodyParts[i] = nil end
+  for i = #headerParts, 1, -1 do headerParts[i] = nil end
+
+  local rc = curl.curl_easy_perform(h)
+  if rc ~= CURLE_OK then
+    local msg = ffi.string(curl.curl_easy_strerror(rc))
+    cleanup()
+    return nil, string.format('libcurl request failed: %s (CURLcode %d)', msg, tonumber(rc))
+  end
+
+  local code = ffi.new('long[1]', 0)
+  curl.curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, code)
+  local status = tonumber(code[0])
+
+  local resBody = table.concat(bodyParts)
+  local rawHeaders = table.concat(headerParts)
+  cleanup()
+
+  if status == 0 then return nil, 'libcurl returned no HTTP status' end
+  return { status = status, body = resBody,
+           headers = parseRawHeaders(rawHeaders), backend = 'curl-ffi' }
+end
+
+--- Create `path` empty and make it owner-only BEFORE anything is written to it.
+function L.secureCreate(path)
+  local f = io.open(path, 'wb')
+  if not f then return nil, 'cannot create ' .. path end
+  f:close()
+  if ffi.C.chmod(path, 384) ~= 0 then    -- 384 == 0600
+    os.remove(path)
+    return nil, 'chmod 0600 failed on ' .. path
+  end
+  return true
+end
+
+end -- IS_LINUX
+
+------------------------------------------------------------------- curl CLI ---
+-- Fallback on both platforms.  The request body (which contains the password)
+-- is passed by FILE, never on the command line.
 
 local C = {}
 
 local function tempName(tag)
-  local dir = os.getenv('TEMP') or os.getenv('TMP') or '.'
-  return string.format('%s\\lcHttp_%s_%d_%d.tmp', dir, tag,
+  local sys = require('lib.sys')
+  local dir = sys.tempDir()
+  local sep = IS_WINDOWS and '\\' or '/'
+  return string.format('%s%slcHttp_%s_%d_%d.tmp', dir, sep, tag,
                        os.time(), math.random(100000, 999999))
 end
 
-local function writeFile(path, data)
+-- Windows: cmd.exe quoting (double quotes, whole command wrapped again).
+-- POSIX:   single quotes, with the '\'' escape for an embedded quote.
+local function shq(s)
+  if IS_WINDOWS then return '"' .. tostring(s):gsub('"', '\\"') .. '"' end
+  return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+end
+
+local function writeBody(path, data)
+  if IS_LINUX then
+    local ok, e = L.secureCreate(path)
+    if not ok then return nil, e end
+  end
   local f, e = io.open(path, 'wb')
-  if not f then return nil, e end
-  f:write(data)
+  if not f then return nil, tostring(e) end
+  f:write(data or '')
   f:close()
   return true
 end
 
-local function readFile(path)
-  local f = io.open(path, 'rb')
-  if not f then return nil end
-  local d = f:read('*a')
-  f:close()
-  return d
+function C.probe()
+  local p = io.popen(shq(http.curlPath) .. ' --version 2>' ..
+                     (IS_WINDOWS and 'NUL' or '/dev/null'), 'r')
+  if not p then return false, 'io.popen unavailable' end
+  local out = p:read('*a') or ''
+  p:close()
+  if out:match('^curl%s') then return true end
+  return false, http.curlPath .. ' not found on PATH'
 end
 
 function C.post(u, headers, body, timeoutMs)
@@ -357,41 +579,43 @@ function C.post(u, headers, body, timeoutMs)
     os.remove(reqFile); os.remove(hdrFile); os.remove(respFile)
   end
 
-  local ok, e = writeFile(reqFile, body or '')
+  local ok, e = writeBody(reqFile, body or '')
   if not ok then clean(); return nil, 'cannot write temp request file: ' .. tostring(e) end
 
   -- -k: match the reference client, which disables cert+hostname verification.
   -- No -L: redirects are never followed.  The body NEVER goes on the command
-  -- line (cmd.exe would mangle &, %VAR%, ^ and quotes) — it is passed by file.
+  -- line (it holds the password, and argv is world-readable in /proc and in
+  -- `ps`; cmd.exe would also mangle &, %VAR%, ^ and quotes) — it goes by file.
   local parts = {
-    '"' .. http.curlPath .. '"', '-s', '-S', '--http1.1',
+    shq(http.curlPath), '-s', '-S', '--http1.1',
     '-k', '--no-keepalive',
     '--max-time', tostring(math.max(1, math.floor((timeoutMs or 20000) / 1000))),
     '-X', 'POST',
-    '--data-binary', '"@' .. reqFile .. '"',
+    '--data-binary', shq('@' .. reqFile),
   }
   local list = sortedHeaderList(headers)
   for i = 1, #list do
     parts[#parts + 1] = '-H'
-    parts[#parts + 1] = '"' .. list[i][1] .. ': ' .. list[i][2]:gsub('"', '\\"') .. '"'
+    parts[#parts + 1] = shq(list[i][1] .. ': ' .. list[i][2])
   end
+  parts[#parts + 1] = '-H'
+  parts[#parts + 1] = shq('Expect:')
   parts[#parts + 1] = '-D'
-  parts[#parts + 1] = '"' .. hdrFile .. '"'
+  parts[#parts + 1] = shq(hdrFile)
   parts[#parts + 1] = '-o'
-  parts[#parts + 1] = '"' .. respFile .. '"'
+  parts[#parts + 1] = shq(respFile)
   parts[#parts + 1] = '-w'
-  parts[#parts + 1] = '"%{http_code}"'
-  parts[#parts + 1] = '"' .. u.scheme .. '://' .. u.host .. ':' .. u.port .. u.path .. '"'
+  parts[#parts + 1] = shq('%{http_code}')
+  parts[#parts + 1] = shq(u.scheme .. '://' .. u.host .. ':' .. u.port .. u.path)
   parts[#parts + 1] = '2>&1'   -- capture curl's own diagnostics for the error string
 
-  if u.scheme == 'https' and not warnedInsecure then
-    warnedInsecure = true
-    log.warn('http: TLS certificate/hostname verification is DISABLED (matches the C++ reference client)')
-  end
+  warnInsecureOnce(u)
 
-  local cmd = '"' .. table.concat(parts, ' ') .. '"'
+  local cmd = table.concat(parts, ' ')
+  -- cmd.exe strips the outer pair of quotes off the whole line; POSIX shells do not.
+  if IS_WINDOWS then cmd = '"' .. cmd .. '"' end
   local p = io.popen(cmd, 'r')
-  if not p then clean(); return nil, 'io.popen failed for curl.exe' end
+  if not p then clean(); return nil, 'io.popen failed for ' .. http.curlPath end
   local out = p:read('*a') or ''
   p:close()
 
@@ -401,31 +625,84 @@ function C.post(u, headers, body, timeoutMs)
   clean()
 
   if not status or status == 0 then
-    return nil, 'curl.exe request failed (' .. (out ~= '' and out or 'no output') .. ')'
+    return nil, 'curl CLI request failed (' .. (out ~= '' and out or 'no output') .. ')'
   end
   return { status = status, body = respBody,
-           headers = parseRawHeaders(rawHeaders), backend = 'curl' }
+           headers = parseRawHeaders(rawHeaders), backend = 'curl-cli' }
 end
 
------------------------------------------------------------------------- post ---
+--------------------------------------------------------- backend selection ---
 
-local function oneShot(u, headers, body, timeoutMs, backend)
-  if backend == 'curl' then return C.post(u, headers, body, timeoutMs) end
+local chosen, chosenErr
 
-  local ok, err = loadWinhttp()
-  if not ok then
-    if backend == 'winhttp' then return nil, 'winhttp.dll not loadable: ' .. tostring(err) end
+local function selectBackend()
+  if chosen then return chosen end
+  if chosenErr then return nil, chosenErr end
+
+  if IS_WINDOWS then
+    local ok, err = W.load()
+    if ok then chosen = 'winhttp'; return chosen end
     log.warn('http: winhttp.dll not loadable (%s) — falling back to curl.exe', tostring(err))
-    return C.post(u, headers, body, timeoutMs)
+    local ok2, err2 = C.probe()
+    if ok2 then chosen = 'curl-cli'; return chosen end
+    chosenErr = 'no HTTP backend: winhttp.dll unusable (' .. tostring(err) ..
+                ') and curl.exe unusable (' .. tostring(err2) .. ')'
+    return nil, chosenErr
   end
 
-  local res, e = W.post(u, headers, body, timeoutMs)
-  if res then return res end
-  if backend == 'winhttp' then return nil, e end
-  log.warn('http: WinHTTP request failed (%s) — retrying with curl.exe', tostring(e))
-  local res2, e2 = C.post(u, headers, body, timeoutMs)
-  if res2 then return res2 end
-  return nil, tostring(e) .. '; curl fallback: ' .. tostring(e2)
+  local ok, err = L.load()
+  if ok then chosen = 'curl-ffi'; return chosen end
+  log.warn('http: libcurl not loadable (%s) — falling back to the curl CLI', tostring(err))
+  local ok2, err2 = C.probe()
+  if ok2 then chosen = 'curl-cli'; return chosen end
+  chosenErr = 'no HTTP backend available: libcurl could not be loaded (' .. tostring(err) ..
+              ') and the curl CLI is not on PATH (' .. tostring(err2) ..
+              ').  Install it:  apt install curl'
+  return nil, chosenErr
+end
+
+--- Name of the backend this process will use ('winhttp' | 'curl-ffi' | 'curl-cli').
+--- Probes once and caches; returns nil, err when no backend exists at all.
+function http.backend()
+  if http.preferBackend and http.preferBackend ~= 'auto' then
+    return http.preferBackend
+  end
+  return selectBackend()
+end
+
+local function oneShot(u, headers, body, timeoutMs, backend)
+  if backend == nil or backend == 'auto' then
+    local b, err = selectBackend()
+    if not b then return nil, err end
+    backend = b
+  end
+  if backend == 'curl' then backend = IS_LINUX and 'curl-ffi' or 'curl-cli' end
+
+  if backend == 'curl-cli' then return C.post(u, headers, body, timeoutMs) end
+
+  if backend == 'curl-ffi' then
+    if not IS_LINUX then return nil, 'curl-ffi backend is Linux-only' end
+    local res, e = L.post(u, headers, body, timeoutMs)
+    if res then return res end
+    log.warn('http: libcurl request failed (%s) — retrying with the curl CLI', tostring(e))
+    local res2, e2 = C.post(u, headers, body, timeoutMs)
+    if res2 then return res2 end
+    return nil, tostring(e) .. '; curl CLI fallback: ' .. tostring(e2)
+  end
+
+  if backend == 'winhttp' then
+    if not IS_WINDOWS then return nil, 'winhttp backend is Windows-only' end
+    local ok, err = W.load()
+    if not ok then return nil, 'winhttp.dll not loadable: ' .. tostring(err) end
+    local res, e = W.post(u, headers, body, timeoutMs)
+    if res then return res end
+    log.warn('http: WinHTTP request failed (%s) — retrying with curl.exe', tostring(e))
+    local res2, e2 = C.post(u, headers, body, timeoutMs)
+    if res2 then return res2 end
+    return nil, tostring(e) .. '; curl fallback: ' .. tostring(e2)
+  end
+
+  return nil, 'unknown http backend: ' .. tostring(backend)
 end
 
 --- Blocking POST.  Returns {status=, body=, headers=} or nil, err.
@@ -435,7 +712,7 @@ function http.post(url, headers, body, opts)
   if not u then return nil, e end
 
   local timeoutMs = opts.timeoutMs or http.DEFAULT_TIMEOUT_MS
-  local backend = opts.backend or http.backend or 'auto'
+  local backend = opts.backend or http.preferBackend or 'auto'
   local hdrs = copyHeaders(headers)
 
   local res, err = oneShot(u, hdrs, body, timeoutMs, backend)
@@ -459,5 +736,6 @@ http._parseUrl = parseUrl
 http._parseRawHeaders = parseRawHeaders
 http._sortedHeaderList = sortedHeaderList
 http._looksLikeText = looksLikeText
+http._shellQuote = shq
 
 return http

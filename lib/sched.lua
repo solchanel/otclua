@@ -3,13 +3,18 @@
 -- One loop turn:
 --   1. drain sched.post() work
 --   2. compute the select() timeout = min(next timer deadline, 50 ms), clamped to >= 0
---   3. select() over every registered socket
+--   3. socket.select() over every registered socket (select() on Windows,
+--      poll() on Linux -- lib/socket.lua hides the difference behind one name)
 --        read   : all registered sockets (+ listeners)
 --        write  : sockets with a non-empty outbox, and sockets still connecting
 --        except : sockets still connecting  -- on Windows a FAILED non-blocking
---                 connect is signalled ONLY here, never in writefds
---      with zero sockets registered the loop Sleep()s for the same interval instead
---      (Winsock select() with three empty sets returns WSAEINVAL, it does not sleep)
+--                 connect is signalled ONLY here, never in writefds.  On Linux
+--                 the same socket comes back POLLOUT-ready with POLLERR|POLLHUP,
+--                 which lib/socket.lua reports in BOTH the write and the except
+--                 list, so this loop needs no branch of its own.
+--      with zero sockets registered the loop sleeps for the same interval instead
+--      (Winsock select() with three empty sets returns WSAEINVAL, it does not sleep;
+--      poll(NULL,0,ms) would sleep, but one code path for both is simpler)
 --   4. fire ready sockets: except -> writable (settle connect / drain outbox) -> readable
 --   5. fire due timers, rescheduling repeats as at = at + every (drift-free, with a
 --      catch-up clamp after a long stall)
@@ -164,6 +169,8 @@ function sched.tick(maxWait)
       sys.sleepMs(1)
     else
       -- 4a) exceptional: a failed non-blocking connect lands here on Windows
+      --     (exceptfds) and on Linux (POLLERR/POLLHUP); either way the verdict
+      --     comes from getsockopt(SO_ERROR) inside _settleConnect.
       for i = 1, #ready.except do
         local s = ready.except[i]
         if s.state == 'connecting' then guard('connect', s._settleConnect, s) end

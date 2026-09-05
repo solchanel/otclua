@@ -92,8 +92,12 @@ end
 -- <dir>/assets/assets.json.sha256 then <dir>/things/<clientVersion>/assets.json.sha256,
 -- trim spaces and newlines, parse a u32 consuming the WHOLE string, require
 -- 1 <= v <= 0xFFFF, else 0.
+--
+-- Returns `value, found`.  `found` distinguishes "no such file anywhere" (this project ships
+-- neither file -- see README "Layout") from "the file is there but is empty / unparsable /
+-- out of range", which is a BROKEN install and must not be papered over.
 function handshake.resolveContentRevision(dir)
-    if not dir then return 0 end
+    if not dir then return 0, false end
     dir = dir:gsub('[/\\]+$', '')
     local candidates = {
         dir .. '/assets/assets.json.sha256',
@@ -107,12 +111,12 @@ function handshake.resolveContentRevision(dir)
             text = text:gsub('^%s+', ''):gsub('%s+$', '')
             if text:match('^%d+$') then
                 local v = tonumber(text)
-                if v and v >= 1 and v <= 0xFFFF then return v end
+                if v and v >= 1 and v <= 0xFFFF then return v, true end
             end
-            return 0
+            return 0, true
         end
     end
-    return 0
+    return 0, false
 end
 
 -- ================================================== 3. HTTPS account login
@@ -195,10 +199,25 @@ function handshake.buildLoginPacket(opts)
     local ts            = opts.challengeTs or 0
     local rnd           = opts.challengeRand or 0
 
+    -- The C++ sends the decimal text of resolveGunzContentRevision(), which is "0" whenever
+    -- the probe fails.  We deviate ONLY for the "no such file anywhere" case, which is the
+    -- normal layout of this project (README "Layout": neither candidate file ships here), and
+    -- which is what DEFAULT_CONTENT_REVISION exists for.  When a candidate file IS present but
+    -- unparsable/out of range the install is broken: send "0" exactly like the reference
+    -- client instead of silently substituting 42196 and lying about the asset set we hold.
     local cr = opts.contentRevision
     if cr == nil and opts.assetsDir then
-        local v = handshake.resolveContentRevision(opts.assetsDir)
-        if v ~= 0 then cr = v end
+        local v, found = handshake.resolveContentRevision(opts.assetsDir)
+        if found then
+            cr = v
+            if v == 0 then
+                local ok, log = pcall(require, 'lib.log')
+                if ok and log and log.warn then
+                    log.warn('content revision file under %s is unparsable or out of range; ' ..
+                             'sending "0" as the reference client does', tostring(opts.assetsDir))
+                end
+            end
+        end
     end
     if cr == nil then cr = handshake.DEFAULT_CONTENT_REVISION end
     cr = tostring(cr)
@@ -224,8 +243,11 @@ function handshake.buildLoginPacket(opts)
     }
 
     -- ---- RSA block: exactly 128 plaintext bytes
+    -- nil = "not supplied" -> the 1530 default.  An EXPLICIT '' means the caller wants the
+    -- conditional field to vanish entirely, which is what the C++ does
+    -- (`if (!extended.empty()) msg->addString(extended);`, framing-crypto VERIFIER #6).
     local extended = opts.extendedData
-    if extended == nil or extended == '' then extended = handshake.EXTENDED_DATA end
+    if extended == nil then extended = handshake.EXTENDED_DATA end
     local rsaParts = {
         u8(0x00),                                   -- first RSA byte must be 0
         u32(key[1]), u32(key[2]), u32(key[3]), u32(key[4]),

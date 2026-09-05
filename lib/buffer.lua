@@ -218,10 +218,20 @@ function Writer:i32(v) return self:u32(v % 4294967296) end
 --- Inverse of Reader:double() -- the 5-byte OutputMessage form: u8 precision, then
 --- u32 (round(value * 10^precision) + INT_MAX) wrapped into uint32.
 --- Added for test fixtures / senders that must emit the InputMessage::getDouble shape.
+--- Rounding is HALF-AWAY-FROM-ZERO (the usual round()), not the floor(x+0.5) half-up rule:
+--- half-up biases negative values toward zero, so Writer:double(-1.5, 0) would encode -1
+--- while Writer:double(1.5, 0) encodes 2.  The scaled value must also stay inside the int32
+--- range Reader:double reconstructs -- outside it the u32 wraps and silently decodes as a
+--- completely different number, so we raise instead.
 function Writer:double(value, precision)
     precision = precision or 2
     self:u8(precision)
-    local scaled = floor(value * (10 ^ precision) + 0.5)
+    local m = value * (10 ^ precision)
+    local scaled = (m >= 0) and floor(m + 0.5) or -floor(-m + 0.5)
+    if scaled < -2147483648 or scaled > 2147483647 then
+        error(sformat('buffer.writer:double: %s at precision %d does not fit in int32 (%s)',
+                      tostring(value), precision, tostring(scaled)), 2)
+    end
     return self:u32((scaled + 2147483647) % 4294967296)
 end
 

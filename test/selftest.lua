@@ -726,15 +726,16 @@ end)
 runSuite('proto.sender', function()
     local sender = require('proto.sender')
     local sent = {}
-    local fake = { send = function(_, b) sent[#sent + 1] = b end }
-    local s = sender.new(fake)
+    -- the fake must report success: sender:_send now propagates a transport failure
+    local fake = { send = function(_, b) sent[#sent + 1] = b; return true end }
+    local s = sender.new(fake, { accountName = 'testaccount' })
     s:ping()
     eq(tohex(sent[#sent]), '1d', 'sendPing writes opcode 29 (ClientPing)')
     s:pingBack()
     eq(tohex(sent[#sent]), '1c', 'sendPingBack writes opcode 28 (ClientPingBackGunz, gunz OS)')
     s:logout()
     eq(tohex(sent[#sent]), '14', 'logout writes opcode 20 (ClientLeaveGame)')
-    s:enterGame()
+    s:enterGame(false)
     eq(tohex(sent[#sent]), '0f', 'enterGame writes opcode 15')
     s:extendedOpcode(10, 'ABCD-1234')
     eq(tohex(sent[#sent]), '320a0900' .. tohex('ABCD-1234'),
@@ -854,6 +855,595 @@ runSuite('boot sequence (offline)', function()
     rx:enableXtea(t.xteaKey)
     rx:feed(wire[4])
     eq(tohex(back), '000000001c', 'the pong is [compression header][opcode 28]')
+end)
+
+-- ===================================================== review-fix regressions
+-- Every check below fails on the commit BEFORE the corresponding fix and passes after.
+-- Grouped by the module the fix landed in, not by lens.
+runSuite('fixes: lib', function()
+    -- --- lib/buffer.lua Writer:double -------------------------------------
+    local W = buffer.writer(); W:double(-1.5, 0)
+    local Rd = buffer.reader(W:data())
+    eq(Rd:double(), -2, 'Writer:double rounds -1.5 AWAY from zero (half-up gave -1)')
+    W = buffer.writer(); W:double(1.5, 0)
+    eq(buffer.reader(W:data()):double(), 2, 'Writer:double rounds 1.5 away from zero (unchanged)')
+    W = buffer.writer(); W:double(-2.5, 0)
+    eq(buffer.reader(W:data()):double(), -3, 'Writer:double rounds -2.5 away from zero (was -2)')
+    for _, v in ipairs({ 0, 12.34, -12.34, 21474836.47, -21474836.48 }) do
+        local ww = buffer.writer(); ww:double(v, 2)
+        eq(buffer.reader(ww:data()):double(), v, ('Writer:double round-trips %s'):format(v))
+    end
+    raises(function() local x = buffer.writer(); x:double(1e9, 2) end,
+           'does not fit in int32', 'Writer:double refuses a value that would wrap the u32')
+
+    -- --- lib/events.lua Bus:clear -----------------------------------------
+    local events = require('lib.events')
+    local bus = events.new()
+    local calls = {}
+    bus:on('go', function() calls[#calls + 1] = 'h1'; bus:clear() end)
+    local h2 = bus:on('go', function() calls[#calls + 1] = 'h2' end)
+    bus:emit('go')
+    eq(table.concat(calls, ','), 'h1', 'clear() inside a handler stops the rest of that emit')
+    eq(bus:off(h2), false, 'off() on a handle clear() already dropped reports it was not live')
+
+    -- --- lib/xtea.lua schedule memoisation --------------------------------
+    local xtea = require('lib.xtea')
+    local key = { 0x01234567, 0x89ABCDEF, 0xFEDCBA98, 0x76543210 }
+    local plain = string.rep('luaclient', 8)          -- 72 bytes, multiple of 8
+    local ct = xtea.encrypt(key, plain)
+    eq(xtea.decrypt(key, ct), plain, 'xtea round-trips through the memoised schedule')
+    local before = xtea.scheduleBuilds()
+    for _ = 1, 50 do xtea.decrypt(key, xtea.encrypt(key, plain)) end
+    eq(xtea.scheduleBuilds(), before,
+       '100 encrypt/decrypt calls on one key rebuild the schedules ZERO times')
+    local ctx = xtea.newContext(key)
+    eq(ctx:decrypt(ctx:encrypt(plain)), plain, 'xtea.newContext round-trips')
+end)
+
+runSuite('fixes: proto.transport', function()
+    local socket = require('lib.socket')
+    local sched  = require('lib.sched')
+    local sys    = require('lib.sys')
+    socket.init(); sched.reset()
+
+    local function driveUntil(pred, limitMs)
+        local deadline = sys.nowMs() + (limitMs or 1500)
+        local id = sched.every(5, function()
+            if pred() or sys.nowMs() > deadline then sched.stop() end
+        end)
+        sched.run()
+        sched.cancel(id)
+    end
+
+    -- --- connect() must refuse an empty world name ------------------------
+    local tw = transport.new{ onMessage = function() end }
+    local okw, errw = tw:connect()
+    check(okw == nil, 'connect() without a worldName is refused')
+    check(tostring(errw):find('worldName', 1, true) ~= nil, 'the refusal names worldName', errw)
+
+    -- --- _fail() closes the socket instead of leaking the fd --------------
+    local closed = false
+    local tf = transport.new{ onMessage = function() end, onError = function() end }
+    tf.sock = { close = function() closed = true end }
+    tf:_fail('synthetic')
+    check(closed, '_fail() closed the socket')
+    eq(tf.sock, nil, '_fail() dropped the socket reference')
+
+    -- --- connect/read timeouts -------------------------------------------
+    local seen
+    local tc = transport.new{ onMessage = function() end, onError = function(m) seen = m end }
+    tc.sock = { close = function() end }
+    tc.state, tc.connectStartMs = 'connecting', 1000
+    tc:checkTimeouts(1000 + 30000)                 -- exactly at the limit: still alive
+    check(seen == nil and not tc.dead, 'a connect at exactly 30 s has not timed out yet')
+    tc:checkTimeouts(1000 + 30001)
+    check(tc.dead, 'connect timeout fires past 30 s')
+    check(tostring(seen):find('connect timeout', 1, true) ~= nil, 'onError names the timeout', seen)
+
+    seen = nil
+    local tr = transport.new{ onMessage = function() end, onError = function(m) seen = m end,
+                              readTimeoutMs = 500 }
+    tr.sock = { close = function() end }
+    tr.state, tr.lastReadMs = 'connected', 0
+    tr:checkTimeouts(400)
+    check(not tr.dead, 'a read 400 ms ago does not trip a 500 ms read timeout')
+    tr:checkTimeouts(600)
+    check(tr.dead and tostring(seen):find('read timeout', 1, true) ~= nil,
+          'read timeout fires past readTimeoutMs', seen)
+
+    -- --- reconnecting the SAME Transport object ---------------------------
+    local listener = assert(socket.listen('127.0.0.1', 0))
+    local port = listener.boundPort or listener:port()
+    local accepted = {}
+    sched.onSocket(listener, function(l)
+        local c = l:accept()
+        if c then accepted[#accepted + 1] = c end
+    end)
+
+    local errors = {}
+    local t = transport.new{ host = '127.0.0.1', port = port, worldName = 'SelftestWorld',
+                             onMessage = function() end,
+                             onError = function(m) errors[#errors + 1] = m end }
+    check(t:connect() == true, 'first connect()')
+    driveUntil(function() return t.state == 'connected' end)
+    eq(t.state, 'connected', 'session 1 reached connected')
+
+    -- poison every piece of per-connection state, exactly as a mid-frame failure would
+    t.needBody, t.rbuf, t.rpos = 36, 'half-a-frame', 1
+    t.xteaOn, t.xteaKey = true, { 1, 2, 3, 4 }
+    t.compressionMode = 'stream'
+    t.seq = 7
+    t:close()
+    check(t.dead and t.sock == nil, 'close() marks the transport dead and drops the socket')
+
+    check(t:connect() == true, 'reconnect on the same Transport object is accepted')
+    eq(t.dead, false, 'reconnect cleared dead (before the fix it stayed true forever)')
+    eq(t.lastError, nil, 'reconnect cleared lastError')
+    eq(t.needBody, nil, 'reconnect cleared the pending frame length')
+    eq(t.rbuf, '', 'reconnect cleared the receive accumulator')
+    eq(t.rqlen, 0, 'reconnect cleared the pending chunk queue')
+    eq(t.xteaOn, false, 'reconnect turned XTEA back off')
+    eq(t.xteaKey, nil, 'reconnect dropped the previous session key')
+    eq(t.compressionMode, nil, 'reconnect cleared the inbound zlib latch')
+    eq(t.seq, 0, 'reconnect restarted the sequence counter')
+    driveUntil(function() return t.state == 'connected' end)
+    eq(t.state, 'connected', 'session 2 reached connected and wrote its preamble')
+    eq(#errors, 0, 'no error was reported across the reconnect')
+    check(t.stats.sent >= 0, 'stats survived the reconnect')
+
+    t:close()
+    for _, c in ipairs(accepted) do c:close() end
+    listener:close()
+    sched.reset()
+end)
+
+runSuite('fixes: proto.handshake', function()
+    -- --- an EXPLICIT empty extendedData must remove the field entirely -----
+    local base = handshake.buildLoginPacket{
+        sessionKey = 'K', characterName = 'C', challengeTs = 1, challengeRand = 2,
+        contentRevision = 42196, xteaKey = { 1, 2, 3, 4 } }
+    local empty = handshake.buildLoginPacket{
+        sessionKey = 'K', characterName = 'C', challengeTs = 1, challengeRand = 2,
+        contentRevision = 42196, xteaKey = { 1, 2, 3, 4 }, extendedData = '' }
+    local dflt = handshake.buildLoginPacket{
+        sessionKey = 'K', characterName = 'C', challengeTs = 1, challengeRand = 2,
+        contentRevision = 42196, xteaKey = { 1, 2, 3, 4 }, extendedData = '261' }
+    eq(base, dflt, 'extendedData=nil is the documented 261 default')
+    check(empty ~= dflt, "extendedData='' drops the field (before: coerced to 261)")
+    eq(#empty, #dflt, 'the RSA block is still exactly 128 bytes (zero-filled)')
+
+    -- --- a probe that FAILED must send "0", not the 42196 fallback ---------
+    local isWin = package.config:sub(1, 1) == '\\'
+    local tmp = (os.getenv('TMPDIR') or os.getenv('TEMP') or os.getenv('TMP')
+                 or (isWin and '.' or '/tmp')):gsub('\\', '/'):gsub('/+$', '')
+    local dir = tmp .. '/lcselftest_cr'
+    local function mkdirp(path)
+        if isWin then
+            os.execute('mkdir "' .. path:gsub('/', '\\') .. '" 2>NUL')
+        else
+            os.execute('mkdir -p "' .. path .. '" 2>/dev/null')
+        end
+    end
+    mkdirp(dir .. '/assets')
+    local f = io.open(dir .. '/assets/assets.json.sha256', 'wb')
+    if check(f ~= nil, 'wrote a corrupt assets.json.sha256 fixture', dir) then
+        f:write('deadbeefnotanumber')
+        f:close()
+        local v, found = handshake.resolveContentRevision(dir)
+        eq(v, 0, 'an unparsable sha256 file resolves to 0')
+        eq(found, true, 'and reports that a candidate file WAS found')
+        local body = handshake.buildLoginPacket{
+            sessionKey = 'K', characterName = 'C', challengeTs = 1, challengeRand = 2,
+            assetsDir = dir, xteaKey = { 1, 2, 3, 4 } }
+        -- head = u8 0x0A, u16 os, u16 pv, u32 cv, STR "1530", STR contentRevision, u8 0
+        local Rh = buffer.reader(body)
+        Rh:u8(); Rh:u16(); Rh:u16(); Rh:u32(); Rh:string()
+        eq(Rh:string(), '0',
+           'a FAILED probe puts "0" on the wire like the reference client (was "42196")')
+        os.remove(dir .. '/assets/assets.json.sha256')
+    end
+    -- and when NO candidate file exists anywhere the documented 42196 fallback still applies
+    -- (README "Layout": this project ships neither file, so that is the normal live path).
+    local v0, found0 = handshake.resolveContentRevision(ROOT .. '/assets')
+    eq(v0, 0, 'no candidate file -> 0')
+    eq(found0, false, 'and reports that nothing was found')
+    for _, opt in ipairs({ {}, { assetsDir = ROOT .. '/assets' } }) do
+        opt.sessionKey, opt.characterName = 'K', 'C'
+        opt.challengeTs, opt.challengeRand = 1, 2
+        opt.xteaKey = { 1, 2, 3, 4 }
+        local body2 = handshake.buildLoginPacket(opt)
+        local R2 = buffer.reader(body2)
+        R2:u8(); R2:u16(); R2:u16(); R2:u32(); R2:string()
+        eq(R2:string(), '42196', 'with nothing probed the 42196 fallback is unchanged')
+    end
+end)
+
+runSuite('fixes: proto.parser', function()
+    local items = require('proto.items')
+    local PING = string.char(0x1D)
+
+    local function fresh()
+        local st = state.new()
+        local ev, warns = {}, {}
+        local p = parser.new(st, function(name, data)
+            ev[#ev + 1] = { name = name, data = data }
+            if name == 'parseWarning' then warns[#warns + 1] = data end
+        end)
+        return st, p, ev, warns
+    end
+    local function sawPing(ev)
+        for _, e in ipairs(ev) do if e.name == 'ping' then return true end end
+        return false
+    end
+
+    -- ---- 0xFC StoreOffers: STATE_SALE is 2, not 1 ------------------------
+    -- one non-Home category, one offer, one sub-offer in STATE_SALE (+u32 validUntil,
+    -- +u32 basePrice), offer type SHOW_MOUNT so the type dispatch is not under test here.
+    local function storeOffers(subState, saleTail, offerType, typeBody)
+        local w = buffer.writer()
+        w:u8(0xFC)
+        w:string('Premium')          -- categoryName (not "Home", not "Search")
+        w:u32(0)                     -- redirectId
+        w:u8(0)                      -- sort order
+        w:u8(0)                      -- drop-menu entries
+        w:u16(0)                     -- opaque blob
+        w:u16(0)                     -- disable reasons (cv >= 1310)
+        w:u16(1)                     -- offersCount
+        w:string('Offer')            -- offer name
+        w:u8(1)                      -- sub-offer count
+        w:u32(7):u16(1):u32(250):u8(0)
+        w:u8(0)                      -- not disabled
+        w:u8(subState)
+        if saleTail then w:u32(0):u32(250) end
+        w:u8(offerType)
+        typeBody(w)
+        w:u8(0)                      -- tryOnType
+        w:string('')                 -- collection
+        w:u16(0):u32(0):u8(0)
+        w:u16(0)                     -- productsCapacity
+        return w:data()
+    end
+
+    local _, p, ev, warns = fresh()
+    p:parse(storeOffers(2, true, 1, function(w) w:u16(500) end) .. PING)
+    eq(#warns, 0, '0xFC STATE_SALE(2) sub-offer parses without a warning')
+    check(sawPing(ev), '0xFC STATE_SALE consumed exactly its own bytes')
+
+    _, p, ev, warns = fresh()
+    p:parse(storeOffers(1, false, 1, function(w) w:u16(500) end) .. PING)
+    eq(#warns, 0, '0xFC STATE_NEW(1) sub-offer carries NO sale tail')
+    check(sawPing(ev), '0xFC STATE_NEW consumed exactly its own bytes')
+
+    -- ---- 0xFC offer type: SHOW_OUTFIT(2) = u16 + 4 colours, SHOW_ITEM(3) = u16 ----
+    _, p, ev, warns = fresh()
+    p:parse(storeOffers(0, false, 2, function(w) w:u16(128):u8(1):u8(2):u8(3):u8(4) end) .. PING)
+    eq(#warns, 0, '0xFC SHOW_OUTFIT(2) reads u16 + 4 colour bytes')
+    check(sawPing(ev), '0xFC SHOW_OUTFIT consumed exactly its own bytes')
+
+    _, p, ev, warns = fresh()
+    p:parse(storeOffers(0, false, 3, function(w) w:u16(3031) end) .. PING)
+    eq(#warns, 0, '0xFC SHOW_ITEM(3) reads a bare u16')
+    check(sawPing(ev), '0xFC SHOW_ITEM consumed exactly its own bytes')
+
+    -- ---- tolerant classification: made-up / zero item ids -----------------
+    local _, p2, ev2 = fresh()
+    local w = buffer.writer()
+    w:u8(0xCD):u16(1):u16(items.MAX_ID + 856):u64(1234)     -- a made-up client id
+    local ok = pcall(function() p2:parse(w:data() .. PING) end)
+    check(ok, '0xCD SendItemsPrice tolerates a made-up client id (C++ assumes classification 0)')
+    check(sawPing(ev2), '0xCD consumed exactly its own bytes')
+
+    local _, p3, ev3 = fresh()
+    w = buffer.writer(); w:u8(0xF5):u16(1):u16(0):u8(0):u8(5)   -- itemId 0, packed count 5
+    ok = pcall(function() p3:parse(w:data() .. PING) end)
+    check(ok, '0xF5 PlayerInventory tolerates item id 0')
+    check(sawPing(ev3), '0xF5 consumed exactly its own bytes')
+
+    -- readItem itself must STAY strict (the C++ getItem really does throw)
+    local _, p4 = fresh()
+    w = buffer.writer(); w:u8(0x6A):u16(100):u16(100):u8(7):u8(0):u16(0)
+    check(not pcall(function() p4:parse(w:data()) end), 'readItem still rejects item id 0')
+
+    -- ---- 0xA1 PlayerSkills additional-skills block: 4 entries, not 5 ------
+    -- 0x43 Features: enable GameAdditionalSkills(76), disable GameConcotions(94) and
+    -- GameCharacterSkillStats(127) so the tail is exactly the block under test.
+    local function features(on, off)
+        local fw = buffer.writer()
+        fw:u8(0x43):u16(#on + #off)
+        for _, id in ipairs(on)  do fw:u8(id):u8(1) end
+        for _, id in ipairs(off) do fw:u8(id):u8(0) end
+        return fw:data()
+    end
+    local function skillsBody(extraPairs)
+        local sw = buffer.writer()
+        sw:u8(0xA1)
+        sw:u16(50):u16(50):u16(0):u16(5000)              -- magic level block (cv >= 1281)
+        for _ = 0, 6 do sw:u16(10):u16(10):u16(0):u16(0) end
+        for _ = 1, extraPairs do sw:u16(0):u16(0) end
+        return sw:data()
+    end
+    local _, p5, ev5 = fresh()
+    p5:parse(features({ 76 }, { 94, 127 }))
+    ok = pcall(function() p5:parse(skillsBody(4) .. PING) end)
+    check(ok and sawPing(ev5),
+          'GameAdditionalSkills with GameLeechAmount OFF is 4 pairs (was hard-coded 5)')
+    local _, p6 = fresh()
+    p6:parse(features({ 76 }, { 94, 127 }))
+    check(not pcall(function() p6:parse(skillsBody(5)) end),
+          'a 5-pair additional-skills payload is now rejected')
+    local _, p7, ev7 = fresh()
+    p7:parse(features({ 76, 109 }, { 94, 127 }))
+    ok = pcall(function() p7:parse(skillsBody(6) .. PING) end)
+    check(ok and sawPing(ev7), 'GameAdditionalSkills with GameLeechAmount ON is 6 pairs')
+
+    -- ---- 0xA1 forge-skill block: 4 pairs + 2 u32 at cv >= 1332 -----------
+    local _, p8, ev8 = fresh()
+    p8:parse(features({ 126 }, { 76, 94, 127 }))
+    local fw = buffer.writer()
+    fw:u8(0xA1):u16(50):u16(50):u16(0):u16(5000)
+    for _ = 0, 6 do fw:u16(10):u16(10):u16(0):u16(0) end
+    for _ = 1, 4 do fw:u16(0):u16(0) end               -- Fatal..Transcendence
+    fw:u32(0):u32(0)
+    ok = pcall(function() p8:parse(fw:data() .. PING) end)
+    check(ok and sawPing(ev8), 'GameForgeSkillStats is 4 pairs at cv >= 1332 (was 11)')
+
+    -- ---- 0xA7 PlayerModes honours GameTacticsWithoutFightMode ------------
+    local st9, p9, ev9 = fresh()
+    p9:parse(features({}, { 136 }))
+    w = buffer.writer(); w:u8(0xA7):u8(1):u8(2):u8(1):u8(3)   -- fight, chase, safe, pvp
+    ok = pcall(function() p9:parse(w:data() .. PING) end)
+    check(ok and sawPing(ev9), '0xA7 with feature 136 OFF reads 4 bytes')
+    eq(st9.fightMode, 1, '0xA7 fightMode came from the first byte')
+    eq(st9.chaseMode, 2, '0xA7 chaseMode')
+    eq(st9.pvpMode, 3, '0xA7 pvpMode (GamePVPMode is on)')
+
+    local st10, p10, ev10 = fresh()
+    w = buffer.writer(); w:u8(0xA7):u8(1):u8(1):u8(2)         -- 1530 default: 3 bytes
+    ok = pcall(function() p10:parse(w:data() .. PING) end)
+    check(ok and sawPing(ev10), '0xA7 at the 1530 default is still 3 bytes')
+    eq(st10.pvpMode, 2, '0xA7 default-branch pvpMode')
+
+    -- ---- 0xA0 PlayerData mana-shield tail with GameDoubleHealth OFF ------
+    local st11, p11, ev11 = fresh()
+    p11:parse(features({}, { 28 }))
+    w = buffer.writer()
+    w:u8(0xA0)
+    w:u16(100):u16(200)                 -- health / maxHealth (u16 now)
+    w:u32(87650)                        -- freeCapacity (GameDoubleFreeCapacity stays on)
+    w:u64(9):u16(3):u16(4321)
+    w:u16(0):u16(0):u16(0):u16(0)       -- experience-bonus block
+    w:u16(30):u16(60)                   -- mana / maxMana (u16 now)
+    w:u8(100):u16(2400):u16(220):u16(0):u16(0)
+    w:u16(0):u8(0)
+    w:u16(11):u16(22)                   -- mana shield: FOUR bytes, not zero
+    ok = pcall(function() p11:parse(w:data() .. PING) end)
+    check(ok and sawPing(ev11), '0xA0 with GameDoubleHealth OFF consumes the u16 shield tail')
+    eq(st11.player.health, 100, '0xA0 narrow health')
+    eq(st11.player.manaShield, 11, '0xA0 narrow manaShield')
+    eq(st11.player.maxManaShield, 22, '0xA0 narrow maxManaShield')
+
+    -- ---- 0x71 / 0x72 container pagination layouts ------------------------
+    local _, p12, ev12 = fresh()
+    p12:parse(features({}, { 40 }))
+    -- item id 1 has no attribute flags (see the proto.items suite), so readItem reads
+    -- exactly its u16 and nothing else -- the slot width is the only variable here.
+    w = buffer.writer(); w:u8(0x71):u8(3):u8(5):u16(1)        -- cid, u8 slot, item
+    ok = pcall(function() p12:parse(w:data() .. PING) end)
+    check(ok and sawPing(ev12), '0x71 with pagination OFF reads a u8 slot')
+
+    local _, p13, ev13 = fresh()
+    p13:parse(features({}, { 40 }))
+    w = buffer.writer(); w:u8(0x72):u8(3):u8(5)               -- cid, u8 slot, NO lastItemId
+    ok = pcall(function() p13:parse(w:data() .. PING) end)
+    check(ok and sawPing(ev13), '0x72 with pagination OFF reads only a u8 slot')
+
+    local _, p14, ev14 = fresh()
+    w = buffer.writer(); w:u8(0x72):u8(3):u16(5):u16(0)       -- 1530 default: pagination on
+    ok = pcall(function() p14:parse(w:data() .. PING) end)
+    check(ok and sawPing(ev14), '0x72 at the 1530 default is u16 slot + u16 lastItemId')
+
+    -- ---- 0xC4 WeaponProficiencyInfo warns instead of killing the session --
+    local _, p15, ev15, warns15 = fresh()
+    w = buffer.writer(); w:u8(0xC4):u16(3031):u32(500):u8(0):u8(2)   -- detailCount = 2
+    ok = pcall(function() p15:parse(w:data() .. PING) end)
+    check(ok, '0xC4 with a non-zero detail count no longer raises')
+    eq(#warns15, 1, '0xC4 emitted exactly one parseWarning')
+    check(sawPing(ev15), '0xC4 let the rest of the frame be parsed')
+
+    -- ---- 0x83 unknown magic-effect subtype recovers like the C++ ---------
+    local _, p16, ev16, warns16 = fresh()
+    w = buffer.writer(); w:u8(0x83):u16(100):u16(100):u8(7)
+    w:u8(9)                                     -- unknown subtype -> C++ `default: break;`
+    w:u8(0)                                     -- terminator
+    ok = pcall(function() p16:parse(w:data() .. PING) end)
+    check(ok, '0x83 with an unknown subtype no longer disconnects')
+    eq(#warns16, 1, '0x83 emitted one parseWarning naming the subtype')
+    check(sawPing(ev16), '0x83 recovered and the rest of the frame parsed')
+
+    -- ---- P:setCentral drives Map::setCentralPosition -> removeUnawareThings ----
+    local st18, p18 = fresh()
+    st18:addThing({ x = 2000, y = 2000, z = 7 }, -2, { kind = 'item', id = 101 })
+    st18:addThing({ x = 2100, y = 2000, z = 7 }, -2, { kind = 'item', id = 101 })
+    p18:setCentral({ x = 2000, y = 2000, z = 7 })
+    check(st18:tile({ x = 2000, y = 2000, z = 7 }) ~= nil, 'the new centre tile survived')
+    check(st18:tile({ x = 2100, y = 2000, z = 7 }) == nil,
+          'a tile 100 columns away was evicted when the centre moved (was retained forever)')
+    eq(st18.player.pos.x, 2000, 'setCentral still updates the player position')
+
+    -- ---- 0x33 aware range stays aliased with game/state.lua --------------
+    local st17, p17 = fresh()
+    check(rawequal(p17.aware, st17.world.awareRange), 'parser.aware aliases state.world.awareRange')
+    w = buffer.writer(); w:u8(0x33):u8(34):u8(26)
+    p17:parse(w:data())
+    -- xRange 34 -> left = 34/2 - ((34+1)%2) = 16, right = 17 (map-parsing Correction #7)
+    eq(st17.world.awareRange.left, 16, '0x33 updated state.world.awareRange in place')
+    eq(st17.world.awareRange.right, 17, '0x33 right half')
+    check(rawequal(p17.aware, st17.world.awareRange), '0x33 preserved the alias')
+    st17:reset()
+    eq(p17.aware.left, 8, 'state:reset() reset the range the PARSER uses (alias survived)')
+    eq(p17:AW(), 18, 'the parser sizes map packets with the reset range (8+9+1)')
+end)
+
+runSuite('fixes: game.state', function()
+    local st = state.new()
+    eq(st.player.statesLo, 0, 'player.statesLo is declared (parser writes it)')
+    eq(st.player.statesHigh, 0, 'player.statesHigh is declared (parser writes it)')
+    eq(st.player.statesHi, nil, 'the dead statesHi spelling is gone')
+
+    -- ---- the 11-thing trim may delete the thing that was just inserted ----
+    local pos = { x = 500, y = 500, z = 7 }
+    for i = 1, 11 do st:addThing(pos, -2, { kind = 'item', id = 100 + i }) end
+    eq(st:thingCount(pos), 11, 'the tile holds 11 things before the trim fires')
+    local victim = { kind = 'item', id = 999 }
+    local sp = st:addThing(pos, 10, victim)
+    eq(st:creatureStackPos(pos, -1), nil, 'sanity: no creature on the fixture tile')
+    eq(sp, nil, 'addThing returns nil when the trim deleted the thing it just inserted')
+    local stillThere = false
+    for _, t in ipairs(st:tile(pos).things) do if t == victim then stillThere = true end end
+    check(not stillThere, 'the trimmed thing really is off the tile')
+
+    -- a thing that SURVIVES the trim still reports its real index
+    local keeper = { kind = 'item', id = 998 }
+    local kp = st:addThing(pos, 3, keeper)
+    eq(kp, 3, 'a surviving insert still reports its 0-based index')
+    eq(st:getThing(pos, 3), keeper, 'and that index addresses the thing')
+
+    -- ---- reset() mutates world/awareRange in place ----------------------
+    local st2 = state.new()
+    local worldRef, rangeRef = st2.world, st2.world.awareRange
+    st2.world.awareRange.left = 99
+    st2:reset()
+    check(rawequal(st2.world, worldRef), 'reset() kept the same world table')
+    check(rawequal(st2.world.awareRange, rangeRef), 'reset() kept the same awareRange table')
+    eq(rangeRef.left, 8, 'reset() restored the 8/6/9/7 default in place')
+    eq(rangeRef.bottom, 7, 'reset() restored bottom')
+
+    -- ---- setCentralPosition evicts unaware tiles -------------------------
+    local st3 = state.new()
+    st3.player.id = 1
+    local centre = { x = 1000, y = 1000, z = 7 }
+    for dx = -20, 20 do
+        for dy = -20, 20 do
+            st3:addThing({ x = 1000 + dx, y = 1000 + dy, z = 7 }, -2, { kind = 'item', id = 101 })
+        end
+    end
+    eq(st3.tileCount, 41 * 41, 'the fixture described 1681 tiles')
+    st3:setCentralPosition(centre)
+    local a = st3.world.awareRange
+    eq(st3.tileCount, (a.left + a.right + 1) * (a.top + a.bottom + 1),
+       'setCentralPosition kept exactly the aware rectangle')
+    check(st3:tile(centre) ~= nil, 'the centre tile survived')
+    check(st3:tile({ x = 1000 - a.left, y = 1000, z = 7 }) ~= nil, 'the left edge survived')
+    check(st3:tile({ x = 1000 - a.left - 1, y = 1000, z = 7 }) == nil,
+          'one tile past the left edge was evicted')
+    check(st3:tile({ x = 1020, y = 1020, z = 7 }) == nil, 'a far corner was evicted')
+    eq(select(2, st3:walkableAt({ x = 1020, y = 1020, z = 7 })), 'unknown-tile',
+       'an evicted tile answers unknown-tile, not items-unknown')
+
+    -- walking away keeps the tile count bounded instead of growing forever
+    local before = st3.tileCount
+    for step = 1, 200 do
+        local c = { x = 1000 + step, y = 1000, z = 7 }
+        for dy = -a.top, a.bottom do
+            st3:addThing({ x = c.x + a.right, y = 1000 + dy, z = 7 }, -2, { kind = 'item', id = 101 })
+        end
+        st3:setCentralPosition(c)
+    end
+    eq(st3.tileCount, before, 'a 200-step walk leaves the tile count bounded (was unbounded)')
+
+    -- a floor change is aware-range-limited too
+    check(not st3:isAwareOf({ x = 1200, y = 1000, z = 0 }, { x = 1200, y = 1000, z = 7 }),
+          'a tile 7 floors up is outside the aware floors')
+    check(st3:isAwareOf({ x = 1200, y = 1000, z = 7 }, { x = 1200, y = 1000, z = 7 }),
+          'the central tile is aware of itself')
+
+    -- ---- walkableAt reason strings match the documented contract ---------
+    local st4 = state.new()
+    eq(select(2, st4:walkableAt({ x = 1, y = 1, z = 7 })), 'unknown-tile', 'unknown-tile reason')
+    st4:addThing({ x = 1, y = 1, z = 7 }, -2, { kind = 'item', id = 101 })
+    eq(select(2, st4:walkableAt({ x = 1, y = 1, z = 7 })), 'items-unknown', 'items-unknown reason')
+    st4:addThing({ x = 1, y = 1, z = 7 }, -2, { kind = 'creature', creatureId = 77, id = 0x63 })
+    eq(select(2, st4:walkableAt({ x = 1, y = 1, z = 7 })), 'creature', 'creature reason')
+end)
+
+runSuite('fixes: proto.sender', function()
+    local sender = require('proto.sender')
+
+    -- ---- a failed transport write must be reported, not counted ----------
+    local dead = { send = function() return nil, 'transport is dead' end }
+    local sd = sender.new(dead)
+    local body, err = sd:ping()
+    eq(body, nil, 'a builder returns nil when the transport refused the frame')
+    eq(err, 'transport is dead', 'and it propagates the transport error')
+    eq(sd.sent, 0, 'a refused frame is not counted in sender.sent')
+
+    -- ---- attack/follow must not advance m_seq on a failed send -----------
+    sd.seq = 0
+    body, err = sd:attack(0x11223344)
+    eq(body, nil, 'attack on a dead transport reports the failure')
+    eq(sd.seq, 0, 'a failed attack left m_seq alone (it used to advance regardless)')
+    body = sd:follow(0x11223344)
+    eq(sd.seq, 0, 'a failed follow left m_seq alone')
+
+    -- and a successful one still advances it
+    local sent = {}
+    local live = { send = function(_, b) sent[#sent + 1] = b; return true end }
+    local s = sender.new(live, { accountName = 'testaccount' })
+    check(s:attack(0x11223344) ~= nil, 'attack on a live transport succeeds')
+    eq(s.seq, 0x11223344, 'a successful attack set m_seq to the target id')
+    eq(s.sent, 1, 'a successful frame is counted')
+
+    -- ---- talk aimMode is normalised to an integer ------------------------
+    sent = {}
+    s:talk(1, 0, '', 'exura', 1, { x = 1000, y = 2000, z = 7 })
+    local withPos = sent[#sent]
+    sent = {}
+    s:talk(1, 0, '', 'exura', 1.4, { x = 1000, y = 2000, z = 7 })
+    eq(tohex(sent[#sent]), tohex(withPos),
+       'a fractional aimMode 1.4 still appends the Position (byte and branch agree)')
+
+    -- ---- setFightMode accepts booleans on all three fields ---------------
+    sent = {}
+    check(s:setFightMode(1, true, true, false) ~= nil, 'setFightMode(chase=true) does not crash')
+    eq(tohex(sent[#sent]), 'a0010100', 'setFightMode coerces chase/safe/pvp identically')
+
+    -- ---- enterGame emits BOTH gunz frames --------------------------------
+    sent = {}
+    s:enterGame()
+    eq(#sent, 2, 'enterGame() emits the 0x0F frame AND the 0x32/0x0A hwid frame')
+    eq(tohex(sent[1]), '0f', 'first frame is 0x0F')
+    eq(tohex(sent[2]), '320a0900' .. tohex(handshake.hwid('testaccount')),
+       'second frame is [0x32][10][STR hwid] for the account name')
+    sent = {}
+    s:enterGame(false)
+    eq(#sent, 1, 'enterGame(false) suppresses the fingerprint frame')
+
+    -- ---- autoWalk reports how many steps it actually sent -----------------
+    sent = {}
+    local b2, n = s:autoWalk({ 1, 4, 0 })
+    eq(n, 3, 'autoWalk reports a complete path')
+    eq(tohex(b2), '6403010203', 'autoWalk bytes: E->1, NE->2, N->3 (sender.AUTOWALK_BYTE)')
+    local long = {}
+    for i = 1, 200 do long[i] = 0 end
+    local _, n2 = s:autoWalk(long)
+    eq(n2, 127, 'autoWalk reports the clamped step count so the caller can resume')
+
+    -- ---- the newly added builders ---------------------------------------
+    sent = {}
+    s:seekInContainer(3, 700)
+    eq(tohex(sent[#sent]), 'cc03bc0200', '0xCC seek-in-container: u8 cid, u16 index, u8 filter')
+    s:buyItem(3031, 0, 100, false, true)
+    eq(tohex(sent[#sent]), '7ad70b006400' .. '0001', '0x7A buy: u16 id, u8 sub, u16 amount, 2 flags')
+    s:sellItem(3031, 0, 5, true)
+    eq(tohex(sent[#sent]), '7bd70b00050001', '0x7B sell: u16 id, u8 sub, u16 amount, u8 flag')
+    s:closeNpcTrade()
+    eq(tohex(sent[#sent]), '7c', '0x7C close npc trade is empty')
+    s:requestOutfit()
+    eq(tohex(sent[#sent]), 'd2', '0xD2 request outfit is empty')
+    s:changeOutfit{ id = 128, head = 1, body = 2, legs = 3, feet = 4, addons = 3,
+                    mount = 0, hasMount = false, familiar = 0 }
+    eq(tohex(sent[#sent]), 'd3008000010203040300000000000000000000',
+       '0xD3 change outfit follows docs/opcode-map.md 5.3 (19 payload bytes)')
 end)
 
 -- =================================================================== report

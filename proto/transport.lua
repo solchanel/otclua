@@ -41,6 +41,18 @@ local function INFLATE() if not _inflate then _inflate = require('lib.inflate') 
 local function SOCKET()  if not _socket  then _socket  = require('lib.socket')  end return _socket  end
 local function SCHED()   if not _sched   then _sched   = require('lib.sched')   end return _sched   end
 
+-- monotonic clock; falls back to os.time() when lib/sys is unavailable (never on either
+-- supported platform, but the transport must stay loadable in a bare interpreter).
+local _nowFn
+local function NOWMS()
+    if not _nowFn then
+        local ok, sys = pcall(require, 'lib.sys')
+        if ok and type(sys) == 'table' and sys.nowMs then _nowFn = sys.nowMs
+        else _nowFn = function() return os.time() * 1000 end end
+    end
+    return _nowFn()
+end
+
 local floor  = math.floor
 local schar  = string.char
 local ssub   = string.sub
@@ -82,6 +94,10 @@ function transport.new(opts)
     self.onError   = opts.onError   or noop
     self.onConnect = opts.onConnect or noop
     self.recvChunk = opts.recvChunk or 65536
+    -- Connection::READ_TIMEOUT == WRITE_TIMEOUT == 30 s (connection.h:36-39,
+    -- docs/framing-crypto.md §0).  0 or false disables the watchdog.
+    self.connectTimeoutMs = opts.connectTimeoutMs or 30000
+    self.readTimeoutMs    = opts.readTimeoutMs    or 30000
 
     -- crypto / framing state
     self.xteaOn   = false
@@ -116,7 +132,13 @@ function Transport:_fail(msg)
     -- stop driving a socket we are never going to read again
     if self._sched then
         if self._pollTimer then self._sched.cancel(self._pollTimer); self._pollTimer = nil end
+        if self._watchTimer then self._sched.cancel(self._watchTimer); self._watchTimer = nil end
         if self.sock then pcall(function() self._sched.removeSocket(self.sock) end) end
+    end
+    -- and close it: unregistering from the reactor alone leaks the fd on every error path.
+    if self.sock then
+        pcall(function() self.sock:close() end)
+        self.sock = nil
     end
     self.onError(msg)
     return nil, msg
@@ -321,8 +343,33 @@ end
 
 -- ================================================================ SOCKET
 
+-- Restore EVERY per-connection field to its post-construction value.  A Transport object may
+-- be reconnected by a supervisor loop after close() or an error, and each of these outlives a
+-- session if it is not reset: `dead` would make the new socket unreadable and unsendable, the
+-- receive accumulator would splice the previous session's half-frame onto the new stream, and
+-- the crypto/zlib latches would decode the new (plaintext) handshake with the old XTEA key.
+-- self.stats.sent/recv/bytesIn/bytesOut stay CUMULATIVE across reconnects on purpose; only
+-- stats.seq is per-connection, because it mirrors the wire sequence counter.
+function Transport:_resetSession()
+    self.dead, self.lastError = false, nil
+    self.rbuf, self.rpos, self.rq, self.rqlen, self.needBody = '', 1, {}, 0, nil
+    self.xteaOn, self.xteaKey = false, nil
+    self.compressionMode, self.zstream = nil, nil
+    self.seq, self.stats.seq = 0, 0     -- m_packetNumber restarts on every login
+    self.lastReadMs, self.connectStartMs = nil, nil
+end
+
 function Transport:connect()
     if self.sock then return nil, 'already connected' end
+    -- The FIRST bytes on the game socket are the world name plus '\n', raw and unframed
+    -- (docs/lua-runtime.md VERIFIER).  An empty world name puts a bare '\n' on the wire and
+    -- desynchronises the login before the 0x1F challenge, so refuse here rather than
+    -- silently substituting ''.  (transport.new stays permissive: offline framing tests
+    -- build Transports they never connect.)
+    if type(self.worldName) ~= 'string' or self.worldName == '' then
+        return nil, 'transport: worldName is required before connect()'
+    end
+    self:_resetSession()
     local socket = SOCKET()
     socket.init()
     local s = socket.tcp()
@@ -333,15 +380,35 @@ function Transport:connect()
     end
     self.sock  = s
     self.state = 'connecting'
-    self.seq   = 0                    -- m_packetNumber restarts on every login
-    self.stats.seq = 0
 
     local sok, sched = pcall(SCHED)
     if sok and sched then
+        self.connectStartMs = self:_nowMs()
         self._pollTimer = sched.every(10, function() self:poll() end)
+        self._watchTimer = sched.every(1000, function() self:checkTimeouts() end)
         self._sched = sched
     end
     return true
+end
+
+function Transport:_nowMs()
+    return NOWMS()
+end
+
+-- Connection::READ_TIMEOUT / WRITE_TIMEOUT (30 s): a black-holed SYN must not leave us in
+-- state 'connecting' forever, and a half-open session after login must surface as an error
+-- rather than as a client that simply stops receiving.
+function Transport:checkTimeouts(now)
+    if self.dead or not self.sock then return end
+    now = now or self:_nowMs()
+    if self.state == 'connecting' and self.connectTimeoutMs and self.connectTimeoutMs > 0
+       and self.connectStartMs and (now - self.connectStartMs) > self.connectTimeoutMs then
+        return self:_fail(('connect timeout (%d ms)'):format(self.connectTimeoutMs))
+    end
+    if self.state == 'connected' and self.readTimeoutMs and self.readTimeoutMs > 0
+       and self.lastReadMs and (now - self.lastReadMs) > self.readTimeoutMs then
+        return self:_fail(('read timeout (%d ms)'):format(self.readTimeoutMs))
+    end
 end
 
 -- Drives connect completion and reads. Safe to call repeatedly; the
@@ -351,6 +418,7 @@ function Transport:poll()
     if self.state == 'connecting' then
         if self.sock:isConnected() then
             self.state = 'connected'
+            self.lastReadMs = self:_nowMs()      -- arm the read watchdog
             if self._sched and self._pollTimer then
                 self._sched.cancel(self._pollTimer)
                 self._pollTimer = nil
@@ -376,6 +444,7 @@ function Transport:pump()
             return self:_fail('recv failed: ' .. tostring(err))
         end
         if data == '' then return true end
+        self.lastReadMs = self:_nowMs()
         local ok, ferr = self:feed(data)
         if not ok then return nil, ferr end
     end
@@ -384,6 +453,7 @@ end
 function Transport:close()
     if self._sched then
         if self._pollTimer then self._sched.cancel(self._pollTimer); self._pollTimer = nil end
+        if self._watchTimer then self._sched.cancel(self._watchTimer); self._watchTimer = nil end
         if self.sock then pcall(function() self._sched.removeSocket(self.sock) end) end
     end
     if self.sock then pcall(function() self.sock:close() end) end

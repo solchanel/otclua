@@ -86,8 +86,11 @@ All little-endian. `R:u64` returns a Lua number when < 2^53 (fine for exp/money)
 ```lua
 xtea.encrypt(key4, str) -> str      -- key4 = {u32,u32,u32,u32}; str length % 8 == 0
 xtea.decrypt(key4, str) -> str
+xtea.newContext(key4) -> ctx        -- ctx:encrypt(str) / ctx:decrypt(str)
+xtea.scheduleBuilds() -> n          -- diagnostics: how many key schedules were ever computed
 adler32.sum(str) -> u32
 ```
+The 32 round constants are memoised per key, so encrypt/decrypt do not rebuild them per packet.
 
 ## lib/bigint.lua + lib/rsa.lua
 ```lua
@@ -135,8 +138,15 @@ comment at the top of both files.**
 Owns socket framing + crypto state. Knows nothing about opcodes.
 ```lua
 local t = transport.new{ host=, port=, worldName=, onMessage=function(readerOrString) end,
-                         onError=function(msg) end, onConnect=function() end }
+                         onError=function(msg) end, onConnect=function() end,
+                         connectTimeoutMs=30000, readTimeoutMs=30000 }
 t:connect()                 -- async; fires onConnect after the raw world-name preamble is written
+                            -- REFUSES (nil,err) without a non-empty worldName: the preamble is
+                            -- the first bytes on the wire.  Resets ALL per-connection state
+                            -- (dead, receive accumulator, XTEA, zlib latch, sequence), so the
+                            -- same object may be reconnected by a supervisor loop.
+t:checkTimeouts()           -- driven by a 1 s sched timer; _fail()s on connect/read timeout
+                            -- (Connection::READ_TIMEOUT == WRITE_TIMEOUT == 30 s)
 t:send(bodyString)          -- applies compression header / padding / xtea / sequence / size
 t:enableXtea(key4)
 t:close()
@@ -180,9 +190,14 @@ without the `on` prefix, lowerCamel: `gameStart`, `login`, `pending`, `talk`, `t
 `awareRangeChange`, `attackCancel`, `distanceEffect`, `magicEffect`, `animatedText`, `staticText`.
 
 ## proto/sender.lua
+Every builder returns the body string on success, or `nil, err` when the transport refused the
+frame (dead transport / failed socket write).  A refused frame is not counted in `sender.sent`,
+and `attack`/`follow` do not advance `m_seq`.
 ```lua
-local s = sender.new(transport)
-s:enterGame() s:ping() s:pingBack() s:logout()
+local s = sender.new(transport [, {accountName=}])
+s:enterGame()               -- emits BOTH gunz frames: 0x0F and 0x32/0x0A/STR hwid.
+                            -- s:enterGame(false) suppresses the fingerprint frame.
+s:ping() s:pingBack() s:logout()
 s:walk(dir) s:turn(dir) s:stop() s:autoWalk(dirs)
 s:talk(mode, channelId, receiver, text) s:talkSpell(text, aimMode, pos)
 s:use(pos, itemId, stackpos, index) s:useWith(fromPos, itemId, fromStack, toPos, toId, toStack)
@@ -194,7 +209,15 @@ s:setFightMode(fight, chase, safe, pvp)
 s:openContainer(pos, itemId, stackpos, containerId) s:closeContainer(id) s:upContainer(id)
 s:equipItem(itemId, tier) s:requestChannels() s:joinChannel(id) s:leaveChannel(id)
 s:answerModalDialog(id, button, choice) s:extendedOpcode(opcode, buffer)
+s:seekInContainer(containerId, index)                  -- 0xCC, pages a container
+s:buyItem(itemId, subType, amount, ignoreCapacity, buyWithBackpack)     -- 0x7A
+s:sellItem(itemId, subType, amount, ignoreEquipped)                     -- 0x7B
+s:closeNpcTrade()                                                       -- 0x7C
+s:requestOutfit()                                                       -- 0xD2
+s:changeOutfit{id=,head=,body=,legs=,feet=,addons=,mount=,hasMount=,familiar=}  -- 0xD3
 ```
+`s:autoWalk(dirs)` returns `body, sentSteps`; when `sentSteps < #dirs` the path was clamped to
+the 127-step wire limit and the caller must re-issue autoWalk for the remainder.
 Positions are `{x=,y=,z=}`. Every builder writes bytes per `docs/opcode-map.md`.
 
 ## game/state.lua
@@ -212,8 +235,17 @@ st.containers    -- [id] = {id, name, capacity, hasPages, firstIndex, size, item
 st.channels      -- [id] = name
 st.world         -- {name, awareRange={left,top,right,bottom}, worldTime}
 st:tile(pos) st:setTile(pos, tile) st:cleanTile(pos) st:getCreature(id) st:walkableAt(pos)
-st:reset()
+st:setCentralPosition(pos)  -- Map::setCentralPosition: records the centre and evicts every
+                            -- tile outside the aware range (GameKeepUnawareTiles is never on).
+                            -- proto/parser.lua calls it from P:setCentral.
+st:isAwareOf(pos [, central]) -> bool     -- Map::isAwareOfPosition, incl. the floor projection
+st:reset()                  -- mutates st.world / st.world.awareRange IN PLACE: proto/parser.lua
+                            -- aliases the awareRange table and must see the reset
 ```
+`st:walkableAt(pos)` second return is one of `'unknown-tile'`, `'no-ground'`, `'creature'`
+(definite false) or `'items-unknown'` (true, item blocking unchecked).
+`st:addThing(...)` returns `nil` when the thing was filtered out **or** when the 11-thing trim
+deleted the very thing it just inserted.
 The map keeps only what the server sends (aware range around the player); `cleanTile` removes.
 
 ## main.lua

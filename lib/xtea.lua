@@ -57,6 +57,25 @@ local function decSchedule(k)
     return C, D
 end
 
+-- Schedules are a pure function of the key, and the key is fixed for a whole session while
+-- encrypt/decrypt run once per packet in each direction.  Memoise them: a weak-VALUED cache
+-- keyed on the normalised key text, so an entry disappears once nothing references it.
+local schedCache = setmetatable({}, { __mode = 'v' })
+local schedBuilds = 0            -- diagnostics only (selftest asserts the memoisation)
+
+local function schedulesFor(k)
+    local ck = k[1] .. ',' .. k[2] .. ',' .. k[3] .. ',' .. k[4]
+    local e = schedCache[ck]
+    if not e then
+        local A, B = encSchedule(k)
+        local C, D = decSchedule(k)
+        e = { A = A, B = B, C = C, D = D }
+        schedCache[ck] = e
+        schedBuilds = schedBuilds + 1
+    end
+    return e
+end
+
 local function checkKey(key)
     if type(key) ~= 'table' then error("xtea: key must be a table of 4 u32", 3) end
     local k = {}
@@ -82,7 +101,8 @@ function M.encrypt(key, s)
     checkData(s, 'plaintext')
     local n = #s
     if n == 0 then return "" end
-    local A, B = encSchedule(k)
+    local sc = schedulesFor(k)
+    local A, B = sc.A, sc.B
     local out, o = {}, 0
     for i = 1, n, 8 do
         local b1, b2, b3, b4, b5, b6, b7, b8 = sbyte(s, i, i + 7)
@@ -106,7 +126,8 @@ function M.decrypt(key, s)
     checkData(s, 'ciphertext')
     local n = #s
     if n == 0 then return "" end
-    local C, D = decSchedule(k)
+    local sc = schedulesFor(k)
+    local C, D = sc.C, sc.D
     local out, o = {}, 0
     for i = 1, n, 8 do
         local b1, b2, b3, b4, b5, b6, b7, b8 = sbyte(s, i, i + 7)
@@ -121,6 +142,24 @@ function M.decrypt(key, s)
                        R % 256, floor(R / 256) % 256, floor(R / 65536) % 256, floor(R / 16777216))
     end
     return concat(out)
+end
+
+-- How many times a key schedule has actually been computed since load.  Used by the selftest
+-- to prove encrypt/decrypt no longer rebuild the 32-entry tables on every packet.
+function M.scheduleBuilds() return schedBuilds end
+
+-- Explicit context form: build the schedules once, then run many packets through them.
+-- ctx:encrypt(s) / ctx:decrypt(s).  M.encrypt/M.decrypt stay the memoised thin wrappers, so
+-- every existing call site keeps working unchanged.
+local Ctx = {}
+Ctx.__index = Ctx
+function Ctx:encrypt(s) return M.encrypt(self.key, s) end
+function Ctx:decrypt(s) return M.decrypt(self.key, s) end
+
+function M.newContext(key)
+    local k = checkKey(key)
+    schedulesFor(k)
+    return setmetatable({ key = k }, Ctx)
 end
 
 M.DELTA = DELTA

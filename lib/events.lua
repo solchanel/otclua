@@ -106,7 +106,15 @@ function Bus:count(name)
     return list and #list or 0
 end
 
+-- clear() must MARK the dropped handles dead, not just forget the lists: emit() walks a
+-- snapshot and skips only handles whose `dead` flag is set, so without this a handler that
+-- calls clear() mid-dispatch would still see the rest of that emit run, and a later
+-- off(handle) on an already-cleared handle would wrongly report "it was live".
 function Bus:clear()
+    for _, list in pairs(self._named) do
+        for i = 1, #list do list[i].dead = true end
+    end
+    for i = 1, #self._any do self._any[i].dead = true end
     self._named = {}
     self._any   = {}
     self.errors = 0

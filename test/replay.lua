@@ -280,9 +280,11 @@ local function buildSyntheticCapture()
 end
 
 -- ===================================================================== main
+-- lib/sys knows TEMP/TMP on Windows and TMPDIR//tmp on POSIX.  The local copy
+-- this replaced only knew the Windows variables, so on Linux it fell back to
+-- '.' and dropped luaclient-replay-selftest.cam/.lcap into the project root.
 local function tempDir()
-    local t = os.getenv('TEMP') or os.getenv('TMP') or '.'
-    return (t:gsub('\\', '/'))
+    return (require('lib.sys').tempDir():gsub('\\', '/'))
 end
 
 local function main(argv)
@@ -293,8 +295,14 @@ local function main(argv)
         return 1
     end
 
+    -- When main.lua dofile()s us for `--replay=FILE`, `arg` still holds MAIN's
+    -- command line (--replay=..., --log-level=..., --assets=...), and the loop
+    -- below rejects every unknown `--` flag -- so `run.bat --replay=FILE` used
+    -- to die with "replay: unknown flag --replay=FILE" without replaying
+    -- anything.  LC.replayTarget IS the handoff; when it is set, ignore argv.
     local files = {}
     local selfMode = false
+    if _G.LC and _G.LC.replayTarget then argv = {} end
     for _, a in ipairs(argv) do
         if a == '--self' then selfMode = true
         elseif a:sub(1, 2) == '--' then
