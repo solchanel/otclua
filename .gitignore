@@ -3,3 +3,5 @@
 *.lcap
 capture-*
 scratch/
+scratch-profile/
+live-*.log

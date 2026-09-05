@@ -154,7 +154,8 @@ label.check input { width: auto; accent-color: var(--accent); cursor: pointer; }
 
 #app { height: 100%; display: flex; flex-direction: column; }
 
-#insecure-banner {
+#banners { flex: 0 0 auto; }
+.banner {
   background: #4a2c07;
   border-bottom: 1px solid #7a4a0c;
   color: #ffd79a;
@@ -163,9 +164,14 @@ label.check input { width: auto; accent-color: var(--accent); cursor: pointer; }
   display: flex;
   gap: 10px;
   align-items: center;
-  flex: 0 0 auto;
 }
-#insecure-banner b { color: #ffcf7a; }
+.banner b { color: #ffcf7a; }
+.banner.mock {
+  background: #1c2f45;
+  border-bottom-color: #2f5580;
+  color: #a9cdf5;
+}
+.banner.mock b { color: #d6e9ff; }
 
 #topbar {
   flex: 0 0 auto;

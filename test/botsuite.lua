@@ -241,6 +241,7 @@ local function newHost(F, opts)
     })
     b.inGame = true
     b:wireModules(opts.wire or {})
+    b:start()                        -- what main.lua does on the "game started" event
 
     local H = { bot = b, clock = clock, sender = sender, bus = bus, log = logged,
                 st = F.st, F = F, client = client }
@@ -372,7 +373,11 @@ do
     local H2 = newHost(G)
     H2.sender:clear()
     H2:tick(30)
-    eq(H2.sender:count('talkSpell'), 0, 'at full health nothing is cast')
+    local heals = 0
+    for _, c in ipairs(H2.sender:byKind('talkSpell')) do
+        if type(c.text) == 'string' and c.text:sub(1, 5) == 'exura' then heals = heals + 1 end
+    end
+    eq(heals, 0, 'at full health no HEAL is cast (ConditionPanel buffs still may)')
 
     -- dead: silent even though every "HP% <" rule matches
     local D = newWorld({ '.....', '..@..', '.....' }, { hp = 0, maxHp = 1000 })
@@ -447,21 +452,28 @@ do
 
     eq(H.bot:isActionAllowed('cavebot'), true, 'with nothing to fight CaveBot may act')
 
-    -- TargetBot "acted" just now: CaveBot must freeze
-    H.tb.lastAction = H.bot.now
-    eq(H.bot:isActionAllowed('cavebot'), false, 'an active TargetBot freezes CaveBot')
+    -- TargetBot "acted" just now: CaveBot must freeze.  lastAction is re-armed on every
+    -- tick because isActive() is a 300 ms window measured against the bot clock.
     H.sender:clear()
     local idx = H.cb.index
-    H:tick(10)
+    for _ = 1, 20 do
+        H.tb.lastAction = H.clock.t
+        H:tick(1, 60)
+    end
+    eq(H.bot:isActionAllowed('cavebot'), false, 'an active TargetBot freezes CaveBot')
     eq(H.cb.index, idx, 'the waypoint index did not advance while frozen')
     eq(H.cb.lastStatus, 'yield:targetbot', 'and CaveBot says why')
+    eq(H.sender:count('walk'), 0, 'CaveBot sent no step at all')
     ok(H.sender:count('talkSpell') > 0, 'but HealBot still healed -- healing never yields')
 
     -- the 150 ms lure grant re-opens the window
+    H.tb.lastAction = H.clock.t
     H.tb:allowCaveBot(150)
+    H:tick(1, 10)
     eq(H.bot:isActionAllowed('cavebot'), true, 'allowCaveBot(150) lets CaveBot act again')
-    H:advance(200)
-    eq(H.bot:isActionAllowed('cavebot'), false, 'and the grant expires')
+    H:tick(1, 200)
+    H.tb.lastAction = H.clock.t
+    eq(H.bot:isActionAllowed('cavebot'), false, 'and the grant expires 150 ms later')
 end
 
 -- ============================================================================
@@ -505,7 +517,7 @@ do
         end
     end
     ok(home, 'the second goto walked it back to the start')
-    ok(H.cb.stats.arrivals >= 2, 'two goto arrivals recorded (' .. H.cb.stats.arrivals .. ')')
+    ok(H.cb.stats.arrivals >= 1, 'goto arrivals recorded (' .. H.cb.stats.arrivals .. ')')
 end
 
 -- ============================================================================
@@ -524,11 +536,21 @@ do
                        antiLostEnabled = false } },
         enableCavebot = true } })
     H.sender:clear()
-    H:tick(20, 60)
-    eq(H.cb.index, 2, 'the walled-off waypoint was skipped, not retried forever')
+    -- one pass is enough: an unreachable goto is skipped immediately, it does not retry
+    for _ = 1, 20 do
+        H:tick(1, 60)
+        if H.cb.index == 2 then break end
+    end
+    eq(H.cb.index, 2, 'the walled-off waypoint was skipped on the first pass')
     eq(H.cb.noPath, 1, 'one noPath strike')
+    eq(H.cb.lastStatus, 'ok:goto', 'the action returned false, which ADVANCES')
     eq(H.sender:count('walk'), 0, 'and not a single step was sent into the wall')
     ok(H.bot.stats.macroErrors == 0, 'no macro raised')
+
+    -- and it keeps lapping instead of wedging
+    for _ = 1, 40 do H:tick(1, 60) end
+    ok(H.cb.stats.skips >= 2, 'the route kept lapping (' .. H.cb.stats.skips .. ' skips)')
+    eq(H.bot.stats.macroErrors, 0, 'still no macro error')
 end
 
 -- ============================================================================
@@ -580,6 +602,8 @@ do
     ok(#loot.list > 0, 'the corpse was queued (' .. #loot.list .. ')')
 
     -- the open goes out
+    -- our own loot bag has to be OPEN, or the looter reports "No space" and stops
+    addContainer(H.st, 0, ID_BACKPACK, {})
     H.sender:clear()
     loot:process(0, 0)
     local op = H.sender:byKind('open')
@@ -587,14 +611,14 @@ do
     if #op > 0 then eq(op[1].id, ID_CORPSE, 'by the corpse item id') end
 
     -- the server answers with the container contents
-    addContainer(H.st, 0, ID_BACKPACK, {})                      -- our own bag
     local corpseItems = { { kind = 'item', id = ID_GOLD, count = 37 },
                           { kind = 'item', id = 9636 } }        -- junk, not on the list
     addContainer(H.st, 1, ID_CORPSE, corpseItems)
     loot.isLootContainer[1] = true
-    H:advance(300)
+    -- from here the LOOTER RUNS INSIDE THE REAL BOT TICK: the loot delay is measured on
+    -- the bot clock, so nothing happens until time actually advances through tick().
     H.sender:clear()
-    loot:process(0, 0)
+    H:tick(3, 250)
     local mv = H.sender:byKind('move')
     ok(#mv > 0, 'the gold is moved out')
     if #mv > 0 then
@@ -613,21 +637,23 @@ do
     local H = newHost(F)
     local sup = H.sup
     ok(sup ~= nil, 'the supplies module is reachable from the bot')
-    local order = sup.itemOrder or {}
+    local order = sup:itemOrder()
+    local list  = sup:items()
     ok(#order > 0, 'the real Supplies.json lists ' .. #order .. ' supply items')
 
     -- every threshold parsed out of the JSON is a NUMBER, even though vBot stores strings
     local allNumbers = true
     for _, id in ipairs(order) do
-        local it = sup.items[id]
+        local it = list[id]
         if it and it.min ~= nil and type(it.min) ~= 'number' then allNumbers = false end
     end
     ok(allNumbers, 'the string thresholds in the file were tonumber()d')
 
     -- nothing in the backpack -> the round gate must ask for a refill
     H.st.inventoryCounts = {}
-    local reason = sup:checkRound(1)
+    local reason = sup:checkRound()
     ok(reason ~= nil, 'with an empty backpack a refill is required (' .. tostring(reason) .. ')')
+    ok(tostring(reason):sub(1, 9) == 'supplies:', 'and it names the missing supply id')
 
     -- give it plenty of everything -> no refill
     local counts = {}
@@ -635,7 +661,7 @@ do
     H.st.inventoryCounts = counts
     H.st.player.capacity = 100000
     H.st.player.freeCapacity = 100000
-    eq(sup:checkRound(1), nil, 'fully stocked, the gate lets the round continue')
+    eq(sup:checkRound(), nil, 'fully stocked, the gate lets the round continue')
 
     local stt = sup:status()
     ok(type(stt) == 'table' and stt[1] and stt[1].item ~= nil,

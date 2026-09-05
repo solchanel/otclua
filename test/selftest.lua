@@ -1446,6 +1446,42 @@ runSuite('fixes: proto.sender', function()
        '0xD3 change outfit follows docs/opcode-map.md 5.3 (19 payload bytes)')
 end)
 
+-- ============================================================ the bot layer
+-- test/botsuite.lua drives the whole bot stack against a synthetic world and, in
+-- turn, embeds the five per-module suites (F1 item metadata, F2 pathfinder+walker,
+-- F3 bot core, M1 healbot+attackbot, M2 cavebot+supplies, M3 targetbot+loot).
+-- It prints its own per-check output; only the totals are folded in here.
+--
+-- It never touches the network and never writes to the user's vBot profile.
+do
+    local sb = suite('bot layer (test/botsuite.lua)')
+    io.write('\n')
+    _G.BOTSUITE_NO_EXIT = true
+    local okr, res = pcall(dofile, ROOT .. '/test/botsuite.lua')
+    _G.BOTSUITE_NO_EXIT = nil
+    if not okr then
+        check(false, 'test/botsuite.lua raised', tostring(res))
+    elseif type(res) ~= 'table' then
+        check(false, 'test/botsuite.lua did not return its counters',
+              'got ' .. type(res) .. ' -- the BOTSUITE_NO_EXIT hook did not fire')
+    else
+        -- fold the counters in wholesale; botsuite already printed every line
+        sb.pass    = sb.pass + (res.pass or 0)
+        totalPass  = totalPass + (res.pass or 0)
+        for _, m in ipairs(res.failures or {}) do
+            sb.fail   = sb.fail + 1
+            totalFail = totalFail + 1
+            sb.msgs[#sb.msgs + 1] = m
+        end
+        -- a failure count without a message must still fail the run
+        local unreported = (res.fail or 0) - #(res.failures or {})
+        if unreported > 0 then
+            sb.fail   = sb.fail + unreported
+            totalFail = totalFail + unreported
+        end
+    end
+end
+
 -- =================================================================== report
 io.write('\n')
 io.write('================ selftest ================\n')
