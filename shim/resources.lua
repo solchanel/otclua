@@ -139,15 +139,28 @@ if isWindows then
         return a ~= INVALID_ATTRS and bit.band(a, ATTR_DIRECTORY) == 0
     end
 
+    -- The FIND_DATA pointer is passed as a `void*` ON PURPOSE.  `cdef` above is a
+    -- pcall, so if ANOTHER module in the same process already declared
+    -- FindFirstFileA with its own struct typedef -- bot/config.lua:567-569 does
+    -- exactly that, with a byte-identical layout under a different name -- our
+    -- declaration is silently dropped and the surviving prototype wants THAT
+    -- struct pointer.  Passing LCRES_FINDDATA* then raises
+    -- "cannot convert 'struct N' to 'struct M *'" and every directory listing
+    -- fails, which means the shim cannot boot at all in a process that also uses
+    -- the native bot layer.  void* converts to any pointer type in the FFI, so
+    -- this call is correct under either declaration.
+    local function findData() return ffi.new('LCRES_FINDDATA') end
+    local function vp(x) return ffi.cast('void*', x) end
+
     function host.list(p)
         local out = {}
-        local fd = ffi.new('LCRES_FINDDATA')
-        local h = ffi.C.FindFirstFileA(p .. '/*', fd)
+        local fd = findData()
+        local h = ffi.C.FindFirstFileA(p .. '/*', vp(fd))
         if h == INVALID_HANDLE then return out end
         repeat
             local name = ffi.string(fd.cFileName)
             if name ~= '.' and name ~= '..' then out[#out + 1] = name end
-        until ffi.C.FindNextFileA(h, fd) == 0
+        until ffi.C.FindNextFileA(h, vp(fd)) == 0
         ffi.C.FindClose(h)
         return out
     end

@@ -449,28 +449,50 @@ function M.new(LC, reg, opts)
     -- combat / targeting
     -- =======================================================================
     -- G1: the client caches the target so `getAttackingCreature()` answers on the NEXT LINE.
+    -- Game::attack (game.cpp:970-991) has three guards, and vBot leans on all three:
+    --   1. `creature == m_localPlayer` -> return, no packet at all;
+    --   2. "cancel when attacking again" -- re-attacking the CURRENT target sets
+    --      creature = nullptr, i.e. it TOGGLES the attack off and sends id 0.  Unguarded
+    --      re-attacks exist at vBot/combo.lua:294,341,347,431 and
+    --      mods/game_bot/panels/attacking.lua:1085,1095;
+    --   3. the follow is cancelled with a real packet (`cancelFollow`), not silently.
     function g.attack(creature)
         if not canAct() then return end
         local s = sender(); if not s then reg:report('g_game.attack', 'no sender'); return end
+        if creature ~= nil and creature == reg:localPlayer() then return end
+        if creature ~= nil and creature.getId and creature:getId() == attackingId
+           and attackingId ~= 0 then
+            creature = nil                                -- cancel when attacking again
+        end
         local id = (creature and creature.getId) and creature:getId() or 0
+        local old = attackingId ~= 0 and reg:creature(attackingId) or nil
+        if id ~= 0 and followingId ~= 0 then g.cancelFollow() end
         local body = s:attack(id)
         if body == nil and id ~= 0 then return end       -- refused: do not fake a target
         attackingId = id
-        if id ~= 0 then followingId = 0 end
         if g.onAttackingCreatureChange then
-            pcall(g.onAttackingCreatureChange, creature, nil)
+            pcall(g.onAttackingCreatureChange, creature, old)
         end
         return body
     end
 
+    -- Game::follow (game.cpp:993-1015) is the mirror image of attack, with the SAME three
+    -- guards -- following yourself is an early return, re-following the current target
+    -- cancels, and the attack is cancelled with a real packet (`cancelAttack()`, which is
+    -- `attack(nullptr)`).  Fixing attack and leaving follow alone would just move the bug.
     function g.follow(creature)
         if not canAct() then return end
         local s = sender(); if not s then return end
+        if creature ~= nil and creature == reg:localPlayer() then return end
+        if creature ~= nil and creature.getId and creature:getId() == followingId
+           and followingId ~= 0 then
+            creature = nil                                -- cancel when following again
+        end
         local id = (creature and creature.getId) and creature:getId() or 0
+        if id ~= 0 and attackingId ~= 0 then g.cancelAttack() end
         local body = s:follow(id)
         if body == nil and id ~= 0 then return end
         followingId = id
-        if id ~= 0 then attackingId = 0 end
         return body
     end
 
@@ -587,7 +609,11 @@ function M.new(LC, reg, opts)
     function g.buyItem(item, amount, ignoreCapacity, buyWithBackpack)
         if not (canAct() and item) then return end
         local s = sender(); if not s then return end
-        return s:buyItem(item:getId(), item:getSubType(), amount or 1,
+        -- Game::buyItem (game.cpp:1390) sends getCountOrSubType(), NOT getSubType():
+        -- for a stackable offer getSubType() is 0 at cv > 862 (item.cpp:107), which puts
+        -- a 0x00 count byte on the wire.  sellItem really does use getSubType()
+        -- (game.cpp:1398) -- the asymmetry is upstream's, not a typo here.
+        return s:buyItem(item:getId(), item:getCountOrSubType(), amount or 1,
                          ignoreCapacity, buyWithBackpack)
     end
 
@@ -680,34 +706,121 @@ function M.new(LC, reg, opts)
     function g.enableFeature(f)  features[f] = true end
     function g.disableFeature(f) features[f] = false end
 
-    -- G3: opcode 0xB7 is not parsed.  An ALL-ZERO struct, never nil (vlib.lua:224 crashes on
-    -- nil), and loud so the deviation is visible rather than assumed correct.
+    -- Opcode 0xB7 (GameServerUnjustifiedStats) IS parsed -- proto/parser.lua writes
+    -- `state.unjustified` verbatim from parseUnjustifiedStats (protocolgameparse.cpp:1322).
+    -- Prefer it; fall back to whatever setUnjustifiedPoints was handed, and only report
+    -- when NEITHER exists (i.e. the server has not sent the packet yet this session).
+    --
+    -- The fallback is NOT zeros.  vBot/vlib.lua:223-227 killsToRs() is the min of the three
+    -- *Remaining fields; 0 is conservative for the AttackBot PvP gate
+    -- (AttackBot.lua:1573,2949,... `killsToRs() > KillsAmount`) but it INVERTS
+    -- vBot/antiRs.lua:21 (`killsToRs() < 6`), which would then latch on for the whole
+    -- session.  255 -- the wire byte's own maximum -- is the only value that is
+    -- conservative in BOTH directions until the packet arrives.
+    local UNJ_UNKNOWN = 255
     function g.getUnjustifiedPoints()
-        reg:report('g_game.getUnjustifiedPoints',
-                   'opcode 0xB7 is not parsed; returning an all-zero struct (gap G3)')
+        local src = st.unjustified
+        if type(src) ~= 'table' then src = unjustified.__set and unjustified or nil end
+        if src == nil then
+            reg:report('g_game.getUnjustifiedPoints',
+                       'opcode 0xB7 has not arrived this session; the three *Remaining '
+                       .. 'fields answer 255 so vlib.killsToRs() stays conservative in '
+                       .. 'BOTH directions (AttackBot gate off, antiRs.lua:21 quiet)')
+            return { killsDay = 0, killsDayRemaining = UNJ_UNKNOWN,
+                     killsWeek = 0, killsWeekRemaining = UNJ_UNKNOWN,
+                     killsMonth = 0, killsMonthRemaining = UNJ_UNKNOWN,
+                     skullTime = 0 }
+        end
         local out = {}
-        for k, v in pairs(unjustified) do out[k] = v end
+        for _, k in ipairs{ 'killsDay', 'killsDayRemaining', 'killsWeek',
+                            'killsWeekRemaining', 'killsMonth', 'killsMonthRemaining',
+                            'skullTime' } do
+            out[k] = tonumber(src[k]) or 0
+        end
         return out
     end
     function g.setUnjustifiedPoints(t)
         if type(t) ~= 'table' then return end
         for k, v in pairs(t) do unjustified[k] = v end
+        unjustified.__set = true
+        st.unjustified = st.unjustified or {}
+        for k, v in pairs(t) do st.unjustified[k] = v end
     end
 
     -- functions/callbacks.lua:8-9 / bot.lua:115 gate the per-thing fan-out on this.
-    function g.enableTileThingLuaCallback(v) tileThingLuaCallback = (v == true) end
+    -- The gate now HAS something behind it (gap G5 closed): shim/object.lua wraps
+    -- state:addThing / state:_removeAt and fans out to reg.onTileThing, which
+    -- shim/callbacks.lua turns into onAddThing / onRemoveThing.  Both sides read the
+    -- same flag, so with the callback off nothing is allocated -- same as game.h:431.
+    function g.enableTileThingLuaCallback(v)
+        tileThingLuaCallback = (v == true)
+        reg.tileThingCallback = tileThingLuaCallback
+    end
     function g.isTileThingLuaCallbackEnabled() return tileThingLuaCallback end
 
-    -- B2: the imbuement family has neither a sender nor a parser on either side.  Loud and
-    -- inert; `cavebot/imbuing.lua` is the only consumer and stays disabled.
-    local IMBUE = { 'applyImbuement', 'clearImbuement', 'closeImbuingWindow',
-                    'selectImbuementItem', 'imbuementDurations' }
-    for i = 1, #IMBUE do
-        local name = IMBUE[i]
-        g[name] = function()
-            reg:report('g_game.' .. name, 'no imbuement sender or parser exists (blocker B2)')
-            return nil
+    -- =======================================================================
+    -- imbuements -- blocker B2 CLOSED.  Senders are proto/sender.lua (0xD5 0xD6 0xD7
+    -- 0xB2 0x60, protocolgamesend.cpp:1735-1775,1887-1893) and the three inbound
+    -- opcodes (0x5D tracker, 0xEB window, 0xEC close) are parsed and emitted by
+    -- proto/parser.lua.  shim/callbacks.lua turns those into the g_game signals the
+    -- user's own profiles/bot/vBot_4.8/cavebot/imbuing.lua connects to:
+    -- onUpdateImbuementTracker, onOpenImbuementWindow, onImbuementItem,
+    -- onImbuementScroll, onCloseImbuementWindow -- plus the game_bot-facing
+    -- onImbuementWindow (bot.lua:566).
+    --
+    -- Every guard is Game::canPerformGameAction, exactly like game.cpp:2063-2108.
+
+    -- Game::applyImbuement (game.cpp:2063)
+    function g.applyImbuement(slot, imbuementId, protectionCharm)
+        if not canAct() then return end
+        local s = sender(); if not s then return end
+        return s:applyImbuement(slot or 0, imbuementId or 0, protectionCharm)
+    end
+
+    -- Game::clearImbuement (game.cpp:2071)
+    function g.clearImbuement(slot)
+        if not canAct() then return end
+        local s = sender(); if not s then return end
+        return s:clearImbuement(slot or 0)
+    end
+
+    -- Game::closeImbuingWindow (game.cpp:2079)
+    function g.closeImbuingWindow()
+        if not canAct() then return end
+        local s = sender(); if not s then return end
+        return s:closeImbuingWindow()
+    end
+
+    -- Game::selectImbuementItem (game.cpp:2087) -- IMBUEMENT_WINDOW_SELECT_ITEM = 1.
+    -- vBot calls it as selectImbuementItem(itemId, pos, stackpos)
+    -- (cavebot/imbuing.lua:752); an Item may be passed instead of the three parts.
+    function g.selectImbuementItem(itemId, pos, stackpos)
+        if not canAct() then return end
+        local s = sender(); if not s then return end
+        if type(itemId) == 'table' and itemId.getId then
+            local it = itemId
+            pos = pos or it:getPosition()
+            stackpos = stackpos or it:getStackPos()
+            itemId = it:getId()
         end
+        if type(pos) ~= 'table' then pos = { x = 0xFFFF, y = 0, z = 0 } end
+        return s:imbuementWindowAction(1, itemId or 0, pos, stackpos or 0)
+    end
+
+    -- Game::selectImbuementScroll (game.cpp:2095) -- IMBUEMENT_WINDOW_SCROLL = 2, and
+    -- the SCROLL branch writes no position at all (protocolgamesend.cpp:1768).
+    function g.selectImbuementScroll()
+        if not canAct() then return end
+        local s = sender(); if not s then return end
+        return s:imbuementWindowAction(2)
+    end
+
+    -- Game::imbuementDurations (game.cpp:2103) -- the tracker subscription.
+    -- imbuing.lua:236-239 toggles it false->true to force a fresh 0x5D push.
+    function g.imbuementDurations(isOpen)
+        if not canAct() then return end
+        local s = sender(); if not s then return end
+        return s:imbuementDurations(isOpen and true or false)
     end
 
     function g.forgeRequest()

@@ -523,13 +523,22 @@ do
     eq(gold:isCreature(), false, 'item isCreature')
     eq(gold:getTier(), 0, 'item getTier')
     eq(gold:getName(), 'gold coin', 'item getName')
-    eq(gold:getServerId(), ID_GOLD, 'item getServerId falls back to the client id (B3)')
+    -- B3 RESOLVED.  Item::m_serverId is only ever assigned at item.cpp:273, which sits
+    -- inside #ifdef FRAMEWORK_EDITOR, and src/CMakeLists.txt:12 defaults
+    -- TOGGLE_FRAMEWORK_EDITOR to OFF -- so the shipped client returns the item.h:193
+    -- initialiser 0 for every item while still binding the method (luafunctions.cpp:853).
+    -- 0 is therefore BOTH the honest headless answer and the C++-exact one; the client id
+    -- was simply wrong.
+    eq(gold:getServerId(), 0, 'item getServerId is 0, like the non-editor C++ build')
     ok(gold:getMarketData() ~= nil, 'getMarketData is never nil')
-    -- thingtype.cpp:340-357 copies m_name into m_market.name ONLY inside `if has_market()`,
-    -- and the gold coin has no market block -- so the REAL client also hands the bot an
-    -- empty string here (proto/items.lua FLAGS5 MARKET, and vBot works around it with a
-    -- hardcoded id at analyzer.lua:401).  Reproduce the client, do not "fix" it.
-    eq(gold:getMarketData().name, '', 'getMarketData().name is empty for a marketless item')
+    -- DECIDED deviation, api-game.md sec.4.4: `.name` falls back to items.name(id).
+    -- thingtype.cpp:340-357 copies m_name into m_market.name only inside `if has_market()`,
+    -- so the live client answers '' for a marketless item; the C++-exact value is kept
+    -- alongside as `.marketName` and only `.name` gets the fallback.
+    eq(gold:getMarketData().name, 'gold coin',
+       'getMarketData().name falls back to items.name(id) for a marketless item')
+    eq(gold:getMarketData().marketName, '',
+       'and .marketName still carries the C++-exact empty string')
     eq(gold:getMarketData().tradeAs, ID_GOLD, 'getMarketData().tradeAs')
     eq(gold:getName(), 'gold coin', 'but getName() still has the raw appearance name')
     eq(H.Item.create(ID_BP):getMarketData().name, 'backpack',
@@ -1177,7 +1186,22 @@ do
     end
     local okk, res = pcall(killsToRs)
     ok(okk, '[vlib.lua:223-227] killsToRs() does not crash on the shim', tostring(res))
-    eq(res, 0, '[vlib.lua:223-227] and returns a number (the all-zero G3 struct)')
+    -- G3 CLOSED.  Before 0xB7 arrives the three *Remaining fields answer 255, not 0:
+    -- 0 is conservative for the AttackBot PvP gate (`killsToRs() > KillsAmount`) but it
+    -- INVERTS vBot/antiRs.lua:21 (`killsToRs() < 6`), which would then latch on for the
+    -- whole session.  255 is the only value that is safe in both directions.
+    eq(res, 255, '[vlib.lua:223-227] answers 255 before opcode 0xB7 has arrived')
+    local u0 = H.g_game.getUnjustifiedPoints()
+    eq(u0.killsDay, 0, 'the progress fields are still 0 before 0xB7')
+    -- ... and the REAL numbers once the parser has seen the packet
+    H.st.unjustified = { killsDay = 12, killsDayRemaining = 3,
+                         killsWeek = 40, killsWeekRemaining = 5,
+                         killsMonth = 60, killsMonthRemaining = 9, skullTime = 0 }
+    local u1 = H.g_game.getUnjustifiedPoints()
+    eq(u1.killsDayRemaining, 3, 'getUnjustifiedPoints reads state.unjustified (0xB7)')
+    eq(u1.killsMonth, 60, 'and every one of the seven fields')
+    eq(killsToRs(), 3, 'killsToRs() is then the real minimum')
+    H.st.unjustified = nil
 
     -- ---------------------------------------------------------------- (4)
     -- VERBATIM: profiles/bot/vBot_4.8/targetbot/looting.lua:284-301
@@ -1316,19 +1340,33 @@ S('H. strict mode')
 do
     local H = newHost({ strict = true })
     addPlayer(H, ORIGIN)
+    -- gap G3 is closed, but only ONCE the server has sent 0xB7; until then the answer is
+    -- still a documented deviation and strict mode still has to say so.
     local okk = pcall(H.g_game.getUnjustifiedPoints)
-    eq(okk, false, 'strict: getUnjustifiedPoints raises (gap G3 is not silently faked)')
+    eq(okk, false, 'strict: getUnjustifiedPoints raises while 0xB7 has not arrived')
+    H.st.unjustified = { killsDay = 1, killsDayRemaining = 2, killsWeek = 3,
+                         killsWeekRemaining = 4, killsMonth = 5, killsMonthRemaining = 6,
+                         skullTime = 7 }
+    local okk1b, u = pcall(H.g_game.getUnjustifiedPoints)
+    ok(okk1b and u and u.killsWeekRemaining == 4,
+       'strict: and it stops reporting once the real numbers are in')
+    H.st.unjustified = nil
     local okk2 = pcall(function() return H.g_map.findItemsById(1) end)
     eq(okk2, false, 'strict: an unimplemented g_map binding raises')
+
+    -- blocker B2 CLOSED: the imbuement family is a real sender now, so it must NOT raise
+    -- even in strict mode -- it must put bytes on the wire.
+    H:clear()
     local okk3 = pcall(function() return H.g_game.applyImbuement(1, 2, true) end)
-    eq(okk3, false, 'strict: the imbuement family raises (blocker B2)')
+    ok(okk3, 'strict: applyImbuement no longer raises (blocker B2 closed)')
+    local apply = H:last()
+    ok(apply ~= nil and apply:byte(1) == 0xD5, 'strict: and it sent a real 0xD5')
 
     -- non-strict: the same calls are inert and callable
     local H2 = newHost()
     addPlayer(H2, ORIGIN)
     ok(type(H2.g_game.getUnjustifiedPoints()) == 'table', 'non-strict: still a table')
     eq(H2.g_map.findItemsById(1), nil, 'non-strict: an unknown binding is callable and inert')
-    eq(H2.g_game.applyImbuement(1, 2, true), nil, 'non-strict: imbuement is inert')
     ok(#H2.logged > 0, 'and every one of them logged a warning')
     H.g_game._shutdown(); H2.g_game._shutdown()
 end
@@ -1368,6 +1406,528 @@ do
     eq(r3.indexed, 0, 'state:reset() clears the floor index')
     eq(next(r3.tiles), nil, 'and every interned wrapper')
     r3:detach()
+end
+
+-- ============================================================================
+-- J. the adversarial-review findings (work item F)
+--    Each block FAILED before the fix named in its comment and passes after it.
+-- ============================================================================
+S('J. review findings: the disappear payload, identity, counts, addresses')
+do
+    local parsermod = require('proto.parser')
+    local cbmod     = require('shim.callbacks')
+
+    -- ---------------------------------------------------------------- J1
+    -- BLOCKER: onCreatureDisappear used to hand vBot a BLANK creature -- or, if
+    -- nothing had wrapped that creature during the session, not to fire at all.
+    -- proto/parser.lua:dropCreature unlinks the record BEFORE emitting, and
+    -- game/state.lua cleared `creature.pos` on the way out, so every getter fell
+    -- back to its C++ default: getName()=='' , getPosition()=={65535,65535,255},
+    -- isMonster()==false.  targetbot/looting.lua:313 (`if not creature:isMonster()
+    -- then return end`) and :322 (`if pos.z ~= mpos.z`) both bail on that, so the
+    -- bot never loots a corpse -- silently, with no error and no log line.
+    local H = newHost()
+    addPlayer(H, ORIGIN)
+    fillGround(H, ORIGIN.x, ORIGIN.y, ORIGIN.z, 4)
+    local ratPos = { x = ORIGIN.x + 2, y = ORIGIN.y, z = ORIGIN.z }
+    addCreature(H, 7001, 'Rotworm', ratPos)
+
+    local seen = {}
+    local cb = { onCreatureDisappear = function(c)
+        seen.n = (seen.n or 0) + 1
+        seen.name = c:getName()
+        seen.pos = c:getPosition()
+        seen.monster = c:isMonster()
+        seen.id = c:getId()
+        seen.outfit = c:getOutfit()
+    end }
+    local handle = cbmod.install(H.LC, cb, { reg = H.reg, g_game = H.g_game })
+    ok(handle ~= nil, 'the callback bridge installed')
+
+    local P = parsermod.new(H.st, function(name, d) H.bus:emit(name, d) end)
+    H.reg:creature(7001)                       -- a spectator scan wrapped it earlier
+    P:dropCreature(7001)
+
+    eq(seen.n, 1, 'J1 onCreatureDisappear fired exactly once')
+    eq(seen.name, 'Rotworm', 'J1 the handler still sees the NAME')
+    eq(seen.monster, true, 'J1 and isMonster() (looting.lua:313 bails otherwise)')
+    eq(seen.id, 7001, 'J1 and the id')
+    ok(seen.pos and seen.pos.x == ratPos.x and seen.pos.y == ratPos.y
+       and seen.pos.z == ratPos.z,
+       'J1 and the POSITION it died on (looting.lua:322 compares its z)',
+       seen.pos and (seen.pos.x .. ',' .. seen.pos.y .. ',' .. seen.pos.z))
+    ok(seen.outfit and seen.outfit.lookType == 3, 'J1 and the outfit')
+    eq(H.g_map.getCreatureById(7001), nil,
+       'J1 while g_map.getCreatureById STILL answers nil for a removed id (C++ exact)')
+    eq(H.st.creatures[7001], nil, 'J1 and the record really is unlinked from state')
+
+    -- the harder half: nothing ever wrapped this creature, so the old code could not
+    -- mint one and dropped the callback entirely
+    local ghostPos = { x = ORIGIN.x - 2, y = ORIGIN.y, z = ORIGIN.z }
+    addCreature(H, 7002, 'Cave Rat', ghostPos)
+    H.reg.creatures[7002] = nil                -- never queried this session
+    seen = {}
+    P:dropCreature(7002)
+    eq(seen.n, 1, 'J1 it fires even when the creature was never wrapped before')
+    eq(seen.name, 'Cave Rat', 'J1 with its name')
+    ok(seen.pos and seen.pos.x == ghostPos.x, 'J1 and its last position')
+
+    -- and the wrapper keeps answering afterwards, like the live client CreaturePtr
+    local dead = H.reg:creatureFromRecord({ id = 7002 })
+    ok(dead ~= nil, 'J1 the wrapper survives the removal')
+    handle:remove()
+
+    -- containerClose gets the same treatment
+    local H2 = newHost()
+    addPlayer(H2, ORIGIN)
+    addContainer(H2, 3, 'loot bag', 20, { { kind = 'item', id = ID_GOLD, count = 5 } })
+    local closed = {}
+    local cb2 = { onContainerClose = function(c)
+        closed.name = c:getName(); closed.items = #c:getItems(); closed.shut = c:isClosed()
+    end }
+    local h2 = cbmod.install(H2.LC, cb2, { reg = H2.reg, g_game = H2.g_game })
+    H2.reg.containers[3] = nil                 -- never queried
+    local rec3 = H2.st:closeContainer(3)
+    H2.bus:emit('containerClose', rec3)
+    eq(closed.name, 'loot bag', 'J1b onContainerClose still knows WHICH bag closed')
+    eq(closed.items, 1, 'J1b and what was in it')
+    eq(closed.shut, true, 'J1b while isClosed() stays a live, honest test')
+    h2:remove()
+
+    -- ---------------------------------------------------------------- J2
+    -- MAJOR: Reg:localPlayer() re-minted the wrapper whenever state.player.id
+    -- changed, so after a relog `spec ~= player` was TRUE for our own character and
+    -- AttackBot (1233,1317,1477,2543,2966,3050) counted us as a hostile spectator.
+    local H3 = newHost()
+    local captured = H3.g_game.getLocalPlayer()          -- executor.lua does this ONCE
+    eq(captured:getId(), 0, 'J2 captured before login, id 0')
+    addPlayer(H3, ORIGIN)
+    fillGround(H3, ORIGIN.x, ORIGIN.y, ORIGIN.z, 3)
+    ok(H3.g_game.getLocalPlayer() == captured, 'J2 the SAME table after login (I1)')
+    eq(captured:getId(), PLAYER_ID, 'J2 re-keyed in place, not re-minted')
+    eq(captured:getName(), 'Testchar', 'J2 and it reads the live player record')
+    local selfSpec
+    for _, sp in ipairs(H3.g_map.getSpectators(ORIGIN, false)) do
+        if sp:getId() == PLAYER_ID then selfSpec = sp end
+    end
+    ok(selfSpec == captured,
+       'J2 the spectator for ourselves IS the captured player (AttackBot spec ~= player)')
+
+    -- a relog: a brand new player id, no shim restart (main.lua:646 early-returns)
+    H3.st.player.id = 0x2000
+    H3.st:addCreature{ id = 0x2000, name = 'Testchar', type = 0, pos = ORIGIN }
+    ok(H3.g_game.getLocalPlayer() == captured, 'J2 still the same table across a RELOG')
+    eq(captured:getId(), 0x2000, 'J2 with the new id')
+    eq(H3.reg.creatures[PLAYER_ID], nil, 'J2 and the stale id was un-keyed')
+    ok(H3.reg:creature(0x2000) == captured, 'J2 reg:creature(newId) is the singleton too')
+
+    -- ---------------------------------------------------------------- J3
+    -- MAJOR: getInventoryCount summed the RAW wire byte, which for a fluid container
+    -- or a splash is the FLUID SUBTYPE, not a count.  localplayer.cpp:565-569
+    -- accumulates Item::getCount() = `isStackable() ? m_countOrSubType : 1`.
+    local H4 = newHost()
+    local me4 = addPlayer(H4, ORIGIN)
+    local ID_VIAL = 2874                       -- fluid container in items1530.bin
+    ok(not items.isStackable(ID_VIAL), 'J3 the vial is not stackable')
+    ok(items.isStackable(ID_GOLD), 'J3 gold is')
+    H4.st.player.inventory = {
+        [5] = { kind = 'item', id = ID_VIAL, count = 7 },   -- subtype 7 (a fluid)
+        [6] = { kind = 'item', id = ID_GOLD, count = 100 },
+    }
+    addContainer(H4, 0, 'bp', 20, { { kind = 'item', id = ID_VIAL, count = 7 },
+                                    { kind = 'item', id = ID_VIAL, count = 3 } })
+    eq(me4:getInventoryCount(ID_VIAL), 3,
+       'J3 three vials count as 3, not 7+7+3=17 (Item::getCount, item.h:96)')
+    eq(me4:getInventoryCount(ID_GOLD), 100, 'J3 while a stackable still sums its count')
+
+    -- ---------------------------------------------------------------- J4
+    -- MAJOR (invariant I3): Reg:item interned on the THING alone and rewrote _loc on
+    -- every later call, so the last caller silently repointed every earlier holder --
+    -- and Item:getPosition()/getStackPos() are where g_game.move gets its fromPos and
+    -- stackpos bytes.  The intern key is now (thing, location).
+    local H5 = newHost()
+    addPlayer(H5, ORIGIN)
+    local bpThing = { kind = 'item', id = ID_BP }
+    H5.st.player.inventory = { [3] = bpThing }               -- worn in the backpack slot
+    H5.st.containers[0] = { id = 0, name = 'bp', capacity = 20, firstIndex = 0,
+                            size = 0, items = {}, hasParent = false, isUnlocked = true,
+                            item = bpThing }                 -- the SAME table, twice over
+    local slotItem = H5.reg:item(bpThing, { kind = 'inventory', slot = 3 })
+    local p1 = slotItem:getPosition()
+    eq(p1.y, 3, 'J4 the equipped wrapper addresses inventory slot 3')
+    local viaContainer = H5.g_game.getContainer(0):getContainerItem()   -- stamps detached
+    ok(viaContainer ~= slotItem, 'J4 two locations no longer share one wrapper')
+    local p2 = slotItem:getPosition()
+    eq(p2.x, p1.x, 'J4 and the equipped wrapper still addresses slot 3 -- x')
+    eq(p2.y, p1.y, 'J4 ... y')
+    eq(p2.z, p1.z, 'J4 ... z')
+    ok(H5.reg:item(bpThing, { kind = 'inventory', slot = 3 }) == slotItem,
+       'J4 identity for the SAME thing at the SAME place is still stable (I1)')
+
+    -- and the wire bytes, decoded off a real g_game.move
+    H5:clear()
+    H5.LC.inGame = true
+    H5.g_game.move(slotItem, { x = 0xFFFF, y = 0x40, z = 3 }, 1)
+    local body = H5:last()
+    ok(body ~= nil and body:byte(1) == 0x78, 'J4 a real 0x78 move went out')
+    eq(body:byte(2) + body:byte(3) * 256, 0xFFFF, 'J4 fromPos.x is the synthetic 0xFFFF')
+    eq(body:byte(4) + body:byte(5) * 256, 3, 'J4 fromPos.y is the inventory slot, not 65535')
+
+    -- ---------------------------------------------------------------- J4b
+    -- MAJOR: the two Game::attack guards (game.cpp:970-991) and their mirror image in
+    -- Game::follow (game.cpp:993-1015).  vBot/combo.lua:294,341,347,431 and
+    -- mods/game_bot/panels/attacking.lua:1085,1095 all call g_game.attack(x) with no
+    -- `getAttackingCreature() ~= creature` guard of their own.
+    local Hf = newHost()
+    addPlayer(Hf, ORIGIN)
+    fillGround(Hf, ORIGIN.x, ORIGIN.y, ORIGIN.z, 3)
+    local mob = addCreature(Hf, 8100, 'Rotworm', { x = ORIGIN.x + 1, y = ORIGIN.y, z = ORIGIN.z })
+    Hf.g_game.attack(mob)
+    ok(Hf.g_game.getAttackingCreature() == mob, 'J4b the first attack sets the target')
+    Hf:clear()
+    Hf.g_game.attack(mob)
+    eq(Hf.g_game.getAttackingCreature(), nil,
+       'J4b attacking the SAME creature again CANCELS (game.cpp:974-977)')
+    local cancel = Hf:last()
+    ok(cancel ~= nil and cancel:byte(1) == 0xA1, 'J4b and the cancel is a real 0xA1')
+    eq(cancel:byte(2) + cancel:byte(3) * 256 + cancel:byte(4) * 65536
+       + cancel:byte(5) * 16777216, 0, 'J4b carrying creature id 0')
+    Hf.g_game.attack(mob)
+    ok(Hf.g_game.getAttackingCreature() == mob, 'J4b and a third call re-attacks')
+
+    local n = Hf:count()
+    Hf.g_game.attack(Hf.g_game.getLocalPlayer())
+    eq(Hf:count(), n, 'J4b attack(localPlayer) puts NOTHING on the wire (game.cpp:971)')
+    ok(Hf.g_game.getAttackingCreature() == mob, 'J4b and leaves the target alone')
+
+    -- following while attacking sends a REAL cancel, not a silent local clear
+    Hf:clear()
+    Hf.g_game.follow(mob)
+    eq(Hf:count(), 2, 'J4b follow while attacking sends TWO packets')
+    eq(Hf.sent[#Hf.sent - 1]:byte(1), 0xA1, 'J4b the cancelAttack 0xA1 first (game.cpp:1002)')
+    eq(Hf:last():byte(1), 0xA2, 'J4b then the 0xA2 follow')
+    eq(Hf.g_game.getAttackingCreature(), nil, 'J4b and the attack really is cancelled')
+    Hf.g_game.follow(mob)
+    eq(Hf.g_game.getFollowingCreature(), nil,
+       'J4b following the same creature again cancels too (game.cpp:999-1000)')
+    local m = Hf:count()
+    Hf.g_game.follow(Hf.g_game.getLocalPlayer())
+    eq(Hf:count(), m, 'J4b and follow(localPlayer) is an early return')
+
+    -- ---------------------------------------------------------------- J5
+    -- MINOR: buyItem sent getSubType() where Game::buyItem (game.cpp:1390) sends
+    -- getCountOrSubType(), so every stackable trade offer carried a 0x00 count byte.
+    local H6 = newHost()
+    addPlayer(H6, ORIGIN)
+    local gold100 = H6.Item.create(ID_GOLD, 100)
+    H6:clear()
+    H6.g_game.buyItem(gold100, 1, false, false)
+    local buy = H6:last()
+    ok(buy ~= nil and buy:byte(1) == 0x7A, 'J5 a real 0x7A buyItem went out')
+    eq(buy:byte(4), 100, 'J5 byte 4 is getCountOrSubType() = 100, not getSubType() = 0')
+    H6:clear()
+    H6.g_game.sellItem(gold100, 1, false)
+    local sell = H6:last()
+    ok(sell ~= nil and sell:byte(1) == 0x7B, 'J5 a real 0x7B sellItem went out')
+    eq(sell:byte(4), 0, 'J5 and sellItem still sends getSubType() = 0 (game.cpp:1398)')
+end
+
+-- ============================================================================
+-- K. the closed gaps (work item F): onAddThing/onRemoveThing, 0xB7, 0x96 EditText,
+--    a separated turn, and the whole imbuement family -- senders AND parsers.
+--    Every assertion here failed before the change that its comment names.
+-- ============================================================================
+S('K. closed gaps: tile things, 0xB7, edit text, turn, imbuements')
+do
+    local parsermod = require('proto.parser')
+    local cbmod     = require('shim.callbacks')
+    local buffer    = require('lib.buffer')
+
+    --- Feed a raw server packet body (opcode byte first) through the REAL parser.
+    local function feed(H, P, body)
+        local R = buffer.reader(body)
+        local opcode = R:u8()
+        local h = parsermod.handlers[opcode]
+        ok(h ~= nil, 'K parser has a handler for opcode ' .. ('0x%02X'):format(opcode))
+        if h then h(P, R) end
+        return R
+    end
+
+    -- ---------------------------------------------------------------- K1
+    -- gap G5: onAddThing / onRemoveThing.  state:addThing and state:_removeAt now carry
+    -- a hook, GATED on the same flag as tile.cpp:374-376 / 420-422.
+    local H = newHost()
+    addPlayer(H, ORIGIN)
+    fillGround(H, ORIGIN.x, ORIGIN.y, ORIGIN.z, 3)
+    local added, removed = {}, {}
+    local cb = {
+        onAddThing    = function(tile, thing) added[#added + 1] = { tile, thing } end,
+        onRemoveThing = function(tile, thing) removed[#removed + 1] = { tile, thing } end,
+    }
+    local h = cbmod.install(H.LC, cb, { reg = H.reg, g_game = H.g_game })
+
+    local dropPos = { x = ORIGIN.x + 1, y = ORIGIN.y, z = ORIGIN.z }
+    eq(H.g_game.isTileThingLuaCallbackEnabled(), false, 'K1 the gate starts OFF (game.h:431)')
+    H.st:addThing(dropPos, -1, { kind = 'item', id = ID_GOLD, count = 7 })
+    eq(#added, 0, 'K1 and with the gate off nothing fires -- it costs one boolean')
+
+    H.g_game.enableTileThingLuaCallback(true)
+    eq(H.g_game.isTileThingLuaCallbackEnabled(), true, 'K1 the gate reads back on')
+    local corpse = { kind = 'item', id = ID_CORPSE }
+    local sp = H.st:addThing(dropPos, -1, corpse)
+    eq(#added, 1, 'K1 onAddThing fired once for the corpse')
+    ok(added[1][1] == H.g_map.getTile(dropPos),
+       'K1 with the INTERNED Tile wrapper (connect(Tile,...) prepends the receiver)')
+    eq(added[1][2]:getId(), ID_CORPSE, 'K1 and an Item wrapper for the thing')
+    local addedPos = added[1][2]:getPosition()
+    eq(addedPos.x, dropPos.x, 'K1 addressed at the tile it landed on')
+    eq(added[1][2]:getStackPos(), sp, 'K1 with the stack index state:addThing returned')
+
+    H.st:removeThing(dropPos, sp)
+    eq(#removed, 1, 'K1 onRemoveThing fired once')
+    eq(removed[1][2]:getId(), ID_CORPSE, 'K1 and carries the thing that LEFT')
+
+    -- a creature thing becomes a Creature wrapper, not an Item
+    addCreature(H, 9001, 'Rat', dropPos)
+    eq(#added, 2, 'K1 a creature landing on a tile fires onAddThing too')
+    eq(added[2][2]:getName(), 'Rat', 'K1 as a Creature wrapper')
+    ok(added[2][2]:isCreature(), 'K1 ... which knows it is one')
+
+    H.g_game.enableTileThingLuaCallback(false)
+    local before = #added
+    H.st:addThing(dropPos, -1, { kind = 'item', id = ID_GOLD, count = 1 })
+    eq(#added, before, 'K1 turning the gate off again silences it')
+    h:remove()
+    H.g_game.enableTileThingLuaCallback(true)
+    H.st:addThing(dropPos, -1, { kind = 'item', id = ID_GOLD, count = 1 })
+    eq(#added, before, 'K1 and handle:remove() unhooks reg.onTileThing')
+
+    -- ------------------------------------------------------------- K1b
+    -- The same "the removal event has to carry what LEFT" rule as the blocker, applied to
+    -- the other two removal paths: Container::onRemoveItem(container, slot, item) and
+    -- LocalPlayer::onInventoryChange(slot, item, oldItem) (localplayer.cpp:523).
+    local Hr = newHost()
+    addPlayer(Hr, ORIGIN)
+    local gone, unequipped = {}, {}
+    local cbr = {
+        onRemoveItem = function(c, slot, item) gone[#gone + 1] = item end,
+        onInventoryChange = function(p, slot, item, old)
+            unequipped[#unequipped + 1] = { slot = slot, item = item, old = old }
+        end,
+    }
+    local hr = cbmod.install(Hr.LC, cbr, { reg = Hr.reg, g_game = Hr.g_game })
+    Hr.st.containers[4] = { id = 4, name = 'bag', capacity = 8, firstIndex = 0, size = 2,
+                            items = { { kind = 'item', id = ID_GOLD, count = 9 },
+                                      { kind = 'item', id = ID_BP } },
+                            hasParent = false, isUnlocked = true }
+    local Pr = parsermod.new(Hr.st, function(n, d) Hr.bus:emit(n, d) end)
+    Pr.emit('containerRemoveItem', { containerId = 4, slot = 0,
+                                     item = table.remove(Hr.st.containers[4].items, 1) })
+    ok(gone[1] ~= nil, 'K1b onRemoveItem carries the item that LEFT')
+    eq(gone[1] and gone[1]:getId(), ID_GOLD, 'K1b by id')
+    Hr.st.player.inventory[3] = { kind = 'item', id = ID_BP }
+    Pr.emit('inventoryChange', { slot = 3, item = nil,
+                                 oldItem = Hr.st.player.inventory[3] })
+    ok(unequipped[1] and unequipped[1].old ~= nil,
+       'K1b onInventoryChange carries oldItem (localplayer.cpp:523)')
+    eq(unequipped[1] and unequipped[1].old and unequipped[1].old:getId(), ID_BP,
+       'K1b the item that was unequipped')
+    eq(unequipped[1] and unequipped[1].item, nil, 'K1b and nil for the new one')
+    hr:remove()
+
+    -- ---------------------------------------------------------------- K2
+    -- gap G3: opcode 0xB7 UnjustifiedStats really parsed, off a real packet.
+    local H2 = newHost()
+    addPlayer(H2, ORIGIN)
+    local got
+    local cb2 = {}
+    local h2 = cbmod.install(H2.LC, cb2, { reg = H2.reg, g_game = H2.g_game })
+    H2.bus:on('unjustifiedPoints', function(u) got = u end)
+    local P2 = parsermod.new(H2.st, function(n, d) H2.bus:emit(n, d) end)
+    feed(H2, P2, string.char(0xB7, 12, 3, 40, 5, 60, 9, 77))
+    ok(got ~= nil, 'K2 the parser emits unjustifiedPoints for 0xB7')
+    eq(got.killsDay, 12, 'K2 killsDay')
+    eq(got.killsDayRemaining, 3, 'K2 killsDayRemaining')
+    eq(got.killsWeek, 40, 'K2 killsWeek')
+    eq(got.killsWeekRemaining, 5, 'K2 killsWeekRemaining')
+    eq(got.killsMonth, 60, 'K2 killsMonth')
+    eq(got.killsMonthRemaining, 9, 'K2 killsMonthRemaining')
+    eq(got.skullTime, 77, 'K2 skullTime')
+    local u = H2.g_game.getUnjustifiedPoints()
+    eq(u.killsWeekRemaining, 5, 'K2 and g_game.getUnjustifiedPoints answers the real bytes')
+    eq(math.min(u.killsDayRemaining, u.killsWeekRemaining, u.killsMonthRemaining), 3,
+       'K2 so vlib.lua:223-227 killsToRs() is 3, not a placeholder')
+    h2:remove()
+
+    -- ---------------------------------------------------------------- K3
+    -- onGameEditText: opcode 0x96 EditText was consumed and discarded.
+    local H3 = newHost()
+    addPlayer(H3, ORIGIN)
+    local edit
+    local cb3 = { onGameEditText = function(id, itemId, maxLength, text, writer, date)
+        edit = { id = id, itemId = itemId, maxLength = maxLength, text = text,
+                 writer = writer, date = date }
+    end }
+    local h3 = cbmod.install(H3.LC, cb3, { reg = H3.reg, g_game = H3.g_game })
+    local P3 = parsermod.new(H3.st, function(n, d) H3.bus:emit(n, d) end)
+    -- u32 windowId, [item], u16 maxLength, string text, string writer, u8 suffix
+    local w = buffer.writer()
+    w:u8(0x96); w:u32(4242); w:u16(ID_GOLD); w:u8(1)      -- a stackable item: count byte
+    -- GameWritableDate is on at 1530, so the date string is part of the packet
+    w:u16(128); w:string('a note'); w:string('Testchar'); w:u8(0); w:string('06/09/2026')
+    feed(H3, P3, w:data())
+    ok(edit ~= nil, 'K3 onGameEditText fires (was: no parser for 0x96)')
+    eq(edit and edit.id, 4242, 'K3 the window id')
+    eq(edit and edit.itemId, ID_GOLD, 'K3 the item id')
+    eq(edit and edit.maxLength, 128, 'K3 the max length')
+    eq(edit and edit.text, 'a note', 'K3 the text')
+    eq(edit and edit.writer, 'Testchar', 'K3 the writer')
+    eq(edit and edit.date, '06/09/2026', 'K3 and the GameWritableDate string')
+    h3:remove()
+
+    -- ---------------------------------------------------------------- K4
+    -- onTurn: the dedicated turn packet shape (Proto::Creature, "this is send creature
+    -- turn", protocolgameparse.cpp:4483-4494) is separated out instead of being folded
+    -- into a move.  It reports a DIRECTION change and no position change.
+    local H4 = newHost()
+    addPlayer(H4, ORIGIN)
+    fillGround(H4, ORIGIN.x, ORIGIN.y, ORIGIN.z, 3)
+    local turnPos = { x = ORIGIN.x + 1, y = ORIGIN.y, z = ORIGIN.z }
+    addCreature(H4, 9100, 'Rat', turnPos)
+    local turns, moves = {}, {}
+    local cb4 = {
+        onTurn = function(c, dir) turns[#turns + 1] = { c, dir } end,
+        onWalk = function(c, from, to) moves[#moves + 1] = c end,
+    }
+    local h4 = cbmod.install(H4.LC, cb4, { reg = H4.reg, g_game = H4.g_game })
+    local P4 = parsermod.new(H4.st, function(n, d) H4.bus:emit(n, d) end)
+    -- readCreature ty == 99 (Proto::Creature): u32 id, u8 direction, u8 unpass
+    P4:applyCreature({ id = 9100, direction = 3, unpass = 0, turnOnly = true })
+    eq(#turns, 1, 'K4 onTurn fires for a turn-only creature update')
+    eq(turns[1][2], 3, 'K4 with the new direction')
+    eq(turns[1][1]:getName(), 'Rat', 'K4 and the creature')
+    eq(turns[1][1]:getDirection(), 3, 'K4 which now reports it')
+    eq(#moves, 0, 'K4 and a turn is NOT reported as a walk')
+    h4:remove()
+
+    -- ---------------------------------------------------------------- K5
+    -- blocker B2: the imbuement family.  Senders first -- byte-exact against
+    -- protocolgamesend.cpp:1735-1775 and 1887-1893.
+    local H5 = newHost()
+    addPlayer(H5, ORIGIN)
+    H5:clear()
+    H5.g_game.applyImbuement(2, 0x1234, true)
+    local b = H5:last()
+    eq(b:byte(1), 0xD5, 'K5 applyImbuement is 0xD5')
+    eq(b:byte(2), 2, 'K5 u8 slot')
+    eq(b:byte(3) + b:byte(4) * 256 + b:byte(5) * 65536 + b:byte(6) * 16777216, 0x1234,
+       'K5 u32 imbuementId')
+    eq(#b, 6, 'K5 and NO protection byte at cv 1530 (that is a cv < 1510 field)')
+
+    H5:clear(); H5.g_game.clearImbuement(3)
+    b = H5:last()
+    eq(b:byte(1), 0xD6, 'K5 clearImbuement is 0xD6'); eq(b:byte(2), 3, 'K5 u8 slot')
+    eq(#b, 2, 'K5 two bytes exactly')
+
+    H5:clear(); H5.g_game.closeImbuingWindow()
+    b = H5:last()
+    eq(b:byte(1), 0xD7, 'K5 closeImbuingWindow is 0xD7'); eq(#b, 1, 'K5 and empty')
+
+    H5:clear(); H5.g_game.imbuementDurations(true)
+    b = H5:last()
+    eq(b:byte(1), 0x60, 'K5 imbuementDurations is 0x60'); eq(b:byte(2), 1, 'K5 isOpen = 1')
+    H5:clear(); H5.g_game.imbuementDurations(false)
+    eq(H5:last():byte(2), 0, 'K5 and 0 for the off toggle imbuing.lua:237 sends first')
+
+    H5:clear(); H5.g_game.selectImbuementItem(ID_GOLD, { x = 0xFFFF, y = 3, z = 0 }, 0)
+    b = H5:last()
+    eq(b:byte(1), 0xB2, 'K5 selectImbuementItem is 0xB2 ImbuementWindowAction')
+    eq(b:byte(2), 1, 'K5 with type 1 = IMBUEMENT_WINDOW_SELECT_ITEM (const.h:993)')
+    eq(b:byte(3) + b:byte(4) * 256, 0xFFFF, 'K5 then the position')
+    eq(b:byte(8) + b:byte(9) * 256, ID_GOLD, 'K5 then the item id')
+    eq(#b, 10, 'K5 opcode + type + pos(5) + id(2) + stackpos(1)')
+
+    H5:clear(); H5.g_game.selectImbuementScroll()
+    b = H5:last()
+    eq(b:byte(1), 0xB2, 'K5 selectImbuementScroll is 0xB2 too')
+    eq(b:byte(2), 2, 'K5 with type 2 = SCROLL')
+    eq(#b, 2, 'K5 and the SCROLL branch writes NO position (protocolgamesend.cpp:1768)')
+
+    -- ---------------------------------------------------------------- K6
+    -- ... and the parsers, driven into the user's own signal names.
+    local H6 = newHost()
+    addPlayer(H6, ORIGIN)
+    local tracker, window, closed
+    H6.g_game.onUpdateImbuementTracker = function(list) tracker = list end
+    H6.g_game.onImbuementItem = function(itemId, tier, slots, active, imbus, needed)
+        window = { itemId = itemId, tier = tier, slots = slots, active = active,
+                   imbuements = imbus, needed = needed }
+    end
+    H6.g_game.onCloseImbuementWindow = function() closed = true end
+    local h6 = cbmod.install(H6.LC, {}, { reg = H6.reg, g_game = H6.g_game,
+                                          signalcall = function(slot, ...)
+                                              if type(slot) == 'function' then return slot(...) end
+                                          end })
+    local P6 = parsermod.new(H6.st, function(n, d) H6.bus:emit(n, d) end)
+
+    -- 0x5D: u8 count, then per item: u8 slot, [item], u8 slots, per slot u8 imbued
+    --       and when imbued: string name, u16 icon, u32 duration, u8 state
+    local w6 = buffer.writer()
+    w6:u8(0x5D); w6:u8(1)
+    w6:u8(5); w6:u16(ID_BP); w6:u8(0)            -- slot 5, a backpack: id + containerType
+    w6:u8(2)                                     -- two imbuing slots
+    w6:u8(1); w6:string('Vampirism'); w6:u16(101); w6:u32(180000); w6:u8(1)
+    w6:u8(0)                                     -- slot 1 empty
+    feed(H6, P6, w6:data())
+    ok(tracker ~= nil, 'K6 onUpdateImbuementTracker fires for 0x5D (was discarded)')
+    eq(tracker and #tracker, 1, 'K6 one tracked item')
+    eq(tracker and tracker[1].slot, 5, 'K6 the equipment slot')
+    eq(tracker and tracker[1].totalSlots, 2, 'K6 the total imbuing slots')
+    ok(tracker and tracker[1].item and tracker[1].item:getId() == ID_BP,
+       'K6 entry.item is a real Item wrapper (imbuing.lua:155 calls it:getId())')
+    eq(tracker and tracker[1].slots[0] and tracker[1].slots[0].name, 'Vampirism',
+       'K6 the imbuement name')
+    eq(tracker and tracker[1].slots[0] and tracker[1].slots[0].duration, 180000,
+       'K6 and its remaining duration')
+    eq(tracker and tracker[1].slots[1], nil, 'K6 while an empty slot is absent')
+
+    -- 0xEB windowType 1 (SELECT_ITEM), modern layout: u8 type, u8 unknown, u16 itemId,
+    -- [u8 tier iff classified], u8 slots, per slot u8 flag + imbuement + u32 + u32,
+    -- u16 imbuementCount + imbuements, u32 neededCount + (u16 id, u16 count)*
+    local function writeImbuement(ww, id, name)
+        ww:u32(id); ww:string(name); ww:string('desc')
+        ww:u8(0)                                  -- tier (cv >= 1510)
+        ww:u16(555)                               -- iconId
+        ww:u32(180000)                            -- duration
+        ww:u8(1); ww:u16(ID_GOLD); ww:string('gold coin'); ww:u16(3)   -- 1 source
+        ww:u32(25000)                             -- cost
+    end
+    local w7 = buffer.writer()
+    w7:u8(0xEB); w7:u8(1); w7:u8(0); w7:u16(ID_BP)
+    w7:u8(1)                                      -- one imbuing slot
+    w7:u8(0x01); writeImbuement(w7, 7, 'Vampirism'); w7:u32(120000); w7:u32(5000)
+    w7:u16(1); writeImbuement(w7, 8, 'Swiftness')
+    w7:u32(1); w7:u16(ID_GOLD); w7:u16(100)
+    feed(H6, P6, w7:data())
+    ok(window ~= nil, 'K6 onImbuementItem fires for 0xEB SELECT_ITEM')
+    eq(window and window.itemId, ID_BP, 'K6 the item the shrine is showing')
+    eq(window and window.slots, 1, 'K6 the slot count')
+    ok(window and window.active[0], 'K6 activeSlots is 0-based, like the C++ map')
+    eq(window and window.active[0] and window.active[0][1].name, 'Vampirism',
+       'K6 activeSlots[i][1] is the Imbuement (imbuing.lua:194 reads tup[1])')
+    eq(window and window.active[0] and window.active[0][2], 120000,
+       'K6 activeSlots[i][2] is the duration (imbuing.lua:199 reads tup[2])')
+    eq(window and window.active[0] and window.active[0][1].group, 'Basic',
+       'K6 with the tier name the C++ derives at cv >= 1510')
+    eq(window and #window.imbuements, 1, 'K6 the offered list')
+    eq(window and window.imbuements[1].name, 'Swiftness', 'K6 by name')
+    eq(window and window.imbuements[1].id, 8, 'K6 and id (imbuing.lua:207)')
+    eq(window and #window.needed, 1, 'K6 the needed-items list')
+    ok(window and window.needed[1]:getId() == ID_GOLD, 'K6 as Item wrappers')
+
+    feed(H6, P6, string.char(0xEC))
+    eq(closed, true, 'K6 onCloseImbuementWindow fires for 0xEC')
+    h6:remove()
 end
 
 -- ============================================================================

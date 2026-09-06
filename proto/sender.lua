@@ -73,6 +73,12 @@ local OP = {
     SellItem              = 0x7B,
     CloseNpcTrade         = 0x7C,
     AnswerModalDialog     = 0xF9,
+    -- imbuements (protocolcodes.h:285,358,375-377)
+    ImbuementDurations    = 0x60,
+    ImbuementWindowAction = 0xB2,
+    ApplyImbuement        = 0xD5,
+    ClearImbuement        = 0xD6,
+    CloseImbuingWindow    = 0xD7,
 }
 sender.OPCODES = OP
 
@@ -625,6 +631,51 @@ function sender:answerModalDialog(id, button, choice)
     w:u32(id)
     w:u8(button)
     w:u8(choice)
+    return self:_send(w)
+end
+
+-- ---------------------------------------------------------------------------
+-- imbuements  (protocolgamesend.cpp:1735-1775, 1887-1893)
+-- ---------------------------------------------------------------------------
+-- 0xD5: u8 slot, u32 imbuementId   (the protectionCharm byte is cv < 1510 only, so it
+-- is NOT written at 1530 -- sendApplyImbuement, protocolgamesend.cpp:1741-1743)
+function sender:applyImbuement(slot, imbuementId, protectionCharm)
+    local w = op(self, OP.ApplyImbuement)
+    w:u8(u8arg(slot))
+    w:u32(math.floor(imbuementId or 0))
+    if (self.clientVersion or 1530) < 1510 then w:u8(boolByte(protectionCharm)) end
+    return self:_send(w)
+end
+
+-- 0xD6: u8 slot
+function sender:clearImbuement(slot)
+    local w = op(self, OP.ClearImbuement)
+    w:u8(u8arg(slot))
+    return self:_send(w)
+end
+
+-- 0xD7, empty
+function sender:closeImbuingWindow()
+    return self:_send(op(self, OP.CloseImbuingWindow))
+end
+
+-- 0xB2: u8 type; when type == 1 (SELECT_ITEM) also Position(5), u16 itemId, u8 stackpos.
+-- Otc::IMBUEMENT_WINDOW_CHOICE = 0, SELECT_ITEM = 1, SCROLL = 2 (const.h:992-994).
+function sender:imbuementWindowAction(actionType, itemId, pos, stackpos)
+    local w = op(self, OP.ImbuementWindowAction)
+    w:u8(u8arg(actionType))
+    if actionType == 1 then
+        writePos(w, pos)
+        w:u16(math.floor(itemId or 0))
+        w:u8(u8arg(stackpos))
+    end
+    return self:_send(w)
+end
+
+-- 0x60: u8 isOpen  (the imbuement-tracker subscription)
+function sender:imbuementDurations(isOpen)
+    local w = op(self, OP.ImbuementDurations)
+    w:u8(boolByte(isOpen))
     return self:_send(w)
 end
 

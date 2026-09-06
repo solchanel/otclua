@@ -262,7 +262,14 @@ function Tile:getHouseId()  return 0 end
 function Tile:getTimer()    return 0 end
 function Tile:isClickable() return true end
 
-local INERT = { 'setText', 'setFill', 'select', 'unselect', 'overwriteMinimapColor',
+-- Tile::setText / getText (luafunctions.cpp:1088-1089).  Stateful for the same
+-- reason Creature's pair is: `vBot/extras.lua:535-540` walks every tile on the
+-- floor, reads `tile:getText()` and clears the ones holding "HOLD".  A missing
+-- getText raised there; an inert setText would make the clear a silent lie.
+function Tile:setText(t) rawset(self, '_text', t == nil and '' or tostring(t)) end
+function Tile:getText()  return rawget(self, '_text') or '' end
+
+local INERT = { 'setFill', 'select', 'unselect', 'overwriteMinimapColor',
                 'setTimer', 'setHouseId', 'clearTexts', 'remFlag', 'setFlag' }
 for i = 1, #INERT do Tile[INERT[i]] = function() return nil end end
 

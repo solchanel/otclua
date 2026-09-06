@@ -56,6 +56,18 @@ SUPPORTED DIALECT (ECMAScript subset -- every construct vBot 4.8 actually uses)
                              are multi-byte in UTF-8 and cannot be excluded by a
                              byte-oriented std::regex either, so this matches the C++.
   word boundaries        \b \B
+  POSIX classes          alpha digit alnum upper lower space blank punct print graph
+                         cntrl xdigit, plus the one-letter w s d, written the POSIX way
+                         INSIDE a class -- an opening bracket, then :name: , then a
+                         closing bracket, all inside the outer class brackets (spelled
+                         out rather than shown, because the literal form would close this
+                         long comment).  The negated :^name: form works too.  std::regex
+                         accepts all of them inside a character class even under the
+                         ECMAScript grammar (re.grammar extends ClassAtom with the
+                         class-name production), so a user-supplied targetbot/analyzer
+                         regex that uses one really does match in the live client.  An
+                         UNKNOWN name is reported like any other unsupported pattern
+                         instead of silently never matching.
   quantifiers            * + ? {n} {n,} {n,m}, each with a lazy `?` suffix
   Annex-B leniency       a lone `{` that does not start a valid quantifier is a literal
 
@@ -66,7 +78,7 @@ NOT SUPPORTED -- and deliberately loud (see R6)
   named groups   (?<name>...)
   flags/modifiers (?i) (?m) ...
   unicode property escapes \p{...}
-  POSIX classes  [:alpha:]
+  a BARE :alpha: in single brackets -- not a POSIX class in any dialect
   None of these appears in any of the 44 live call sites (docs/shim/api-platform.md
   section 4.7 enumerates the dialect actually exercised: "No lookaround, no
   backreferences").  If one ever does, `regex.match` still returns {} exactly like
@@ -168,6 +180,33 @@ function Parser:accept(c)
     return false
 end
 
+-- POSIX bracket expressions -- [[:alpha:]], [[:digit:]], ... .  std::regex accepts these
+-- INSIDE a character class even with the ECMAScript grammar ([re.grammar] extends
+-- ClassAtom with the character-class-name production), so a vBot targetbot / analyzer
+-- config that uses one really does match in the live client.  The shim used to parse
+-- [[:alpha:]] as the class [[:alph plus a stray literal ] and then quietly never match;
+-- these are the standard names, byte-oriented like everything else in this file.
+local POSIX_CLASSES = {
+    alpha  = function(b) return (b >= 65 and b <= 90) or (b >= 97 and b <= 122) end,
+    digit  = isDigit,
+    alnum  = function(b) return (b >= 48 and b <= 57) or (b >= 65 and b <= 90)
+                                or (b >= 97 and b <= 122) end,
+    upper  = function(b) return b >= 65 and b <= 90 end,
+    lower  = function(b) return b >= 97 and b <= 122 end,
+    space  = isSpace,
+    blank  = function(b) return b == 32 or b == 9 end,
+    punct  = function(b) return (b >= 33 and b <= 47) or (b >= 58 and b <= 64)
+                                or (b >= 91 and b <= 96) or (b >= 123 and b <= 126) end,
+    print  = function(b) return b >= 32 and b <= 126 end,
+    graph  = function(b) return b >= 33 and b <= 126 end,
+    cntrl  = function(b) return b < 32 or b == 127 end,
+    xdigit = function(b) return (b >= 48 and b <= 57) or (b >= 65 and b <= 70)
+                                or (b >= 97 and b <= 102) end,
+    w      = isWord,
+    s      = isSpace,
+    d      = isDigit,
+}
+
 local CLASS_ESCAPES = {
     d = { pred = isDigit,                        neg = false },
     D = { pred = isDigit,                        neg = true  },
@@ -246,20 +285,44 @@ function Parser:classAtom()
     return 'char', sbyte(c)
 end
 
+--- A POSIX bracket expression at the current position, the leading '[' NOT yet consumed.
+--- Returns a { pred=, neg= } predicate entry and advances past ':]', or nil when what
+--- follows is an ordinary literal '['.
+function Parser:posixClass()
+    local rest = ssub(self.s, self.i)
+    local neg, name, width = false, nil, nil
+    local n1 = rest:match('^%[:(%a+):%]')
+    if n1 then
+        name, width = n1, #n1 + 4
+    else
+        local n2 = rest:match('^%[:%^(%a+):%]')
+        if n2 then neg, name, width = true, n2, #n2 + 5 end
+    end
+    if not name then return nil end
+    local pred = POSIX_CLASSES[name:lower()]
+    if not pred then perr('unknown POSIX character class [:' .. name .. ':]') end
+    self.i = self.i + width
+    return { pred = pred, neg = neg }
+end
+
 function Parser:charClass()
     -- '[' already consumed
     local node = { t = 'class', neg = false, ranges = {}, preds = {} }
     if self:accept('^') then node.neg = true end
 
-    if ssub(self.s, self.i):match('^:%a+:') then
-        perr('POSIX character classes ([:alpha:] ...) are not supported')
+    -- A BARE `[:alpha:]` (one bracket) is not a POSIX class anywhere -- std::regex reads
+    -- it as the class of ':alph'.  Say so out loud rather than matching something odd.
+    if ssub(self.s, self.i):match('^:%a+:%]') then
+        perr('[:alpha:] is only a POSIX class INSIDE a class -- write [[:alpha:]]')
     end
 
     while true do
         if self:eof() then perr('unterminated character class') end
         if self:peek() == ']' then self.i = self.i + 1; break end
 
-        local kind, v = self:classAtom()
+        local px = (self:peek() == '[') and self:posixClass() or nil
+        local kind, v
+        if px then kind, v = 'class', px else kind, v = self:classAtom() end
         if kind == 'class' then
             node.preds[#node.preds + 1] = v
         else

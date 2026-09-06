@@ -362,9 +362,9 @@ Replaces `bot.lua:549-614`. Maps `LC.events` names → the 40 `context._callback
 |---|---|
 | `onUse`, `onUseWith` | client-side echo from the shim's own `g_game.use/useWith` |
 | `onAttackingCreatureChange` | fire from `attack()`/`cancelAttack()` and on the `attackCancel` event |
-| `onAddThing`/`onRemoveThing` | **needs a new emit hook in `game/state.lua:237 addThing` and `_removeAt`** (gap G5), gated by `enableTileThingLuaCallback` |
+| `onAddThing`/`onRemoveThing` | **DONE (gap G5 closed).** `shim/object.lua` `Reg:_hookState` wraps `state:addThing` and `state:_removeAt` on the state INSTANCE (so `game/state.lua` itself is untouched) and fans out to `reg.onTileThing`; gated by `enableTileThingLuaCallback`, the same gate as `tile.cpp:374-376,420-422` |
 | `onStatesChange` | old/new `player.states` diffing in `state.lua` |
-| `onKeyDown/Up/Press` | register-and-never-fire (**B2**) |
+| `onKeyDown/Up/Press` | never arrive from the wire (**B2**), but `shim.pressHotkey(desc)` drives the executor's own key path by hand — see COMPAT.md §4.1 |
 
 `functions/callbacks.lua` is loaded verbatim on top and supplies `context.callback` and the 35
 derived helpers — **do not reimplement it**. It needs `debug.getinfo`, which LuaJIT has.
@@ -465,12 +465,12 @@ Legend: **REAL** = real behaviour · **STATEFUL** = remembers a value, no side e
 | `g_game` accessors (getLocalPlayer/getContainers/findPlayerItem/isOnline/getPing/…) | **REAL** over `state.lua` | A1 §1.2 |
 | `g_game.getClientVersion/getProtocolVersion` | **INERT** → `1530` | all 25+1 sites are version gates (A1 §1.2) |
 | `g_game.getUnjustifiedPoints/getFeature` | **STATEFUL** (zeros / latched features) | nil crashes `vlib.lua:224` (A1 §1.2) |
-| `g_game` imbuement family (5 symbols) | **BLOCKED (B2)** — leave the file loaded, macro disabled | neither sender nor parser exists; self-contained to `cavebot/imbuing.lua` (A1 §6) |
+| `g_game` imbuement family (6 symbols) | **DONE (B2 closed)** | 0xD5/0xD6/0xD7/0xB2/0x60 out, 0x5D/0xEB/0xEC in; the opcode family in A1 §6 was misidentified as 0xF8/0xF9/0xFA |
 | `g_map` — all 8 symbols | **REAL**, thin adapters over `state`/`bot/world`/`bot/path` | 37 `getTile`, 16 `getTiles`, 19 `findPath`-funnelled (A1 §2) |
 | `g_map.getMinimapColor` unseen-tile fallback | **BLOCKED-with-data (B1)** — see §6.1 | `map.cpp` reads `g_minimap` for every tile outside the aware range (A1 §6) |
 | `Tile` (18 methods) | **REAL** — `state.lua` already has verbatim C++ ports of all of them | A1 §4.3, §5 |
 | `Creature` / `LocalPlayer` (30 + 26) | **REAL** — mostly one-line field reads | A1 §4.1, §4.2 |
-| `Item` (22) | **REAL**; `getServerId` **STATEFUL** deviation | A1 §4.4, B3 |
+| `Item` (22) | **REAL**; `getServerId` returns **0**, which is what the non-editor C++ build answers | A1 §4.4, B3 |
 | `Container` (13) | **REAL** | second-hottest cluster; 35 `getName`, 27 `getItems` (A1 §4.5) |
 | `g_things.getThingType` | **REAL** (2 methods only) | A1 §3 |
 | `g_sprites/g_creatures/g_shaders/g_effects`, render/map-view methods | **INERT** | 0 call sites / B4 |
@@ -524,12 +524,12 @@ them is how you introduce drift.
 |---|---|---|
 | G1 | no attack/follow target tracked | cache the id in `shim/game.lua`, clear on `attackCancel` |
 | G2 | no RTT | `LC.state.ping` already exists in `main.lua:455` — expose it |
-| G3 | opcode 0xB7 unparsed | return an all-zero struct (defer real parsing) |
+| ~~G3~~ **CLOSED** | opcode 0xB7 parsed into `state.unjustified` | before the packet arrives the three `*Remaining` fields answer **255**, not 0 — see COMPAT.md §4 divergence 4 |
 | G4 | `parser.lua:909` discards the supply-stash byte | store it |
-| **G5** | **no per-thing event** | **emit from `state:addThing` / `state:_removeAt`**, gated by `enableTileThingLuaCallback` — required by `BotServer.lua:221` |
+| ~~**G5**~~ **CLOSED** | per-thing event emitted | from `state:addThing` / `state:_removeAt`, gated by `enableTileThingLuaCallback` — required by `BotServer.lua:221` |
 | G6 | remote `getVocation()` | return 0 |
 | G7 | party mana (0x8B) | return 100 |
-| G8 | imbuement | B2, skip |
+| ~~G8~~ **CLOSED** | imbuement | B2 closed; senders and parsers both exist |
 | G9 | party invite/join builders | add to `proto/sender.lua` |
 | G10 | `stashStowItem` (0x28) | add to `proto/sender.lua` |
 
@@ -731,7 +731,7 @@ optional, before any live hunting test.
 | 7 | **Tick budget** — 48 macros + per-creature regex in interpreted Lua at 10 ms | medium | §5.6 gate; raise `tickMs`, or disable macros via `storage._macros` (vBot's own mechanism) |
 | 8 | **B2 keyboard** — `extras.lua:209` useAll hotkey, `Equipper.lua:590` condition 9 never fire | certain | accept; both are user-input features with no headless meaning |
 | 9 | **B4 relog** — `CharacterList.doLogin` needs the char-list widget | certain | replace `relogOnCharacter` with a shim-native reconnect (`transport:close()` → supervisor re-login) |
-| 10 | **B2 imbuement** — no sender, no parser | certain | leave `cavebot/imbuing.lua` loaded but its macro disabled; nothing else depends on it |
+| ~~10~~ | ~~**B2 imbuement** — no sender, no parser~~ **CLOSED** | — | senders (0xD5/0xD6/0xD7/0xB2/0x60) and parsers (0x5D/0xEB/0xEC) both exist; `cavebot/imbuing.lua` can run |
 | 11 | **B9 `connect` double-dispatch** on LocalPlayer differs from the live client | low | document; assert dispatch counts in §5.1 |
 | 12 | **Upstream drift** — vBot or otclient files change under us | low | `shim/patches.lua` fails loudly; §5.2's 74/27 manifest asserts |
 | 13 | **Config corruption** — the shim writes a file the real vBot can no longer read | low but costly | §5.5 round-trip; never write to the user's live profile in tests |

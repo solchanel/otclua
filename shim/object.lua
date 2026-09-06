@@ -100,6 +100,18 @@ function Thing:getId()      return 0 end
 function Thing:getPosition() return posmod.invalid() end
 function Thing:getStackPos() return -1 end
 
+-- Thing::lua_setMarked (luafunctions.cpp:528).  Render-only in the client -- the
+-- colour is kept on the thing and only consulted by the draw pass -- so headless it
+-- is a STATEFUL no-op rather than an absent method: `targetbot/looting.lua:339`
+-- calls `container:setMarked('#000088')` on every corpse it queues, and a missing
+-- method there raises inside the scheduled callback that has just inserted the
+-- corpse into TargetBot.Looting.list.
+function Thing:setMarked(color)
+    rawset(self, '_marked', color == nil and '' or tostring(color))
+end
+--- Not a C++ binding; the shim's own read-back so a test can prove setMarked landed.
+function Thing:getMarked() return rawget(self, '_marked') or '' end
+
 -- ---------------------------------------------------------------------------
 -- the registry
 -- ---------------------------------------------------------------------------
@@ -139,6 +151,10 @@ function objects.new(LC, opts)
     reg.floorDirty = {}     -- [z] = generation counter
     reg.indexed    = 0      -- how many keys the index holds (cross-check vs state.tileCount)
     reg._reported  = {}
+    -- gap G5: Game::m_tileThingsLuaCallback (game.h:431).  OFF until a script calls
+    -- g_game.enableTileThingLuaCallback(true), exactly like the C++.
+    reg.tileThingCallback = false
+    reg.onTileThing       = nil     -- set by shim/callbacks.lua
 
     reg:_seedFloors()
     reg:_hookState()
@@ -253,8 +269,48 @@ function Reg:_hookState()
         return out
     end
 
+    -- ------------------------------------------------------------ gap G5 -----
+    -- Tile::addThing (tile.cpp:374-376) and Tile::removeThing (tile.cpp:420-422) end
+    -- with `if (g_game.isTileThingLuaCallbackEnabled()) callLuaField("onAddThing"/
+    -- "onRemoveThing", thing)`.  Both hooks are GATED on the same flag the C++ gates
+    -- them on, so with the callback off (the default, and what
+    -- mods/game_bot/functions/callbacks.lua:8-9 leaves it at until a script asks for
+    -- one) this costs one boolean test per thing and allocates nothing.
+    --
+    -- state:_removeAt is the single removal funnel -- state:removeThing goes through
+    -- it AND so does the 11-thing trim inside addThing, which is exactly the C++
+    -- ordering: the trim's onRemoveThing fires before the outer onAddThing.
+    local baseAdd, baseRemoveAt = st.addThing, st._removeAt
+
+    st.addThing = function(s, pos, stackPos, thing)
+        local sp = baseAdd(s, pos, stackPos, thing)
+        if sp ~= nil then
+            for i = 1, #hooks do
+                local h = hooks[i]
+                if h.tileThingCallback and h.onTileThing then
+                    h:onTileThing('add', pos, thing, sp)
+                end
+            end
+        end
+        return sp
+    end
+
+    st._removeAt = function(s, tile, idx)
+        local thing = baseRemoveAt(s, tile, idx)
+        if thing ~= nil then
+            for i = 1, #hooks do
+                local h = hooks[i]
+                if h.tileThingCallback and h.onTileThing then
+                    h:onTileThing('remove', tile.pos, thing, idx)
+                end
+            end
+        end
+        return thing
+    end
+
     rawset(st, '__shimBase', { setTile = baseSet, cleanTile = baseClean,
-                               getOrCreateTile = baseCreate, reset = baseReset })
+                               getOrCreateTile = baseCreate, reset = baseReset,
+                               addThing = baseAdd, _removeAt = baseRemoveAt })
     self._hooked = true
 end
 
@@ -275,6 +331,7 @@ function Reg:detach()
             -- Clearing the INSTANCE fields uncovers the shared `state` metatable methods
             -- again, which is exactly the pre-hook state.
             st.setTile, st.cleanTile, st.getOrCreateTile, st.reset = nil, nil, nil, nil
+            st.addThing, st._removeAt = nil, nil
             rawset(st, '__shimRegs', nil)
             rawset(st, '__shimBase', nil)
         end

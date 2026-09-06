@@ -93,7 +93,7 @@ bot/world.lua, bot/path.lua}`.
 | `g_game.stashStowItem(pos, id, count, stackpos, action)` | `void(const Position&, uint16_t, uint32_t, uint8_t, uint8_t)` | 2/0 | `cavebot/depositor.lua:251`: `stashStowItem(item:getPosition(), id, 0, item:getStackPos(), 2)` (action 2 = stow all of this id) | nothing | IMPLEMENT — **not in `proto/sender.lua`**, must be added (opcode 0x28) |
 | `g_game.buyItem(item, amount, ignoreCap, withBackpack)` / `sellItem(item, amount, ignoreEquipped)` | `game.h:261-262` | 0/1 each | via `panels/` only | nothing | IMPLEMENT → `sender:buyItem` / `sender:sellItem` (already present) |
 | `g_game.requestOutfit()` / `changeOutfit(outfit)` | `void()` / `void(const Outfit&)` | 0/1 each | `functions/player.lua:54-60` | nothing | IMPLEMENT → `sender:requestOutfit()` / `sender:changeOutfit{...}` |
-| `applyImbuement(slot,id,protect)` · `clearImbuement(slot)` · `closeImbuingWindow()` · `selectImbuementItem(itemId,pos,stackpos)` · `imbuementDurations(bool)` | `game.h:420-424` | 1+1+3+1+2 / same | `cavebot/imbuing.lua:237,238,648,668,712,727,738,752` | nothing; the **reply** packets drive the state machine | see BLOCKER B2 |
+| `applyImbuement(slot,id,protect)` · `clearImbuement(slot)` · `closeImbuingWindow()` · `selectImbuementItem(itemId,pos,stackpos)` · `selectImbuementScroll()` · `imbuementDurations(bool)` | `game.h:420-424` | 1+1+3+1+2 / same | `cavebot/imbuing.lua:237,238,648,668,712,727,738,752` | 0xD5 / 0xD6 / 0xD7 / 0xB2 / 0x60 out, 0x5D / 0xEB / 0xEC in | **IMPLEMENTED** — B2 closed, see §6 |
 | `g_game.forgeRequest(actionType, ...)` | `game.h:416` | 1/0 | `cavebot/route_tools.lua:86` | nothing | INERT STUB acceptable (one decorative call site) |
 
 ### 1.2 Read-only accessors (map to `game/state.lua`)
@@ -275,9 +275,9 @@ Counts are raw T1 hits for the name; the receiver column disambiguates game obje
 | `isPickupable()` | `Thing` | 2 | bool | `items.isPickupable(id)` | IMPLEMENT |
 | `isFluidContainer()` | `Thing` | 2 | bool | `items.isFluidContainer(id)` | IMPLEMENT |
 | `isUsable()` / `isMultiUse()` / `isGround()` / `isItem()` / `isCreature()` | `Thing` | 1 / 1 / 1 / 6 / 1 | bool | `items.*` plus `thing.kind` | IMPLEMENT |
-| `getMarketData()` | `item.h` | **10** | a table; **only `.name` is read** (`vBot/depositer_config.lua:42,70`, `vBot/analyzer.lua:401,438,494,1118,1191`). Full struct `{name, category, requiredLevel, restrictVocation, showAs, tradeAs}` (`staticdata.h:230`) | `items.marketName(id)` and `items.name(id)` exist | IMPLEMENT — return `{name = items.marketName(id) or items.name(id) or ('item '..id), category=0, requiredLevel=0, restrictVocation=0, showAs=id, tradeAs=id}`. **`nil` crashes analyzer and depositer_config** |
+| `getMarketData()` | `item.h` | **10** | a table; **only `.name` is read** (`vBot/depositer_config.lua:42,70`, `vBot/analyzer.lua:401,438,494,1118,1191`). Full struct `{name, category, requiredLevel, restrictVocation, showAs, tradeAs}` (`staticdata.h:230`) | `items.marketName(id)` and `items.name(id)` exist | IMPLEMENTED as specified: `{name = items.marketName(id) or items.name(id) or ('item '..id), category=0, requiredLevel=0, restrictVocation=0, showAs=id, tradeAs=id}`, plus a `marketName` field carrying the C++-exact value. **`nil` crashes analyzer and depositer_config.** NOTE — the `name` fallback is a KNOWN, deliberate deviation: `thingtype.cpp:340-357` copies `m_name` into `m_market.name` only inside `if has_market()`, so the live client hands back `''` for an item with no market block. The deviation is one-directional and safe: `.name` is only ever lowercased and string-matched (`vBot/depositer_config.lua:42,70`, `vBot/analyzer.lua:401,438,494,1118,1191`), so a real name can only ADD a classification the live client would have dropped, never mis-classify one. Use `.marketName` for the C++-exact answer. |
 | `getName()` | `item.h` | 0 direct on items (see `g_things.getThingType(id):getName()`) | string | `items.name(id)` | IMPLEMENT |
-| `getServerId()` | `item.h` | 1 | uint16 | no OTB headless — server id ≠ client id | STATEFUL STUB → return `getId()` (B3) |
+| `getServerId()` | `item.h` | 1 | uint16 | no OTB headless — and the shipped client has none either | **return `0`** — that is what the non-editor C++ build answers (`Item::m_serverId` is only written under `#ifdef FRAMEWORK_EDITOR`, `item.cpp:273`; `TOGGLE_FRAMEWORK_EDITOR` is OFF by default). See B3. |
 | `Item.create(id)` | class constructor | **8** | a detached Item; only `getId`/`getMarketData`/`getName` are used on it | — | IMPLEMENT — a 3-line factory: `id`, `count = 1`, no position |
 | `Item.bottom` | field lookup | 4 | — | | INERT |
 | `setCount`, `setTooltip`, `setTier`, `clone`, `setDescription`, `getDurationTime`, `getCharges` | | 0 in T1 | | | INERT STUB |
@@ -327,12 +327,12 @@ which already match the `g_map` contracts.
 |---|---|---|---|
 | G1 | `getAttackingCreature`/`getFollowingCreature`/`isAttacking` (12 T1 sites) | no attack/follow target tracked | keep the id in the shim; clear on `attackCancel` |
 | G2 | `g_game.getPing()` (10 T1 sites) | no RTT measurement | time `ping`/`pingBack` in `proto/transport.lua` |
-| G3 | `g_game.getUnjustifiedPoints()` (3 sites) | opcode 0xB7 not parsed | parse it, or return an all-zero struct |
+| ~~G3~~ **CLOSED** | `g_game.getUnjustifiedPoints()` (3 sites) | ~~opcode 0xB7 not parsed~~ | **DONE** — `proto/parser.lua` `S[0xB7]` parses all seven bytes into `state.unjustified` and emits `unjustifiedPoints`; `g_game.getUnjustifiedPoints()` reads it. **Before the packet arrives** the three `*Remaining` fields answer **255**, not 0: `vBot/vlib.lua:223-227` `killsToRs()` is their minimum, and 0 is conservative for the AttackBot PvP gate (`AttackBot.lua:1573,2949,3001,3036,3046,3065,3083`, `killsToRs() > KillsAmount`) but INVERTS `vBot/antiRs.lua:21` (`killsToRs() < 6`), which would latch on for the whole session. 255 is the only value that is safe in both directions. |
 | G4 | `player:isSupplyStashAvailable()` (1 site) | `proto/parser.lua:909` reads and discards the byte | store it |
-| G5 | `onAddThing`/`onRemoveThing` (`vBot/BotServer.lua:221`) | no per-thing event | emit from `state:addThing` / `state:_removeAt` |
+| ~~G5~~ **CLOSED** | `onAddThing`/`onRemoveThing` (`vBot/BotServer.lua:221`) | ~~no per-thing event~~ | **DONE** — `shim/object.lua` `Reg:_hookState` wraps `state:addThing` and `state:_removeAt` (the single removal funnel: `state:removeThing` AND the 11-thing trim both go through it, which is the C++ ordering) and fans out to `reg.onTileThing`, which `shim/callbacks.lua` turns into `onAddThing(tile, thing)` / `onRemoveThing(tile, thing)`. **Gated** on `reg.tileThingCallback`, flipped by `g_game.enableTileThingLuaCallback` — the same gate as `tile.cpp:374-376,420-422` — so with the callback off it costs one boolean per thing and allocates nothing. |
 | G6 | `Creature:getVocation()` on **remote** creatures (1 site) | only the local player's vocation is stored | store per creature, or return 0 |
 | G7 | `Creature:getManaPercent()` (1 site) | opcode 0x8B (party mana) not stored | store, or return 100 |
-| G8 | imbuement window (`cavebot/imbuing.lua`, 8 sites) | neither senders nor parser exist | see B2 |
+| ~~G8~~ **CLOSED** | imbuement window (`cavebot/imbuing.lua`, 8 sites) | ~~neither senders nor parser exist~~ | **DONE** — see B2 below |
 | G9 | party invite/join (2+2 sites) | no party builders in `proto/sender.lua` | add them |
 | G10 | `g_game.stashStowItem` (2 sites) | no builder | add opcode 0x28 |
 
@@ -360,14 +360,37 @@ which already match the `g_map` contracts.
   `bot/walker.lua`'s anti-lost recovery.
   **Verdict: BLOCKER for long-range cavebot routing; IMPLEMENT-with-data otherwise.**
 
-**B2 — imbuement (`cavebot/imbuing.lua`).** 8 `g_game.*` imbuement calls plus an imbuement-window
-parser that exists on neither side (`proto/sender.lua` has no builder; `docs/opcode-map.md` would
-have to cover the 0xF8/0xF9/0xFA family). Self-contained cavebot extension.
-**BLOCKER for that one file only** — leave it disabled; nothing else in T1 depends on it.
+**B2 — imbuement (`cavebot/imbuing.lua`). CLOSED.** The opcodes were misidentified above: the
+family is 0x5D / 0xEB / 0xEC inbound and 0x60 / 0xB2 / 0xD5 / 0xD6 / 0xD7 outbound
+(`src/client/protocolcodes.h:94,235,236,285,358,375-377`), not 0xF8/0xF9/0xFA.
 
-**B3 — `Item:getServerId()` (1 site).** Needs `items.otb`, which the headless client deliberately
-does not carry (`proto/items.lua` is appearance-derived). Returning the client id is wrong but
-harmless at the single call site. **STATEFUL STUB, documented deviation.**
+| direction | opcode | C++ | shim |
+|---|---|---|---|
+| out | 0xD5 `ApplyImbuement` | `protocolgamesend.cpp:1735` — u8 slot, u32 imbuementId; the `protectionCharm` byte is **cv < 1510 only**, so it is *not* written at 1530 | `sender:applyImbuement` → `g_game.applyImbuement` |
+| out | 0xD6 `ClearImbuement` | `:1747` — u8 slot | `sender:clearImbuement` |
+| out | 0xD7 `CloseImbuingWindow` | `:1755` — empty | `sender:closeImbuingWindow` |
+| out | 0xB2 `ImbuementWindowAction` | `:1762` — u8 type; only type 1 (`SELECT_ITEM`) also writes Position(5) + u16 itemId + u8 stackpos | `sender:imbuementWindowAction` → `g_game.selectImbuementItem` / `selectImbuementScroll` |
+| out | 0x60 `ImbuementDurations` | `:1887` — u8 isOpen | `sender:imbuementDurations` |
+| in | 0x5D `ImbuementDurations` | `protocolgameparse.cpp:5596` → `g_game.onUpdateImbuementTracker(itemList)` | parsed into `state.imbuementTracker`, emitted as `imbuementTracker`, re-signalled as `onUpdateImbuementTracker` with a real `Item` on `entry.item` |
+| in | 0xEB `SendImbuementWindow` | `:6893` — three window types → `onOpenImbuementWindow` (0), `onImbuementItem` (1), `onImbuementScroll` (2) | all three, plus the game_bot-facing `onImbuementWindow` (`bot.lua:566`) |
+| in | 0xEC `SendCloseImbuementWindow` | `:6989` → `onCloseImbuementWindow` | wired |
+
+`activeSlots` is a **0-based** map of slot index → `{ imbuement, duration, removalCost }`, which is
+what `cavebot/imbuing.lua:190-200` reads as `tup[1]` / `tup[2]`. At cv ≥ 1510 the imbuement's
+`group` is derived from its `tier` byte (`Basic` / `Intricate` / `Powerful`,
+`protocolgameparse.cpp:6850`) rather than read as a string.
+
+**B3 — `Item:getServerId()` (1 site). CLOSED, and the old answer was wrong.**
+No client→server id map can be derived offline: it exists only in `items.otb`, which
+`ThingTypeManager::loadOtb` (`thingtypemanager.cpp:653`) turns into `m_reverseItemTypes`
+(`:566`), the 1530 data set does not ship one (`data/things/1530` is appearances + sprites), and
+nothing in `src/` or `modules/` ever calls `g_things.loadOtb`.
+More decisively, **the reference client does not answer the client id either.** `Item::m_serverId`
+is assigned in exactly one place, `item.cpp:273`, and that line is inside `#ifdef FRAMEWORK_EDITOR`;
+`src/CMakeLists.txt:12` defaults `TOGGLE_FRAMEWORK_EDITOR` to **OFF**, so in the shipped client the
+field keeps its `item.h:193` initialiser `{ 0 }` forever while the Lua binding
+(`luafunctions.cpp:853`) is compiled in unconditionally. A real `item:getServerId()` at 1530
+returns **0** for every item. The shim now returns 0 too, and still reports once.
 
 **B4 — everything render-, sprite- and widget-shaped** (`getTileUnderCursor` 3×, `getMapPanel`/
 `getMapView` 4×, `zoomIn`/`zoomOut`, `lockVisibleFloor`/`unlockVisibleFloor` 2+1×,

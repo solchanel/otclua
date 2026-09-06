@@ -195,7 +195,22 @@ without the `on` prefix, lowerCamel: `gameStart`, `login`, `pending`, `talk`, `t
 `containerRemoveItem`, `inventoryChange`, `walkCancel`, `death`, `ping`, `pingBack`, `modalDialog`,
 `loginError`, `loginAdvice`, `loginWait`, `sessionEnd`, `updateNeeded`, `spellCooldown`,
 `spellGroupCooldown`, `channelList`, `openChannel`, `closeChannel`, `mapDescription`, `tileUpdate`,
-`awareRangeChange`, `attackCancel`, `distanceEffect`, `magicEffect`, `animatedText`, `staticText`.
+`awareRangeChange`, `attackCancel`, `distanceEffect`, `magicEffect`, `animatedText`, `staticText`,
+`creatureTurn`, `editText`, `unjustifiedPoints`, `imbuementTracker`, `imbuementWindow`,
+`imbuementWindowClose`.
+
+Three of the newer ones are worth a note:
+
+* **`creatureDisappear` carries a record you can still read.** The creature is unlinked from
+  `state.creatures` before the emit (that is what the C++ does too), and `state:removeThing`
+  clears `creature.pos` — but it now moves the coordinates to **`creature.lastPos`** rather than
+  erasing them, so a handler can still say where the creature was. `pos` still goes to `nil`;
+  `bot/targetbot` and `test/bot_m3_target.lua:844` depend on that.
+* **`containerRemoveItem` carries `item`** — the thing that left, captured before the erase, the
+  way `Container::onRemoveItem` hands it to Lua.
+* **`creatureTurn`** is the dedicated turn packet shape (the `Proto::Creature` marker,
+  `protocolgameparse.cpp:4483-4494`), separated from `creatureMove` so a turn is not reported as
+  a step.
 
 `positionChange` is emitted **exactly once per local-player move**, from the 0x6D handler (and
 from the position-authoritative 0x64 / 0x4B, plus `Map::setCentralPosition`'s teleport fixup when

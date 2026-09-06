@@ -412,12 +412,26 @@ local SNIPPETS = {
 { 'g_game.attack / cancelAttack', [[
   local rat = g_map.getCreatureById(_COMPAT.RAT_ID)
   assert(rat, 'no rat')
+  -- Game::attack cancels when you re-attack the CURRENT target (game.cpp:974-977), and
+  -- the booted profile may already be attacking something, so start from a known state.
+  g_game.cancelAttack()
   local before = _COMPAT.count()
   g_game.attack(rat)
   assert(_COMPAT.count() > before, 'attack sent nothing')
   assert(_COMPAT.last():byte(1) == 0xA1, 'attack opcode')
   assert(g_game.getAttackingCreature() == rat, 'getAttackingCreature')
   assert(g_game.isAttacking(), 'isAttacking')
+  -- the C++ toggle: attacking the same creature again clears the target and sends id 0
+  g_game.attack(rat)
+  assert(g_game.getAttackingCreature() == nil, 'attack(sameCreature) did not cancel')
+  assert(_COMPAT.last():byte(1) == 0xA1, 'the cancel is still an 0xA1')
+  g_game.attack(rat)
+  assert(g_game.getAttackingCreature() == rat, 're-attack after the toggle')
+  -- attacking ourselves is an early return in C++ (game.cpp:971): no packet, no change
+  local n = _COMPAT.count()
+  g_game.attack(g_game.getLocalPlayer())
+  assert(_COMPAT.count() == n, 'attack(localPlayer) put a packet on the wire')
+  assert(g_game.getAttackingCreature() == rat, 'attack(localPlayer) changed the target')
   g_game.cancelAttack()
   assert(g_game.getAttackingCreature() == nil, 'attack was not cleared')
 ]] },
@@ -946,6 +960,157 @@ else
         local bytes = f and #f:read('*a') or 0
         if f then f:close() end
         eq(bytes, d.storageBytes, 'the user storage file is byte-identical after the run')
+    end
+end
+
+--==============================================================================
+section('E  hotkeys can now be fired, against the user REAL profile')
+--==============================================================================
+-- There is no keyboard headless, so onKeyDown / onKeyUp / onKeyPress could never fire
+-- and a `hotkey()` callback or a hotkey-bound macro switch could never run (blocker B2).
+-- `shim.pressHotkey(desc)` drives the executor's OWN key path -- the same
+-- exec.callbacks.onKeyDown/onKeyPress/onKeyUp that mods/game_bot/bot.lua:695-715 calls
+-- for a real key event -- so everything downstream behaves as if the key were pressed.
+if not OTROOT then
+    skip('hotkeys', 'the sandbox needs the otclient tree')
+else
+    local list = shim.hotkeys()
+    check(type(list) == 'table', 'shim.hotkeys() enumerates what the tree registered')
+    row('hotkeys', 'registered', true, true, ('%d combos'):format(#list))
+    for _, hk in ipairs(list) do
+        row('hotkey', hk.keys, true, true, (hk.kind or '?') .. ' -- ' .. tostring(hk.name))
+    end
+
+    -- 1. a hotkey registered by the shim's own snippet, through the REAL context.hotkey()
+    local fired = 0
+    rawset(ctx, '_COMPAT_HK', function() fired = fired + 1 end)
+    local reg = load([[
+      hotkey('Ctrl+F11', 'compat single', function() _COMPAT_HK() end)
+      singlehotkey('Ctrl+F12', 'compat repeat', function() _COMPAT_HK() end)
+    ]], '@snippet:hotkey registration', 't', ctx)
+    check(reg ~= nil, 'the hotkey() registration snippet compiles')
+    local okReg, regErr = pcall(reg)
+    check(okReg, 'hotkey() / singlehotkey() registered', short(regErr))
+
+    if okReg then
+        local bound = shim.pressHotkey('Ctrl+F11')
+        eq(bound, true, 'pressHotkey reports the combo IS bound')
+        eq(fired, 1, 'a repeating hotkey ran once (executor.lua:256-263, the press edge)')
+
+        -- `single` hotkeys fire on the DOWN edge instead (executor.lua:230-238)
+        shim.pressHotkey('Ctrl+F12')
+        eq(fired, 2, 'a single hotkey ran once too (the down edge)')
+
+        -- the description is canonicalised the same way the registration side was
+        shim.pressHotkey('ctrl+f11')
+        eq(fired, 3, 'a differently-spelled combo still finds it (retranslateKeyComboDesc)')
+
+        eq(shim.pressHotkey('Ctrl+F9'), false,
+           'an unbound combo reports false and raises nothing')
+        eq(fired, 3, 'and runs nothing')
+    end
+
+    -- 2. onKeyDown / onKeyPress callbacks the tree registered also see it
+    local keys = {}
+    rawset(ctx, '_COMPAT_KEYS', keys)
+    local reg2 = load([[
+      onKeyDown(function(k) table.insert(_COMPAT_KEYS, 'down:' .. k) end)
+      onKeyPress(function(k) table.insert(_COMPAT_KEYS, 'press:' .. k) end)
+      onKeyUp(function(k) table.insert(_COMPAT_KEYS, 'up:' .. k) end)
+    ]], '@snippet:key callbacks', 't', ctx)
+    if reg2 and pcall(reg2) then
+        shim.pressHotkey('Ctrl+F11')
+        eq(keys[1], 'down:Ctrl+F11', 'onKeyDown fired with the canonical combo')
+        eq(keys[2], 'press:Ctrl+F11', 'onKeyPress fired')
+        eq(keys[3], 'up:Ctrl+F11', 'onKeyUp fired')
+        eq(#keys, 3, 'exactly the three edges of one press')
+    end
+
+    -- 3. and the bridge stops declaring the key callbacks as never-fired... it does not:
+    --    onKeyDown is still dropped by the PARSER bridge (there is no key event on the
+    --    wire).  pressHotkey deliberately bypasses LC.events and calls the executor
+    --    directly, which is what a real key event does too.
+    local br = shim.status().callbackBridge
+    check(br and br.dropped.onKeyDown == 0,
+          'the bridge still declares onKeyDown as parser-unreachable, which is honest')
+end
+
+--==============================================================================
+section('F  the gaps closed in work item F, against the user REAL profile')
+--==============================================================================
+if not OTROOT then
+    skip('closed gaps', 'the sandbox needs the otclient tree')
+else
+    -- onAddThing / onRemoveThing, gated exactly like tile.cpp:374-376 / 420-422
+    local things = {}
+    rawset(ctx, '_COMPAT_THINGS', things)
+    local reg3 = load([[
+      g_game.enableTileThingLuaCallback(true)
+      onAddThing(function(tile, thing)
+        table.insert(_COMPAT_THINGS, 'add:' .. tostring(thing and thing:getId()))
+      end)
+      onRemoveThing(function(tile, thing)
+        table.insert(_COMPAT_THINGS, 'remove:' .. tostring(thing and thing:getId()))
+      end)
+    ]], '@snippet:tile thing callbacks', 't', ctx)
+    check(reg3 ~= nil, 'the onAddThing/onRemoveThing registration compiles')
+    if reg3 and pcall(reg3) then
+        local p = { x = ORIGIN.x + 3, y = ORIGIN.y + 3, z = ORIGIN.z }
+        local sp = st:addThing(p, -1, { kind = 'item', id = ID_BP })
+        check(things[#things] == 'add:' .. ID_BP,
+              'onAddThing reached the vBot callback (gap G5)', tostring(things[#things]))
+        st:removeThing(p, sp)
+        check(things[#things] == 'remove:' .. ID_BP,
+              'onRemoveThing too', tostring(things[#things]))
+        load('g_game.enableTileThingLuaCallback(false)', '@snippet:gate off', 't', ctx)()
+        local n = #things
+        st:addThing(p, -1, { kind = 'item', id = ID_BP })
+        eq(#things, n, 'and the gate really gates it')
+    end
+
+    -- opcode 0xB7 -> vBot's own killsToRs()
+    LC.events:emit('unjustifiedPoints', { killsDay = 10, killsDayRemaining = 4,
+                                          killsWeek = 20, killsWeekRemaining = 7,
+                                          killsMonth = 30, killsMonthRemaining = 11,
+                                          skullTime = 0 })
+    local kchunk = load('return killsToRs()', '@snippet:killsToRs', 't', ctx)
+    if kchunk then
+        local okk, v = pcall(kchunk)
+        check(okk and v == 4, 'vBot killsToRs() answers the real 0xB7 numbers (gap G3)',
+              tostring(v))
+    end
+
+    -- the imbuement family the user's cavebot/imbuing.lua drives
+    local sentBefore = #sent
+    local ichunk = load([[
+      g_game.imbuementDurations(true)
+      g_game.applyImbuement(0, 7, false)
+      g_game.clearImbuement(1)
+      g_game.closeImbuingWindow()
+    ]], '@snippet:imbuements', 't', ctx)
+    check(ichunk ~= nil, 'the imbuement snippet compiles')
+    if ichunk then
+        local oki, ierr = pcall(ichunk)
+        check(oki, 'the imbuement senders ran (blocker B2)', short(ierr))
+        eq(#sent - sentBefore, 4, 'four real packets went out')
+        eq(sent[sentBefore + 1]:byte(1), 0x60, '0x60 ImbuementDurations')
+        eq(sent[sentBefore + 2]:byte(1), 0xD5, '0xD5 ApplyImbuement')
+        eq(sent[sentBefore + 3]:byte(1), 0xD6, '0xD6 ClearImbuement')
+        eq(sent[sentBefore + 4]:byte(1), 0xD7, '0xD7 CloseImbuingWindow')
+    end
+
+    -- and the tracker signal the user's imbuing.lua:152 connects to
+    LC.events:emit('imbuementTracker', {
+        { slot = 5, totalSlots = 1, item = { kind = 'item', id = ID_BP },
+          slots = { [0] = { id = 0, name = 'Vampirism', iconId = 1, duration = 900 } } },
+    })
+    local cache = rawget(ctx, 'ImbuTrackerCache') or (G.G and G.G.ImbuTrackerCache)
+    if type(cache) == 'table' then
+        check(cache[ID_BP] ~= nil,
+              'the profile own cavebot/imbuing.lua tracker cache was filled')
+    else
+        row('imbuements', 'tracker cache', true, true,
+            'imbuing.lua did not install its hook in this fixture')
     end
 end
 

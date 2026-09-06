@@ -904,7 +904,11 @@ function TB:isWalking()
     local wk = self.walker
     if not wk:isWalking() then self._stepAt = nil; return false end
     if self:_walkerStuck() then
-        self._once('walk-watchdog', '[TargetBot] walk confirmation timed out, resetting')
+        -- `:` not `.` -- with a dot, `self` inside _once is the STRING 'walk-watchdog'
+        -- and `self:now()` raises, taking the whole TargetBot tick down every time the
+        -- walk watchdog trips (which is exactly when a chase or keep-distance step
+        -- loses its confirmation).
+        self:_once('walk-watchdog', '[TargetBot] walk confirmation timed out, resetting')
         wk:reset(true)
         self._stepAt = nil
         return false

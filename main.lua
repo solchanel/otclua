@@ -94,6 +94,14 @@ vBot compatibility shim (docs/shim/COMPAT.md) -- runs the REAL vBot 4.8 scripts
   --vbot-vprofile=N        storage/profile_<N>.json    (default: --bot-vprofile, else 1)
   --vbot-tick=MS           the executor tick in ms                    (default 10)
   --vbot-strict            a missing API raises instead of returning an inert stub
+  --vbot-safe              LIVE SMOKE TEST MODE.  Boots and ticks the whole vBot tree
+                           exactly as normal, but turns AttackBot, TargetBot and
+                           CaveBot OFF the moment the tree is up, so the session
+                           never attacks anything and never auto-walks a hunting
+                           route.  HealBot is deliberately left ON (it protects the
+                           character and starts no fight).  Nothing is persisted --
+                           the shim is read-only unless --vbot-write is given, and
+                           --vbot-safe does not imply --vbot-write.
   --vbot-write             allow the bot to write its own storage/configs back into
                            the profile.  OFF by default: the shim runs read-only and
                            records every refused write, so a shim bug cannot corrupt
@@ -263,6 +271,7 @@ local function parseArgs(argv)
         elseif name == 'vbot-vprofile' then cfg.vbotVProfile = tonumber(v)
         elseif name == 'vbot-tick' then cfg.vbotTickMs = tonumber(v)
         elseif name == 'vbot-strict' then cfg.vbotStrict = true
+        elseif name == 'vbot-safe' then cfg.vbotSafe = true
         elseif name == 'vbot-write' then cfg.vbotWrite = true
         elseif name == 'minimap'   then cfg.minimap = v
         elseif name == 'proxy'     then
@@ -362,7 +371,8 @@ local function resolveSecrets(cfg)
                      .. 'both attack, so exactly one may be enabled.  Drop %s, or drop '
                      .. '--vbot.'):format(table.concat(which, ' / '), table.concat(which, ' / '))
     end
-    if (cfg.vbotVProfile or cfg.vbotTickMs or cfg.vbotStrict or cfg.vbotWrite) and not cfg.vbot then
+    if (cfg.vbotVProfile or cfg.vbotTickMs or cfg.vbotStrict or cfg.vbotWrite
+         or cfg.vbotSafe) and not cfg.vbot then
         return nil, 'the --vbot-* options need --vbot (or --vbot-profile=DIR)'
     end
     if cfg.vbotTickMs and (cfg.vbotTickMs < 1 or cfg.vbotTickMs > 1000) then
@@ -685,6 +695,12 @@ local function startVBot(cfg)
         return
     end
     LC.vbot = shim
+    -- Count macro invocations.  Without this every status line reports
+    -- "macros 0/N ran" no matter how much work the tree did, because `runs` is only
+    -- populated by the instrumentation wrapper -- so a clean live session looked
+    -- exactly like a session in which nothing ever ran.  forceEnable is NOT passed:
+    -- the user's own on/off state is untouched.
+    pcall(shim.instrumentMacros, {})
     local st = shim.status()
     log.info('vbot: %d profile files loaded (%d failed), %d runtime files, '
              .. '%d macros (%d enabled), %d callbacks, UI backend %s',
@@ -695,6 +711,28 @@ local function startVBot(cfg)
         log.warn('vbot: %s did not load: %s', tostring(f.name), tostring(f.err))
     end
     if serr then log.warn('vbot: %s', tostring(serr)) end
+
+    -- --vbot-safe: the whole tree is up and ticking; now take the three engines that
+    -- can act on the world offline.  This runs AFTER the boot on purpose, so the
+    -- proof that the tree loads and ticks is unchanged -- only what it is allowed to
+    -- DO is narrowed.  HealBot stays on: it never starts a fight and it is the one
+    -- thing that keeps the character alive if something else does.
+    if cfg.vbotSafe then
+        local ctx = shim.context()
+        local off = {}
+        for _, name in ipairs({ 'AttackBot', 'TargetBot', 'CaveBot' }) do
+            local mod = ctx and rawget(ctx, name)
+            local fn = type(mod) == 'table' and mod.setOff
+            if type(fn) == 'function' then
+                local okoff = pcall(fn)
+                off[#off + 1] = ('%s=%s'):format(name, okoff and 'off' or 'FAILED')
+            else
+                off[#off + 1] = ('%s=absent'):format(name)
+            end
+        end
+        log.warn('vbot: --vbot-safe -- combat and auto-walk disabled (%s); '
+                 .. 'HealBot left on', table.concat(off, ' '))
+    end
 end
 
 local function vbotStatusLine()

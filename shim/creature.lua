@@ -386,9 +386,21 @@ function Creature:isFullHealth() return self:getHealthPercent() >= 100 end
 function Creature:getLight() local r = rec(self); return (r and r.light) or { intensity = 0, color = 0 } end
 function Creature:getMasterId() local r = rec(self); return (r and r.masterId) or 0 end
 
+-- Creature::setText / getText / clearText (luafunctions.cpp:708-710).  The string
+-- lives in Creature::m_text whether or not anything draws it, and vBot READS it
+-- back: `vBot/extras.lua:551` skips a player it has already looked at with
+-- `spec:getText() == ""`, and `targetbot/target.lua:31` clears them again.  So this
+-- is real state, not an inert no-op -- an absent getText raised inside extras.lua's
+-- scheduled Check-Players pass.
+function Creature:setText(t)
+    rawset(self, '_text', t == nil and '' or tostring(t))
+end
+function Creature:getText()   return rawget(self, '_text') or '' end
+function Creature:clearText() rawset(self, '_text', '') end
+
 -- Render / UI: callable, inert, never consulted for a decision (blocker B4).
 local INERT = { 'setOutfit', 'setDirection', 'showStaticSquare', 'hideStaticSquare',
-                'setText', 'setMarked', 'setHighlight', 'attachEffect', 'clearAttachedEffects',
+                'setHighlight', 'attachEffect', 'clearAttachedEffects',
                 'attachParticleEffect', 'setShader', 'setTypingIconTexture', 'setIcon',
                 'addTimedSquare', 'removeTimedSquare', 'setSkull', 'setShield', 'setEmblem' }
 for i = 1, #INERT do Creature[INERT[i]] = function() return nil end end

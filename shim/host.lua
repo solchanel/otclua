@@ -695,6 +695,86 @@ function H:macros()
     return out
 end
 
+-- ---------------------------------------------------------------------------
+-- hotkeys (blocker B2: there is no keyboard headless)
+-- ---------------------------------------------------------------------------
+--- Every hotkey the loaded tree registered, by its canonical key description.
+--- `context._hotkeys` is keyed by the retranslated combo (functions/main.lua:144),
+--- and a MACRO also carries one (`macro.hotkey`, executor.lua:226-229).
+function H:hotkeys()
+    local out = {}
+    local ctx = self.context
+    if not ctx then return out end
+    for keys, hk in pairs(rawget(ctx, '_hotkeys') or {}) do
+        out[#out + 1] = { keys = keys, name = hk.name, single = hk.single and true or false,
+                          kind = 'hotkey' }
+    end
+    for _, m in ipairs(rawget(ctx, '_macros') or {}) do
+        if m.hotkey and m.hotkey ~= '' then
+            out[#out + 1] = { keys = m.hotkey, name = m.name, kind = 'macro',
+                              enabled = m.enabled and true or false }
+        end
+    end
+    table.sort(out, function(a, b)
+        if a.keys == b.keys then return tostring(a.name) < tostring(b.name) end
+        return a.keys < b.keys
+    end)
+    return out
+end
+
+--- Fire a registered hotkey by its key description ("Ctrl+F1", "f5", ...).
+---
+--- There is no keyboard headless, so onKeyDown / onKeyUp / onKeyPress can never fire on
+--- their own (blocker B2) -- which also means a macro's on/off SWITCH bound to a hotkey
+--- can never be toggled and a `hotkey()` callback can never run.  This drives the REAL
+--- executor path rather than reaching past it: it calls
+--- `exec.callbacks.onKeyDown/onKeyPress/onKeyUp`, which is what
+--- mods/game_bot/bot.lua:695-715 does for a real key event.  So a macro switch bound to
+--- the combo flips, `hotkey.switch:setOn()` runs, `single` hotkeys fire on the down
+--- edge and repeating ones on the press edge, and every `onKeyDown` / `onKeyPress`
+--- callback the tree registered sees it -- exactly as if the user had pressed the key.
+---
+--- `shim/platform.lua`'s determineKeyComboDesc canonicalises a STRING argument, so the
+--- description travels through the executor untouched; a stray numeric key code still
+--- records a miss and returns nil, as before.
+---
+--- Returns true when the combo matched at least one hotkey or macro switch, false when
+--- nothing is bound to it (which is not an error -- the live client swallows those too),
+--- and nil plus a message when the tree is not loaded.
+function H:pressHotkey(desc, opts)
+    opts = opts or {}
+    local ctx = self.context
+    if not ctx then return nil, 'the vBot tree is not loaded' end
+    local exec = self.exec
+    local cb = exec and exec.callbacks
+    if type(cb) ~= 'table' or type(cb.onKeyDown) ~= 'function' then
+        return nil, 'the executor callback table is missing'
+    end
+    if type(desc) ~= 'string' or desc == '' then
+        return nil, 'pressHotkey: a key description string is required'
+    end
+    local retranslate = self.G and self.G.retranslateKeyComboDesc
+    local keys = desc
+    if type(retranslate) == 'function' then
+        local okr, canon = pcall(retranslate, desc)
+        if okr and type(canon) == 'string' and canon ~= '' then keys = canon end
+    end
+
+    local bound = false
+    if (rawget(ctx, '_hotkeys') or {})[keys] then bound = true end
+    for _, m in ipairs(rawget(ctx, '_macros') or {}) do
+        if m.switch and m.hotkey == keys then bound = true end
+    end
+
+    -- The three edges, in the order a real key press delivers them.  onKeyPress is
+    -- what runs a NON-single hotkey (executor.lua:256-263), onKeyDown a single one.
+    local ok, err = pcall(cb.onKeyDown, keys, 0)
+    if ok and opts.press ~= false then ok, err = pcall(cb.onKeyPress, keys, 0, 0) end
+    if ok and opts.up ~= false then ok, err = pcall(cb.onKeyUp, keys, 0) end
+    if not ok then return nil, tostring(err) end
+    return bound
+end
+
 function H:status()
     local loaded, failed, vbotLoaded, vbotFailed, rtLoaded, rtFailed = 0, 0, 0, 0, 0, 0
     local failures = {}

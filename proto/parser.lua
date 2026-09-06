@@ -667,6 +667,19 @@ function P:applyCreature(c)
     self:dropCreature(c.removeId)
   end
   if isNew then self.emit('creatureAppear', cr) end
+  -- A TURN is its own packet shape at 1530: the `Proto::Creature` marker
+  -- (protocolgameparse.cpp:4483-4494, "this is send creature turn") carries only an id,
+  -- a direction and the unpass byte, and the C++ answers it with Creature::turn().  It is
+  -- NOT a move, so folding it into `creatureMove` (which every walk watcher listens to)
+  -- reported a step that never happened.  Emitted separately here.
+  --
+  -- Honest note: the reference client emits no Lua signal for a turn at all -- there is no
+  -- callLuaField("onTurn", ...) anywhere in src/ -- so mods/game_bot/bot.lua:587's
+  -- `connect(Creature, { onTurn = botCreatureTurn })` is dead upstream.  Firing it here is
+  -- therefore a deliberate SUPERSET, documented in docs/shim/COMPAT.md sec.5.
+  if c.turnOnly then
+    self.emit('creatureTurn', { creature = cr, direction = c.direction })
+  end
   return cr
 end
 
@@ -1264,17 +1277,28 @@ end
 S[0x5C] = function(self, R) R:u16(); R:u32(); R:u8() end   -- WeaponProficiencyExperience
 
 S[0x5D] = function(self, R)                       -- ImbuementDurations
+  -- parseImbuementDurations (protocolgameparse.cpp:5596-5632) ->
+  -- g_game.onUpdateImbuementTracker(itemList).  The user's own
+  -- profiles/bot/vBot_4.8/cavebot/imbuing.lua:152 connects to exactly this signal and
+  -- indexes entry.item:getId(), entry.slot, entry.totalSlots and entry.slots[i].
   local n = R:u8()
+  local list = {}
   for _ = 1, n do
-    R:u8()                                        -- slot
-    self:readItem(R)
+    local entry = { slot = R:u8() }
+    entry.item = self:readItem(R)
     local slots = R:u8()
-    for _ = 1, slots do
+    entry.totalSlots = slots
+    entry.slots = {}
+    for slotIndex = 0, slots - 1 do
       if R:u8() ~= 0 then
-        R:string(); R:u16(); R:u32(); R:u8()
+        entry.slots[slotIndex] = { id = slotIndex, name = R:string(), iconId = R:u16(),
+                                   duration = R:u32(), state = R:u8() }
       end
     end
+    list[#list + 1] = entry
   end
+  self.state.imbuementTracker = list
+  self.emit('imbuementTracker', list)
 end
 
 S[0x5E] = function(self, R)                       -- PassiveCooldown
@@ -1406,17 +1430,24 @@ S[0x77] = function(self, R)                       -- InspectionState
 end
 
 -- --- inventory / containers -----------------------------------------------
+-- LocalPlayer::setInventoryItem (localplayer.cpp:512-523) captures the PREVIOUS item and
+-- hands Lua `onInventoryChange(slot, item, oldItem)` -- the third argument is what an
+-- unequip handler reads.  Carry it, like the removal events above do.
 S[0x78] = function(self, R)                       -- SetInventory
   local slot = R:u8()
   local item = self:readItem(R)
-  self:player().inventory[slot] = item
-  self.emit('inventoryChange', { slot = slot, item = item })
+  local pl = self:player()
+  local old = pl.inventory[slot]
+  pl.inventory[slot] = item
+  self.emit('inventoryChange', { slot = slot, item = item, oldItem = old })
 end
 
 S[0x79] = function(self, R)                       -- DeleteInventory
   local slot = R:u8()
-  self:player().inventory[slot] = nil
-  self.emit('inventoryChange', { slot = slot, item = nil })
+  local pl = self:player()
+  local old = pl.inventory[slot]
+  pl.inventory[slot] = nil
+  self.emit('inventoryChange', { slot = slot, item = nil, oldItem = old })
 end
 
 S[0x6E] = function(self, R)                       -- OpenContainer
@@ -1510,13 +1541,16 @@ S[0x72] = function(self, R)                       -- ContainerRemoveItem
   end
   local st = self.state
   local c = st.container and st:container(cid) or (st.containers and st.containers[cid])
+  -- Container::onRemoveItem hands Lua the item that LEFT (bot.lua:733 ->
+  -- callbacks.onRemoveItem(container, slot, item)); capture it before the erase.
+  local removed
   if c then
     local idx = slot - (c.firstIndex or 0) + 1
-    if idx >= 1 and idx <= #c.items then table.remove(c.items, idx) end
+    if idx >= 1 and idx <= #c.items then removed = table.remove(c.items, idx) end
     if last then c.items[#c.items + 1] = last end
   end
   self.emit('containerRemoveItem',
-            { containerId = cid, slot = slot, lastItem = last })
+            { containerId = cid, slot = slot, lastItem = last, item = removed })
 end
 
 S[0xF5] = function(self, R)                       -- PlayerInventory (count cache)
@@ -1786,17 +1820,24 @@ S[0x95] = function(self, R)                       -- CreatureType
 end
 
 S[0x96] = function(self, R)                       -- EditText
-  R:u32()                                         -- windowId
+  -- parseEditText (protocolgameparse.cpp:2564-2592) -> Game::processEditText ->
+  -- g_game.onEditText, which mods/game_bot/bot.lua:571 wires to onGameEditText.
+  local windowId = R:u32()
+  local itemId
   if self.clientVersion >= 1010 or self:feat(F_ITEM_SHADER) then
-    self:readItem(R)
+    local it = self:readItem(R)
+    itemId = it and it.id or 0
   else
-    R:u16()
+    itemId = R:u16()
   end
-  R:u16()                                         -- maxLength
-  R:string()                                      -- text
-  R:string()                                      -- writer
+  local maxLength = R:u16()
+  local text   = R:string()
+  local writer = R:string()
   if self.clientVersion >= 1281 then R:u8() end   -- suffix
-  if self:feat(F_WRITABLE_DATE) then R:string() end
+  local date = ''
+  if self:feat(F_WRITABLE_DATE) then date = R:string() end
+  self.emit('editText', { id = windowId, itemId = itemId, maxLength = maxLength,
+                          text = text, writer = writer, date = date })
 end
 
 S[0x97] = function(self, R) R:u8(); R:u32(); R:string() end   -- EditList
@@ -2140,12 +2181,18 @@ S[0xB6] = function(self, R)                       -- WalkWait
 end
 
 S[0xB7] = function(self, R)                       -- UnjustifiedStats (7 x u8)
-  self.state.unjustified = {
+  -- parseUnjustifiedStats (protocolgameparse.cpp:1322-1335) -> g_game.setUnjustifiedPoints.
+  -- vBot/vlib.lua:223-227 killsToRs() is the min of the three *Remaining fields and
+  -- vBot/antiRs.lua:21 and AttackBot.lua:1573,2949,... branch on it, so the numbers have
+  -- to be real rather than a placeholder (gap G3).
+  local u = {
     killsDay = R:u8(), killsDayRemaining = R:u8(),
     killsWeek = R:u8(), killsWeekRemaining = R:u8(),
     killsMonth = R:u8(), killsMonthRemaining = R:u8(),
     skullTime = R:u8(),
   }
+  self.state.unjustified = u
+  self.emit('unjustifiedPoints', u)
 end
 
 S[0xB8] = function(self, R) self.state.openPvpSituations = R:u8() end
@@ -2791,49 +2838,105 @@ end
 
 S[0xEA] = function(self, R) R:u32(); R:string() end   -- SendShowDescription
 
+-- getImbuementInfo (protocolgameparse.cpp:6840-6891).  Returns the struct the C++ builds,
+-- with the same field names the Lua binding exposes (Imbuement in staticdata.h).
+local IMBUEMENT_TIER_NAMES = { [0] = 'Basic', [1] = 'Intricate', [2] = 'Powerful' }
+
 function P:readImbuementInfo(R)
   local cv = self.clientVersion
-  R:u32(); R:string(); R:string()
-  if cv >= 1510 then R:u8() else R:string() end
-  R:u16(); R:u32()
-  if cv < 1510 then R:u8() end                    -- premiumOnly
-  for _ = 1, R:u8() do R:u16(); R:string(); R:u16() end
-  R:u32()                                         -- cost
-  if cv < 1510 then R:u8(); R:u32() end
+  local im = { id = R:u32(), name = R:string(), description = R:string() }
+  if cv >= 1510 then
+    im.tier = R:u8()
+    im.group = IMBUEMENT_TIER_NAMES[im.tier] or 'Unknown'
+  else
+    im.group = R:string()
+    im.tier = 0
+  end
+  im.imageId  = R:u16()
+  im.duration = R:u32()
+  if cv < 1510 then im.premiumOnly = R:u8() ~= 0 else im.premiumOnly = false end
+  im.sources = {}
+  for _ = 1, R:u8() do
+    local sid, sname, scount = R:u16(), R:string(), R:u16()
+    im.sources[#im.sources + 1] = { item = { kind = 'item', id = sid, count = scount },
+                                    name = sname }
+  end
+  im.cost = R:u32()
+  if cv < 1510 then
+    im.successRate = R:u8(); im.protectionCost = R:u32()
+  else
+    im.successRate = 100; im.protectionCost = 0
+  end
+  return im
+end
+
+--- The `needed items` tail both non-CHOICE branches end with (Item::create + setCount).
+local function readNeededItems(R)
+  local out = {}
+  for _ = 1, R:u32() do
+    local id, count = R:u16(), R:u16()
+    out[#out + 1] = { kind = 'item', id = id, count = count }
+  end
+  return out
 end
 
 S[0xEB] = function(self, R)                       -- SendImbuementWindow
+  -- parseImbuementWindow (protocolgameparse.cpp:6893-6987).  Three window types, three
+  -- different g_game signals; cavebot/imbuing.lua:184,188 connects to two of them.
   local modern = self.clientVersion >= 1510
   local windowType = 1                            -- IMBUEMENT_WINDOW_SELECT_ITEM
   if modern then
     windowType = R:u8()
-    if windowType > 2 then return end             -- nothing more is consumed
+    if windowType > 2 then                        -- nothing more is consumed
+      self.emit('parseWarning', { opcode = 0xEB, message =
+                string.format('unexpected imbuement windowType %d', windowType) })
+      return
+    end
   end
   local IT = self.items
   if windowType == 0 then                         -- CHOICE
     if modern then R:u8() end
-    R:u16(); R:u32()
+    local itemId, unknown = R:u16(), R:u32()
+    self.emit('imbuementWindow', { windowType = 0, itemId = itemId, unknown = unknown })
   elseif windowType == 2 then                     -- SCROLL
     R:u8(); R:u8()
     if modern then R:u8() end
-    for _ = 1, R:u16() do self:readImbuementInfo(R) end
-    for _ = 1, R:u32() do R:u16(); R:u16() end
+    local imbuements = {}
+    for _ = 1, R:u16() do imbuements[#imbuements + 1] = self:readImbuementInfo(R) end
+    local needed = readNeededItems(R)
+    self.emit('imbuementWindow', { windowType = 2, imbuements = imbuements,
+                                   neededItems = needed })
   elseif windowType == 1 then                     -- SELECT_ITEM
     if modern then R:u8() end
     local itemId = R:u16()
-    if hasClassify(IT, itemId) then R:u8() end
+    local tier = 0
+    if hasClassify(IT, itemId) then tier = R:u8() end
     local slots = R:u8()
-    for _ = 1, slots do
+    -- activeSlots is a 0-BASED map of slot index -> { imbuement, duration, removalCost },
+    -- which is what the C++ hands Lua as std::unordered_map<int, tuple<...>>.
+    local activeSlots = {}
+    for i = 0, slots - 1 do
       if R:u8() == 0x01 then
-        self:readImbuementInfo(R); R:u32(); R:u32()
+        local im = self:readImbuementInfo(R)
+        activeSlots[i] = { im, R:u32(), R:u32() }
       end
     end
-    for _ = 1, R:u16() do self:readImbuementInfo(R) end
-    for _ = 1, R:u32() do R:u16(); R:u16() end
+    local imbuements = {}
+    for _ = 1, R:u16() do imbuements[#imbuements + 1] = self:readImbuementInfo(R) end
+    local needed = readNeededItems(R)
+    self.state.imbuementWindow = { itemId = itemId, tier = tier, slots = slots,
+                                   activeSlots = activeSlots, imbuements = imbuements,
+                                   neededItems = needed }
+    self.emit('imbuementWindow', { windowType = 1, itemId = itemId, tier = tier,
+                                   slots = slots, activeSlots = activeSlots,
+                                   imbuements = imbuements, neededItems = needed })
   end
 end
 
-S[0xEC] = function(self, R) end                   -- CloseImbuementWindow (empty)
+S[0xEC] = function(self, R)                       -- CloseImbuementWindow (empty)
+  self.state.imbuementWindow = nil
+  self.emit('imbuementWindowClose', {})
+end
 
 S[0xED] = function(self, R)                       -- SendError
   self.emit('serverError', { code = R:u8(), message = R:string() })

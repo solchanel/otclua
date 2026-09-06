@@ -359,6 +359,44 @@ end
 eq(#regex.match('x', '\\1'), 0, 'backreference is refused (returns {})')
 check(regex.failures['\\1'] ~= nil, 'and is recorded in regex.failures')
 
+do
+    -- POSIX bracket expressions.  std::regex accepts these INSIDE a character class even
+    -- under the ECMAScript grammar ([re.grammar] extends ClassAtom with the class-name
+    -- production).  The shim used to parse the alpha class as [[:alph plus a stray literal
+    -- close-bracket and return {} with NO report at all -- and targetbot/creature.lua:62
+    -- and vBot/combo.lua:232 feed USER-SUPPLIED regexes straight in, so a config that used
+    -- one silently never matched.
+    eq(#regex.match('A1b2', '[[:alpha:]]'), 2, 'POSIX [[:alpha:]] matches the two letters')
+    eq(regex.match('A1b2', '[[:alpha:]]')[1][1], 'A', 'the first is A')
+    eq(regex.match('A1b2', '[[:alpha:]]')[2][1], 'b', 'the second is b')
+    eq(#regex.match('A1b2', '[[:digit:]]'), 2, '[[:digit:]] matches the two digits')
+    eq(regex.match('ab12', '[[:alnum:]]+')[1][1], 'ab12', '[[:alnum:]]+ spans both')
+    eq(regex.match('Deer', '^[[:upper:]][[:lower:]]+$')[1][1], 'Deer',
+       'upper/lower compose with anchors')
+    eq(#regex.match('a b', '[[:space:]]'), 1, '[[:space:]]')
+    eq(regex.match('a,b', '[[:punct:]]')[1][1], ',', '[[:punct:]]')
+    eq(regex.match('0xFf', '[[:xdigit:]]+')[1][1], '0', '[[:xdigit:]]')
+    eq(regex.match('a1', '[[:^alpha:]]')[1][1], '1', 'the negated [[:^name:]] form')
+    eq(regex.match('a-b', '[[:alpha:]-]+')[1][1], 'a-b',
+       'a POSIX class composes with ordinary class members')
+    eq(regex.match('a[b', '[[]')[1][1], '[', 'a bare [ inside a class stays a literal')
+
+    local seenP = {}
+    local oldP = regex.onUnsupported
+    regex.onUnsupported = function(pp, why) seenP[#seenP + 1] = { pp, why } end
+    regex.failures['[[:bogus:]]'] = nil
+    regex.failures['[:alpha:]'] = nil
+    regex.clearCache()
+    eq(#regex.match('x', '[[:bogus:]]'), 0, 'an UNKNOWN class name returns {}')
+    check(seenP[1] and seenP[1][2]:find('POSIX', 1, true) ~= nil,
+          'and reports loudly instead of mis-parsing', seenP[1] and seenP[1][2])
+    eq(#regex.match('x', '[:alpha:]'), 0, 'a BARE [:alpha:] (one bracket) returns {}')
+    check(seenP[2] and seenP[2][2]:find('POSIX', 1, true) ~= nil,
+          'and says so -- it is not a POSIX class in any dialect', seenP[2] and seenP[2][2])
+    regex.onUnsupported = oldP
+    regex.clearCache()
+end
+
 raises(function() regex.match(nil, 'x') end, 'subject must be a string',
        'a nil subject raises rather than silently returning {}')
 raises(function() regex.match('x', nil) end, 'pattern must be a string',

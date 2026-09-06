@@ -54,11 +54,28 @@ function Item:getId()
     return (t and t.id) or 0
 end
 
--- B3: no items.otb headless -- the server id is not derivable from the appearance table.
--- Returning the client id is the documented deviation (api-game.md sec.6 B3, one call site).
+-- B3 -- RESOLVED, and the old answer was wrong.  There is no client->server id map to
+-- derive offline: the map lives ONLY in items.otb, which ThingTypeManager::loadOtb builds
+-- into m_reverseItemTypes (thingtypemanager.cpp:653,566) and which the 1530 data set does
+-- not ship at all (data/things/1530 holds appearances/sprites, no .otb; nothing in src/ or
+-- modules/ ever calls g_things.loadOtb).
+--
+-- More to the point, the REFERENCE CLIENT does not answer the client id either.
+-- `Item::m_serverId` is assigned in exactly one place, item.cpp:273, and that line sits
+-- inside `#ifdef FRAMEWORK_EDITOR`; src/CMakeLists.txt:12 defaults TOGGLE_FRAMEWORK_EDITOR
+-- to OFF, so in the shipped client the field keeps its initialiser (item.h:193 `{ 0 }`)
+-- forever while the Lua binding (luafunctions.cpp:853) is compiled in unconditionally.
+-- A real `item:getServerId()` at 1530 therefore returns 0 for every item.
+--
+-- So 0 is both the honest headless answer and the C++-exact one.  It still reports, once,
+-- because a script that branches on a server id is broken either way and should be told.
 function Item:getServerId()
-    self._reg:report('Item:getServerId', 'no items.otb headless; returning the client id (B3)')
-    return self:getId()
+    self._reg:report('Item:getServerId',
+                     'there is no client->server id map offline (items.otb is not shipped '
+                     .. 'at 1530), and the reference client answers 0 too -- Item::m_serverId '
+                     .. 'is only ever written under #ifdef FRAMEWORK_EDITOR (item.cpp:273), '
+                     .. 'which is OFF by default')
+    return 0
 end
 
 function Item:getName()
@@ -228,11 +245,23 @@ function Item:hasFloorChange()   return false end
 -- thingtype.cpp:340-357 copies m_name into m_market.name only inside `if has_market()`, so
 -- a named item with no market block hands the bot an EMPTY string in the real client.
 -- proto/items.marketName() reproduces exactly that, and items.name() is the raw name.
+--
+-- DECIDED (was a doc/implementation contradiction): `.name` FALLS BACK to items.name(id).
+-- api-game.md sec.4.4 is the authority on the return shape and specifies
+-- `items.marketName(id) or items.name(id) or ('item '..id)`.  This is a KNOWN and
+-- deliberate deviation from thingtype.cpp:340-357, where m_name is copied into
+-- m_market.name only inside `if has_market()` so the live client hands back '' for an
+-- item with no market block.  The deviation is one-directional and safe: `.name` is only
+-- ever read to be lowercased and string-matched (vBot/depositer_config.lua:42,70,
+-- vBot/analyzer.lua:401,438,494,1118,1191), so a real name can only ADD a classification
+-- the live client would have dropped, never mis-classify one.  The C++-exact value stays
+-- available as `.marketName` for anything that needs to tell the two apart.
 function Item:getMarketData()
     local id = self:getId()
     local marketName = flagOf(items.marketName, id, nil)
     return {
-        name             = marketName or '',
+        name             = marketName or flagOf(items.name, id, nil) or ('item ' .. id),
+        marketName       = marketName or '',
         category         = 0,
         requiredLevel    = 0,
         restrictVocation = 0,
@@ -244,6 +273,12 @@ end
 -- ---------------------------------------------------------------------------
 -- inert setters (0 live call sites; must be callable)
 -- ---------------------------------------------------------------------------
+-- Item::getText / setText (luafunctions.cpp:865,867) -- the writable-item text,
+-- Item::m_text.  Nothing on the wire fills it headless (0x96 EditText carries its
+-- own string), so it starts empty and round-trips whatever a script wrote.
+function Item:setText(t) rawset(self, '_itemText', t == nil and '' or tostring(t)) end
+function Item:getText()  return rawget(self, '_itemText') or '' end
+
 local INERT = { 'setCount', 'setTooltip', 'setTier', 'setDescription', 'setShader',
                 'setColor', 'setId', 'setPosition', 'setSubType', 'setDurationTime' }
 for i = 1, #INERT do Item[INERT[i]] = function() return nil end end

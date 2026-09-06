@@ -879,6 +879,13 @@ function bootstrap.start(LC, opts)
                 reg = S.reg, g_game = G.g_game, log = log,
                 cooldown = S.modulesCtl and S.modulesCtl.cooldown,
                 modules = G.modules,
+                -- the imbuement family and onGameEditText are g_game SIGNALS, not
+                -- executor dispatchers: cavebot/imbuing.lua:151 does
+                -- connect(g_game, { onUpdateImbuementTracker = ... }).  The bridge needs
+                -- corelib's own signalcall so a connected slot list dispatches the way
+                -- modules/corelib/util.lua:42-119 does.
+                signalcall = G.signalcall,
+                G = G,
             })
             if not h then error(tostring(cerr), 0) end
             S.callbacks = h
@@ -931,7 +938,24 @@ function bootstrap.status()
     -- NOT `st.callbacks` -- host:status() already uses that name for the COUNT of
     -- sandbox callbacks vBot registered.  This is the bridge's dispatch census.
     st.callbackBridge = S.callbacks and S.callbacks:stats() or nil
+    st.hotkeyList = S.host and S.host:hotkeys() or {}
     return st
+end
+
+--- Every registered hotkey, by key description (blocker B2 diagnostics).
+function bootstrap.hotkeys()
+    if not current or not current.host then return {} end
+    return current.host:hotkeys()
+end
+
+--- Fire a registered hotkey by its key description, e.g. shim.pressHotkey('Ctrl+F1').
+--- There is no keyboard headless, so this is the ONLY way a hotkey or a hotkey-bound
+--- macro switch can ever run; it drives the executor's real onKeyDown/onKeyPress/onKeyUp
+--- path, so everything downstream behaves as if the user had pressed the key.
+--- Returns true when something was bound to the combo, false when nothing was.
+function bootstrap.pressHotkey(desc, opts)
+    if not current or not current.host then return nil, 'not started' end
+    return current.host:pressHotkey(desc, opts)
 end
 
 function bootstrap.handle() return current end

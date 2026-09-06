@@ -542,6 +542,32 @@ function M.build(G, deps)
         }),
     })
 
+    -- game_textmessage.init() (textmessage.lua:204-207) registers ONE display
+    -- callback per message mode with gamelib's own `registerMessageMode`, and
+    -- `gamelib/textmessages.lua:3-8` -- which the shim loads verbatim -- owns
+    -- `g_game.onTextMessage` and `perror`s "Unhandled onTextMessage message mode N"
+    -- for any mode nobody registered.  Since shim/callbacks.lua now dispatches
+    -- onTextMessage onto g_game (game.cpp:273, so that a hand-written
+    -- `connect(g_game, { onTextMessage = f })` works), that perror would fire for
+    -- EVERY server message of the session.  Reproduce the registration instead of
+    -- silencing the diagnostic: one no-op display per mode, which is what the client
+    -- module does minus the drawing.  MessageTypes is a client-module-private table,
+    -- so the keys come from gamelib's MessageModes -- a superset by the handful of
+    -- modes the UI chooses not to draw, which headless is the same no-op either way.
+    if type(G.registerMessageMode) == 'function' and type(G.MessageModes) == 'table' then
+        local shown = function(mode, text)
+            if log and log.debug then log.debug('[message %s] %s', tostring(mode), tostring(text)) end
+        end
+        local seen = {}
+        for _, mode in pairs(G.MessageModes) do
+            if type(mode) == 'number' and not seen[mode] then
+                seen[mode] = true
+                pcall(G.registerMessageMode, mode, shown)
+            end
+        end
+        pcall(G.registerMessageMode, 254, shown)      -- textmessage.lua:199
+    end
+
     -- --------------------------------------------------------- game_interface
     local mapPanel = leaf('game_interface.mapPanel')
     if type(mapPanel) == 'table' and rawget(mapPanel, 'lockVisibleFloor') == nil then

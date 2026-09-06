@@ -454,10 +454,22 @@ function platform.install(G, opts)
     }
     G.g_keyboard = g_keyboard
     G.retranslateKeyComboDesc = platform.retranslateKeyComboDesc
-    -- determineKeyComboDesc is INERT by design: the shim never delivers key events, so
-    -- executor.lua:224,246,258 is unreachable.  It exists so a stray call is a recorded
-    -- no-op rather than a nil-call crash.
+    -- determineKeyComboDesc turns a (keyCode, modifiers) pair into the combo string
+    -- executor.lua:224,246,258 looks up in context._hotkeys.  There is no keyboard
+    -- headless, so a NUMERIC key code is still meaningless and stays a recorded no-op.
+    --
+    -- A STRING argument, however, is the shim's own way in: shim/host.lua:pressHotkey
+    -- passes the key DESCRIPTION where the C++ would pass a code, so the executor's real
+    -- onKeyDown/onKeyPress/onKeyUp path runs unmodified -- macro switches toggle,
+    -- `single` hotkeys fire on the down edge, onKeyDown callbacks see the combo.  The
+    -- string is canonicalised through the same retranslateKeyComboDesc the registration
+    -- side used (functions/main.lua:139), so 'ctrl+f1' finds a hotkey bound as 'Ctrl+F1'.
     G.determineKeyComboDesc = function(code, mods)
+        if type(code) == 'string' and code ~= '' then
+            local okc, canon = pcall(platform.retranslateKeyComboDesc, code)
+            if okc and type(canon) == 'string' and canon ~= '' then return canon end
+            return code
+        end
         rec('determineKeyComboDesc', code, mods)
         return nil
     end

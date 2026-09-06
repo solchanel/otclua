@@ -354,6 +354,17 @@ capture groups, **non-capturing groups `(?:…)`** (`cavebot/cavebot.lua:362`, `
 **alternation of anchored globs** built at runtime in `targetbot/creature.lua:27` /
 `creature_editor.lua:71` (`^name.*$|^other.?$`). No lookaround, no backreferences.
 
+The shipped `shim/regex.lua` also supports **POSIX bracket expressions inside a character class**
+(`[[:alpha:]]`, `[[:digit:]]`, `[[:alnum:]]`, `[[:upper:]]`, `[[:lower:]]`, `[[:space:]]`,
+`[[:blank:]]`, `[[:punct:]]`, `[[:print:]]`, `[[:graph:]]`, `[[:cntrl:]]`, `[[:xdigit:]]`, the
+one-letter `w`/`s`/`d`, and the negated `[[:^name:]]` form). `std::regex` accepts these even under
+the ECMAScript grammar — `[re.grammar]` extends `ClassAtom` with the character-class-name
+production — and the targetbot / analyzer feeds **user-supplied** patterns straight into
+`regexMatch` (`targetbot/creature.lua:62`, `vBot/combo.lua:232`), so a config that used one was
+silently never matching. An unknown class name now reports through `regex.onUnsupported` like any
+other unsupported pattern rather than mis-parsing. A **bare** `[:alpha:]` in single brackets is not
+a POSIX class in any dialect and is reported too.
+
 **Verdict: IMPLEMENT — the largest single item in A3.** Options, in order of preference:
 1. A small pure-Lua ECMAScript-subset regex engine (backtracking; needs `|`, `(?:)`, classes,
    `{n,m}`, anchors, greedy/lazy quantifiers). ~400 lines.

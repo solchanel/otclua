@@ -572,14 +572,20 @@ do
             ]]
             local INVALID = ffi.cast('void*', -1)
             listDirFFI = function(path)
+                -- void*, not LC_WIN32_FIND_DATAA*: the cdef above is a pcall, so
+                -- whichever module declared FindFirstFileA FIRST owns the
+                -- prototype (shim/resources.lua:114 declares the same call with
+                -- its own byte-identical typedef).  void* converts to any
+                -- pointer type, so this works under either declaration.
                 local fd = ffi.new('LC_WIN32_FIND_DATAA')
-                local h = ffi.C.FindFirstFileA(norm(path):gsub('/', '\\') .. '\\*', fd)
+                local fdp = ffi.cast('void*', fd)
+                local h = ffi.C.FindFirstFileA(norm(path):gsub('/', '\\') .. '\\*', fdp)
                 if h == INVALID then return nil, 'FindFirstFileA failed' end
                 local out = {}
                 repeat
                     local n = ffi.string(fd.cFileName)
                     if n ~= '.' and n ~= '..' then out[#out + 1] = n end
-                until ffi.C.FindNextFileA(h, fd) == 0
+                until ffi.C.FindNextFileA(h, fdp) == 0
                 ffi.C.FindClose(h)
                 return out
             end
