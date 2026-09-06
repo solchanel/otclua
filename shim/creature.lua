@@ -23,9 +23,10 @@ complete on its own; `shim/otlua.lua` later loads the upstream files over the sa
 tables, which re-defines them with identical semantics.
 ============================================================================]]
 
-local objects = require('shim.object')
-local posmod  = require('shim.position')
-local sys     = require('lib.sys')
+local objects  = require('shim.object')
+local posmod   = require('shim.position')
+local sys      = require('lib.sys')
+local itemsmod = require('proto.items')
 
 local Creature    = objects.Creature
 local LocalPlayer = objects.LocalPlayer
@@ -55,7 +56,17 @@ local SERVER_BEAT_MS   = 50         -- game.h:533
 local function rec(self)
     local st = self._reg.state
     if self._local then return st.player end
-    return st.creatures[self._id]
+    local r = st.creatures[self._id]
+    if r ~= nil then
+        self._lastRec = r
+        return r
+    end
+    -- The record is gone from state.  The live client's CreaturePtr outlives
+    -- Map::removeThing, so a script that still holds the creature (the argument to
+    -- onCreatureDisappear, above all) keeps reading its last name / outfit / health.
+    -- `g_map.getCreatureById` still answers nil for the id -- that is the half of the
+    -- C++ behaviour Reg:creature() reproduces.
+    return self._lastRec
 end
 Creature._rec = rec
 
@@ -65,7 +76,7 @@ local function crec(self)
     local r = st.creatures[self._id]
     if r then return r end
     if self._local then return st.player end
-    return nil
+    return self._lastRec
 end
 
 -- ---------------------------------------------------------------------------
@@ -141,6 +152,12 @@ function Creature:getPosition()
         -- of the aware range
         local c = crec(self)
         p = c and c.pos
+    end
+    if not p then
+        -- Removed from the map: game/state.lua moved the coordinates to `lastPos` rather
+        -- than erasing them, exactly so the creature handed to onCreatureDisappear can
+        -- still say where it died (targetbot/looting.lua:322 compares its z with ours).
+        p = (r and r.lastPos) or (self._lastRec and self._lastRec.lastPos)
     end
     if not p then return posmod.invalid() end
     return { x = p.x, y = p.y, z = p.z }
@@ -503,6 +520,18 @@ function LocalPlayer:hasEquippedItemId(itemId, tier)
     return false
 end
 
+-- Item::getCount (item.h:96) -- `isStackable() ? m_countOrSubType : 1`.  The wire byte is
+-- CUMULATIVE for stackable OR fluidContainer OR splash (proto/parser.lua:678 writes it for
+-- all three), so summing it raw adds the FLUID SUBTYPE for a vial or a splash instead of 1.
+-- localplayer.cpp:565-569 accumulates getCount(), and vBot/HealBot.lua:39,
+-- vBot/AttackBot.lua:43 and vBot/vlib.lua:829 all treat the result as a supply count.
+local function countOf(it)
+    if not it then return 0 end
+    local okStack, stackable = pcall(itemsmod.isStackable, it.id)
+    if okStack and stackable then return it.count or 1 end
+    return 1
+end
+
 -- LocalPlayer::getInventoryCount (localplayer.cpp:552): the 0xC0 count cache FIRST, then the
 -- 11 equipped slots plus every OPEN container.  `state.inventoryCounts` is keyed
 -- itemId*256 + tier (proto/parser.lua:1531 / API.md).
@@ -521,7 +550,7 @@ function LocalPlayer:getInventoryCount(itemId, tier)
     if inv then
         for slot = 1, 11 do
             local it = inv[slot]
-            if it and it.id == itemId and (it.tier or 0) == tier then total = total + (it.count or 1) end
+            if it and it.id == itemId and (it.tier or 0) == tier then total = total + countOf(it) end
         end
     end
     for _, c in pairs(st.containers) do
@@ -529,7 +558,7 @@ function LocalPlayer:getInventoryCount(itemId, tier)
         if list then
             for i = 1, #list do
                 local it = list[i]
-                if it and it.id == itemId and (it.tier or 0) == tier then total = total + (it.count or 1) end
+                if it and it.id == itemId and (it.tier or 0) == tier then total = total + countOf(it) end
             end
         end
     end

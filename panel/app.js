@@ -1578,7 +1578,7 @@ function AdminUsers() {
               Modal.confirm(grant ? 'Grant remote Lua' : 'Revoke remote Lua',
                 grant
                   ? ('Let ' + u.name + ' run arbitrary Lua in a worker and upload scripts? '
-                     + 'That code runs unsandboxed under the hub's own user account and can '
+                     + 'That code runs unsandboxed under the hub\'s own user account and can '
                      + 'read every stored credential -- it is equivalent to making them an '
                      + 'administrator of this host.')
                   : ('Stop ' + u.name + ' running Lua in a worker and uploading scripts?'),

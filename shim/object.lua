@@ -295,14 +295,26 @@ end
 
 -- The LocalPlayer singleton.  It is ALSO what reg:creature(playerId) returns, because
 -- `spec ~= player` (AttackBot) compares a spectator against `context.player` by identity.
+-- INVARIANT I1, and the one place it used to break.  The wrapper is a SINGLETON for the
+-- life of the registry: it is re-KEYED when the player id changes (login, relog), never
+-- re-minted.  `mods/game_bot/executor.lua` captures `context.player = g_game.getLocalPlayer()`
+-- exactly once at boot and vBot/AttackBot.lua:1233,1317,1477,2543,2966,3050 and
+-- vBot/vlib.lua:671 all test `spec ~= player`; a second wrapper makes the character look
+-- like a hostile spectator to itself.  `_local = true` already routes every getter at
+-- `state.player`, so swapping `_id` in place is safe.
 function Reg:localPlayer()
     local st = self.state
     local id = st.player and st.player.id
-    if self._player and self._playerId == id then return self._player end
-    local w = setmetatable({ _reg = self, _id = id, _local = true }, LocalPlayer)
-    self._player, self._playerId = w, id
-    if id and id ~= 0 then self.creatures[id] = w end
-    return w
+    if not self._player then
+        self._player = setmetatable({ _reg = self, _id = id, _local = true }, LocalPlayer)
+    end
+    if self._playerId ~= id then
+        if self._playerId and self._playerId ~= 0 then self.creatures[self._playerId] = nil end
+        self._player._id = id
+        self._playerId = id
+    end
+    if id and id ~= 0 then self.creatures[id] = self._player end
+    return self._player
 end
 
 -- Choose the most specific class so gamelib's `function Player:isPartyMember()` lands on
@@ -337,6 +349,37 @@ end
 function Reg:creatureRec(rec)
     if type(rec) ~= 'table' then return nil end
     return self:creature(rec.id)
+end
+
+-- Wrap a record that is ALREADY UNLINKED from state (the `creatureDisappear` payload).
+-- `Reg:creature(id)` must keep returning nil for a removed id -- that half matches the
+-- C++, where `g_map.getCreatureById` is a map lookup -- but the CreaturePtr the live
+-- client hands to onCreatureDisappear still answers name / position / outfit / health.
+-- Pinning `_lastRec` reproduces that: shim/creature.lua falls back to it when the live
+-- lookup misses, so a handler sees the creature that just died instead of a blank.
+function Reg:creatureFromRecord(r)
+    if type(r) ~= 'table' or type(r.id) ~= 'number' or r.id == 0 then return nil end
+    local st = self.state
+    if st.player and st.player.id == r.id then return self:localPlayer() end
+    local w = self.creatures[r.id]
+    if w == nil then
+        w = setmetatable({ _reg = self, _id = r.id }, creatureClassFor(r))
+        self.creatures[r.id] = w
+    end
+    w._lastRec = r
+    return w
+end
+
+-- Same idea for a container the parser has already closed (`containerClose`).
+function Reg:containerFromRecord(r)
+    if type(r) ~= 'table' or type(r.id) ~= 'number' then return nil end
+    local w = self.containers[r.id]
+    if w == nil then
+        w = setmetatable({ _reg = self, _id = r.id }, Container)
+        self.containers[r.id] = w
+    end
+    w._lastRec = r
+    return w
 end
 
 function Reg:creatureRecord(id)
@@ -442,13 +485,43 @@ end
 --     { kind = 'container', cid = <container id> }
 --     { kind = 'inventory', slot = <InventorySlot 1..11> }
 --     { kind = 'detached' }
+-- Invariant I3.  The intern key is the PAIR (thing, location), never the thing alone:
+-- one Lua thing table can legitimately be reachable from two addresses at once (a
+-- container's backing `item` field is also a slot entry of its parent), and a single
+-- shared wrapper let the LAST caller rewrite the wire address every EARLIER holder
+-- would report -- and `Item:getPosition()` is where g_game.move / use / useWith /
+-- stashStowItem get their fromPos and stackpos bytes.  Keying on the pair keeps
+-- `reg:item(t, L) == reg:item(t, L)` (all `top ~= ground` needs) while making it
+-- impossible for one holder to corrupt another's packet.
+local function locKey(loc)
+    if type(loc) ~= 'table' then return 'd' end
+    local k = loc.kind
+    if k == 'tile' then
+        local p = loc.pos
+        if not p then return 'd' end
+        return 't' .. p.x .. ',' .. p.y .. ',' .. p.z
+    elseif k == 'container' then
+        return 'c' .. tostring(loc.cid)
+    elseif k == 'inventory' then
+        return 'i' .. tostring(loc.slot)
+    end
+    return 'd'
+end
+objects.locKey = locKey
+
 function Reg:item(thing, loc)
     if type(thing) ~= 'table' then return nil end
-    local w = self.items[thing]
+    loc = loc or { kind = 'detached' }
+    local bucket = self.items[thing]
+    if bucket == nil then bucket = {}; self.items[thing] = bucket end
+    local key = locKey(loc)
+    local w = bucket[key]
     if w == nil then
-        w = setmetatable({ _reg = self, _thing = thing, _loc = loc or { kind = 'detached' } }, Item)
-        self.items[thing] = w
-    elseif loc ~= nil then
+        w = setmetatable({ _reg = self, _thing = thing, _loc = loc }, Item)
+        bucket[key] = w
+    else
+        -- Same address, so the wire bytes cannot change; refresh the slot hint only
+        -- (a container slot the parser has shuffled is re-read live anyway).
         w._loc = loc
     end
     return w

@@ -199,6 +199,17 @@ function state:setTile(pos, tile)
     return tile
 end
 
+-- Clearing a creature's position must not ERASE it.  The live client keeps the
+-- CreaturePtr (and therefore its last m_position) alive after Tile::removeThing, and
+-- vBot's death/loot logic reads that off the creature handed to onCreatureDisappear.
+-- `pos` still goes to nil -- "is this creature on a tile right now" has to keep
+-- answering no, and bot/targetbot + test/bot_m3_target.lua:844 rely on it -- but the
+-- coordinates move to `lastPos` so a holder can still say WHERE it was.
+local function forgetPos(c)
+    if c.pos then c.lastPos = { x = c.pos.x, y = c.pos.y, z = c.pos.z } end
+    c.pos = nil
+end
+
 -- Map::cleanTile -- drop everything the server no longer describes.
 function state:cleanTile(pos)
     local key = tileKey(pos)
@@ -208,7 +219,7 @@ function state:cleanTile(pos)
         local t = tile.things[i]
         if t.kind == 'creature' and t.creatureId then
             local c = self.creatures[t.creatureId]
-            if c and samePos(c.pos, pos) then c.pos = nil end
+            if c and samePos(c.pos, pos) then forgetPos(c) end
         end
     end
     self.map[key] = nil
@@ -321,7 +332,7 @@ function state:_removeAt(tile, idx)
         local c = self.creatures[thing.creatureId]
         -- only clear the position if the creature was still believed to be HERE; a move that
         -- adds first and removes second must not wipe the new position.
-        if c and samePos(c.pos, tile.pos) then c.pos = nil end
+        if c and samePos(c.pos, tile.pos) then forgetPos(c) end
     end
     return thing
 end
@@ -441,7 +452,7 @@ function state:setCentralPosition(pos)
     -- calls Map::removeThing on them); cleanTile already did that for described tiles, this
     -- catches creatures whose tile was never in self.map.
     for _, c in pairs(self.creatures) do
-        if c.pos and not self:isAwareOf(c.pos, self.central) then c.pos = nil end
+        if c.pos and not self:isAwareOf(c.pos, self.central) then forgetPos(c) end
     end
     return #doomed
 end

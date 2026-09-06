@@ -1453,6 +1453,32 @@ end)
 -- It prints its own per-check output; only the totals are folded in here.
 --
 -- It never touches the network and never writes to the user's vBot profile.
+-- test/paneljssuite.lua lexes the panel's JavaScript.  A Lua suite cannot
+-- otherwise see a JS syntax error, and one did ship once: an unescaped
+-- apostrophe inside a single-quoted string made the whole panel render blank
+-- while every test here still passed.
+do
+    local pj = suite('panel JavaScript (test/paneljssuite.lua)')
+    io.write('\n')
+    _G.PANELJS_NO_EXIT = true
+    local okp, resp = pcall(dofile, ROOT .. '/test/paneljssuite.lua')
+    _G.PANELJS_NO_EXIT = nil
+    if not okp then
+        check(false, 'test/paneljssuite.lua raised', tostring(resp))
+    elseif type(resp) ~= 'table' then
+        check(false, 'test/paneljssuite.lua did not return its counters',
+              'got ' .. type(resp))
+    else
+        pj.pass   = pj.pass + (resp.pass or 0)
+        totalPass = totalPass + (resp.pass or 0)
+        for _, m in ipairs(resp.failures or {}) do
+            pj.fail   = pj.fail + 1
+            totalFail = totalFail + 1
+            pj.msgs[#pj.msgs + 1] = m
+        end
+    end
+end
+
 do
     local sb = suite('bot layer (test/botsuite.lua)')
     io.write('\n')

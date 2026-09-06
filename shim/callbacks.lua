@@ -201,9 +201,12 @@ function callbacks.install(LC, cb, deps)
         if c then fire('onCreatureAppear', c) end
     end)
     on('creatureDisappear', function(rec)
-        -- The record is already unlinked from state, so mint the wrapper from the
-        -- record rather than from the id -- the id no longer resolves.
-        local c = rec and (reg.creatures[rec.id] or reg:creatureRec(rec))
+        -- The record is already unlinked from state, so `reg:creature(id)` answers nil
+        -- (which is right: g_map.getCreatureById must too).  Mint / re-key the wrapper
+        -- from the RECORD and pin it, so the handler still sees name, position, outfit
+        -- and health -- exactly what the live client's still-alive CreaturePtr reports,
+        -- and what targetbot/looting.lua:310-331 branches on.
+        local c = rec and reg:creatureFromRecord(rec)
         if c then fire('onCreatureDisappear', c) end
     end)
     on('creatureHealth', function(d)
@@ -244,8 +247,8 @@ function callbacks.install(LC, cb, deps)
     on('containerClose', function(c)
         if not (c and c.id) then return end
         -- The record is gone from state by now, so reg:container(id) returns nil;
-        -- hand over the wrapper we already minted if there is one.
-        local w = reg.containers[c.id] or reg:container(c.id)
+        -- mint / re-key from the record so getName() and getItems() still answer.
+        local w = reg:containerFromRecord(c)
         if w == prevContainer then prevContainer = nil end
         if w then fire('onContainerClose', w) end
     end)
@@ -258,7 +261,12 @@ function callbacks.install(LC, cb, deps)
     on('containerRemoveItem', function(d)
         if not d then return end
         local w = reg:container(d.containerId)
-        if w then fire('onRemoveItem', w, d.slot or 0, nil) end
+        -- Container::onRemoveItem(container, slot, item) -- the C++ passes the item that
+        -- LEFT.  The parser now carries it (proto/parser.lua 0x72); it is already
+        -- unlinked, so the wrapper is minted detached rather than at a slot that now
+        -- addresses somebody else.
+        local it = d.item and reg:item(d.item, { kind = 'detached' })
+        if w then fire('onRemoveItem', w, d.slot or 0, it) end
     end)
     on('containerUpdateItem', function(d)
         if not d then return end

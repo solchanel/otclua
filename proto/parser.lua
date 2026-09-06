@@ -421,6 +421,15 @@ function P:dropCreature(id)
     c.pos = nil
     return c
   end
+  -- Snapshot the last known position BEFORE the removal.  state:removeThing clears
+  -- `c.pos` (game/state.lua:324) so by the time a handler runs the record can no longer
+  -- say where the creature stood -- and vBot's death/loot logic (targetbot/looting.lua:
+  -- 310-331) reads exactly that off the CreaturePtr the live client still holds.  The
+  -- record itself survives the unlink (it is only dropped from state.creatures), so the
+  -- shim can keep answering from it; `lastPos` is the one field the removal would eat.
+  -- Written on a NEW key so `c.pos == nil` after a removal stays true -- bot/targetbot
+  -- and test/bot_m3_target.lua:844 depend on that.
+  if c.pos then c.lastPos = { x = c.pos.x, y = c.pos.y, z = c.pos.z } end
   if st.removeCreature then st:removeCreature(id) else st.creatures[id] = nil end
   self.emit('creatureDisappear', c)
   return c

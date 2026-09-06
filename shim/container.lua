@@ -25,8 +25,17 @@ local posmod  = require('shim.position')
 
 local Container = objects.Container
 
+-- Live first; when the parser has already closed the container, fall back to the record
+-- the `containerClose` payload carried.  In the live client the ContainerPtr handed to
+-- onClose still answers getName()/getItems(), so a handler can still say WHICH bag closed.
+-- `isClosed()` deliberately stays a LIVE test (below) so it never lies.
 local function rec(self)
-    return self._reg.state.containers[self._id]
+    local r = self._reg.state.containers[self._id]
+    if r ~= nil then
+        self._lastRec = r
+        return r
+    end
+    return self._lastRec
 end
 Container._rec = rec
 
@@ -56,7 +65,7 @@ end
 
 -- A container the parser has dropped from state.containers is closed.
 function Container:isClosed()
-    return rec(self) == nil
+    return self._reg.state.containers[self._id] == nil
 end
 
 function Container:hasPages()
