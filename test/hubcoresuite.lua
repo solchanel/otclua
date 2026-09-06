@@ -1435,6 +1435,101 @@ do
     eq(tel:socketCount(), 4, 'another account has its own allowance')
 end
 
+-- WORK ITEM FIX: control/server.lua's `debug` push timer used to gate on
+-- `clientCount > 0`, but the worker's only /ws client under hub supervision
+-- is hub/supervisor.lua's own permanent status-poll control link, so that was
+-- always true and the worker pushed (and permanently instrumented its bot
+-- for) a `debug` snapshot every debugIntervalMs regardless of whether any
+-- panel Debug tab was open anywhere. hub/telemetry.lua is the ONE place that
+-- knows how many real panel sockets currently want an instance's debug
+-- stream, so it must be the one to tell the worker exactly when that count
+-- crosses 0<->1+ -- proven here entirely offline, against a fake `sup` that
+-- just records what it was told, with no worker process involved (that half
+-- is test/controlsuite.lua's "debug event push is gated on an explicit
+-- subscription, not clientCount").
+suite('telemetry / debug.subscribe forwarded to the worker only on a real 0<->1 transition')
+do
+    local sent = {}
+    local fakeSup = {
+        command = function(self, id, cmd, args)
+            sent[#sent + 1] = { id = id, cmd = cmd }
+            return true
+        end,
+        info = function(self, id) return {} end,
+    }
+    local tel = telemetry.new{ sup = fakeSup }
+
+    local function fakeWs(tag)
+        return { user = { userId = tag, userName = tag }, tag = tag,
+                 isOpen = function() return true end,
+                 close = function() end, send = function() return true end }
+    end
+
+    local a, b = fakeWs('a'), fakeWs('b')
+    tel:addSocket(a)
+    tel:addSocket(b)
+
+    tel:setDebugSub(a, 'i1')
+    eq(#sent, 1, 'the FIRST subscriber to an instance sends debug.subscribe')
+    eq(sent[1].id, 'i1', '   naming that instance')
+    eq(sent[1].cmd, 'debug.subscribe', '   the right command')
+
+    tel:setDebugSub(b, 'i1')
+    eq(#sent, 1, 'a SECOND subscriber to the SAME instance sends nothing new')
+
+    tel:setDebugSub(a, nil)
+    eq(#sent, 1, 'the first of two unsubscribing sends nothing (one subscriber remains)')
+
+    tel:setDebugSub(b, nil)
+    eq(#sent, 2, 'the LAST subscriber leaving sends debug.unsubscribe')
+    eq(sent[2].id, 'i1', '   naming that instance')
+    eq(sent[2].cmd, 'debug.unsubscribe', '   the right command')
+
+    -- Subscribing to a DIFFERENT instance is tracked independently.
+    tel:setDebugSub(a, 'i2')
+    eq(#sent, 3, 'subscribing to a different instance sends its own debug.subscribe')
+    eq(sent[3].id, 'i2', '   naming the new instance, not the old one')
+
+    -- A socket that dies (tab closed, browser gone) while still subscribed
+    -- must count as an unsubscribe too -- otherwise the worker is told once
+    -- that it is wanted and never told otherwise.
+    tel:removeSocket(a)
+    eq(#sent, 4, 'a socket dropping while subscribed sends debug.unsubscribe')
+    eq(sent[4].id, 'i2', '   for the instance it was watching')
+    eq(sent[4].cmd, 'debug.unsubscribe', '   the right command')
+
+    -- setSubs (the {type:'subscribe'} logs/chat frame) must never disturb an
+    -- independently-set debug subscription, per WsClient's own contract that
+    -- the two frames are separate.
+    tel:setDebugSub(b, 'i3')
+    eq(#sent, 5, 'b subscribes to i3')
+    tel:setSubs(b, 'i3', nil)
+    eq(#sent, 5, 'setSubs (logs/chat) does not touch the debug subscription')
+    check(tel:subsOf(b) and tel:subsOf(b).debug == 'i3',
+          '   the debug sub survives a setSubs call untouched')
+
+    -- A worker's control link coming up ('running' -- e.g. after a restart,
+    -- whose fresh control/server.lua starts with debugWanted=false and no
+    -- memory of any subscription this hub already holds) re-arms an existing
+    -- subscription instead of leaving the live stream silently stalled.
+    local before = #sent
+    tel:onState('i3', 'running')
+    eq(#sent - before, 1, 'a running transition re-sends debug.subscribe for a still-subscribed instance')
+    eq(sent[#sent].id, 'i3', '   for the right instance')
+    eq(sent[#sent].cmd, 'debug.subscribe', '   the right command')
+
+    -- ...but does nothing for an instance nobody has ever subscribed to.
+    before = #sent
+    tel:onState('i4', 'running')
+    eq(#sent, before, 'a running transition for an unwatched instance sends nothing')
+
+    -- forget() (instance deleted) drops the bookkeeping so a reused id starts clean.
+    tel:forget('i3')
+    before = #sent
+    tel:onState('i3', 'running')
+    eq(#sent, before, 'forget() clears the debug-subscriber count too')
+end
+
 suite('server / a published bind is pinned and strict')
 do
     local hubserver = require('hub.server')

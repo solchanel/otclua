@@ -284,10 +284,18 @@ HttpClient.prototype.del = function (p, o) { return this.request('DELETE', p, nu
  *
  *   client -> hub   {"type":"auth","csrf":"<token>"}          first frame, always
  *                   {"type":"subscribe","logs":<id|null>,"chat":<id|null>}
+ *                   {"type":"subscribeDebug","id":<id|null>}  R3: the instance whose
+ *                                                              Debug tab is open, or null
  *                   {"type":"ping","t":<ms>}
  *   hub -> client   {"event":"ready","data":{...}}            answer to auth
  *                   {"event":"<name>","data":{...}}
  *                   close 4401                                 auth refused
+ *
+ * `subscribeDebug` is a separate frame from `subscribe` (rather than a third
+ * field on it) so the existing log/chat subscription wire shape -- and every
+ * test asserting its exact JSON -- is untouched by R3. Like `subscribe`, it is
+ * re-sent after every successful handshake. ASSUMED shape pending R2 (the hub
+ * side of the debug snapshot/event); see the R3 work item report.
  *
  * States: idle -> connecting -> live -> retry -> down (-> connecting ...)
  */
@@ -319,6 +327,7 @@ function WsClient(opts) {
   this.lastRxAt = 0;
   this.opens = 0;                       // diagnostics for the tests
   this.subs = { logs: null, chat: null };
+  this.debugId = null;                  // R3: instance whose Debug tab is open, or null
   this._retryTimer = null;
   this._authTimer = null;
   this._hbTimer = null;
@@ -408,6 +417,7 @@ WsClient.prototype._open = function () {
       self._clearTimeout(self._authTimer); self._authTimer = null;
       self._startHeartbeat();
       self._resubscribe();
+      self._sendDebugSub();
       self._setStatus('live');
       self.emit('#ready', frame.data || {});
       return;
@@ -480,6 +490,16 @@ WsClient.prototype.subscribe = function (logsId, chatId) {
 };
 WsClient.prototype._resubscribe = function () {
   this._send({ type: 'subscribe', logs: this.subs.logs, chat: this.subs.chat });
+};
+
+/** Follow one instance's debug snapshot stream; null unsubscribes. Separate
+ *  from subscribe()/logs/chat -- see the WsClient doc comment above. */
+WsClient.prototype.subscribeDebug = function (id) {
+  this.debugId = id || null;
+  if (this.authed) this._sendDebugSub();
+};
+WsClient.prototype._sendDebugSub = function () {
+  this._send({ type: 'subscribeDebug', id: this.debugId });
 };
 
 /* =========================== exports ============================= */

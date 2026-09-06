@@ -669,7 +669,7 @@ function ViewInstance(params) {
 
   var tabName = params.tab || readTab(id) || 'overview';
   var TABS = [['overview', 'Overview'], ['bot', 'Bot'], ['config', 'Bot Config'],
-              ['console', 'Console'], ['chat', 'Chat']];
+              ['console', 'Console'], ['debug', 'Debug'], ['chat', 'Chat']];
   var pane = h('div');
   var sub = null;
 
@@ -720,12 +720,14 @@ function ViewInstance(params) {
   }
   setTitle();
 
-  /* only the open tab needs the log / chat firehose */
+  /* only the open tab needs the log / chat firehose, or the debug stream */
   ws.subscribe(tabName === 'console' ? id : null, tabName === 'chat' ? id : null);
+  ws.subscribeDebug(tabName === 'debug' ? id : null);
 
   if (tabName === 'bot') sub = TabBot(id);
   else if (tabName === 'config') sub = TabBotConfig(id);
   else if (tabName === 'console') sub = TabConsole(id);
+  else if (tabName === 'debug') sub = TabDebug(id);
   else if (tabName === 'chat') sub = TabChat(id);
   else sub = TabOverview(id);
   pane.appendChild(sub.el);
@@ -735,7 +737,10 @@ function ViewInstance(params) {
     el: h('div', null, head, tabbar, pane),
     update: function (dirty) { setTitle(); if (sub.update) sub.update(dirty); },
     onEvent: function (ev, data) { setTitle(); if (sub.onEvent) sub.onEvent(ev, data); },
-    destroy: function () { ws.subscribe(null, null); if (sub.destroy) sub.destroy(); }
+    destroy: function () {
+      ws.subscribe(null, null); ws.subscribeDebug(null);
+      if (sub.destroy) sub.destroy();
+    }
   };
 }
 
@@ -1146,6 +1151,331 @@ function TabChat(id) {
         box.appendChild(lineNode(data)); box.scrollTop = box.scrollHeight;
       }
     }
+  };
+}
+
+/* ==================================================================
+   9.1c Debug (R3)
+   ------------------------------------------------------------------
+   'figure out what is happening' for one instance: tick health (a
+   sparkline of the last N tick durations + a per-macro table sortable
+   by error count), network health (with a stale/disconnected warning),
+   a bot-state card per module, and a structured event ring buffer
+   distinct from the plain-text Console log. Fetches GET
+   instances.debug once on open and again on demand, and applies the
+   `debug` WS event while the tab stays mounted -- ViewInstance only
+   calls ws.subscribeDebug(id) while this tab is the open one, so nothing
+   here polls or streams once the operator navigates away.
+   Wire shape: see api.js's `instances.debug` comment. ASSUMED pending
+   R2 -- see this work item's crossFileRequests.
+   ================================================================== */
+
+function agoStr(ms) {
+  if (ms === null || ms === undefined || isNaN(ms) || ms < 0) return '-';
+  var s = Math.round(ms / 1000);
+  if (s < 1) return 'just now';
+  if (s < 60) return s + 's';
+  var m = Math.floor(s / 60), r = s % 60;
+  if (m < 60) return m + 'm ' + r + 's';
+  var hh = Math.floor(m / 60);
+  return hh + 'h ' + (m % 60) + 'm';
+}
+function msFmt(n) { return (n === null || n === undefined || isNaN(n)) ? '-' : num(n) + ' ms'; }
+
+var DEBUG_EVENT_LABEL = {
+  resync: 'resync', reconnect: 'reconnect', macro_error: 'macro error',
+  slow_tick: 'slow tick', stuck: 'stuck cavebot', path_blocked: 'blocked path', info: 'info'
+};
+function eventKindLabel(k) {
+  return DEBUG_EVENT_LABEL[k] || String(k || 'event').replace(/_/g, ' ');
+}
+function eventKindClass(k) {
+  k = String(k || '');
+  if (k.indexOf('error') >= 0) return 'error';
+  if (/resync|reconnect|stuck|blocked|slow/.test(k)) return 'warn';
+  return 'info';
+}
+
+/** Simple vertical-bar sparkline -- no library, mirrors drawSeries()'s canvas
+ *  setup but plots N discrete samples (tick durations) instead of a time
+ *  series, and colours a bar by how it compares to the configured interval /
+ *  the slow-tick threshold rather than by a single series colour. */
+function drawTickBars(canvas, vals, configuredMs, slowMs) {
+  var dpr = window.devicePixelRatio || 1;
+  var w = canvas.clientWidth || 260, hgt = canvas.clientHeight || 60;
+  if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(hgt * dpr)) {
+    canvas.width = Math.round(w * dpr); canvas.height = Math.round(hgt * dpr);
+  }
+  var g = canvas.getContext('2d');
+  if (!g) return;
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, hgt);
+  if (!vals || !vals.length) {
+    g.fillStyle = '#5a6a7c'; g.font = '11px ui-monospace, monospace'; g.textAlign = 'center';
+    g.fillText('collecting…', w / 2, hgt / 2 + 3);
+    return;
+  }
+  var mx = Math.max.apply(null, vals.concat([configuredMs || 0, slowMs || 0, 1])) * 1.15;
+  var n = vals.length, gap = 1;
+  var bw = Math.max(1, w / n - gap);
+  for (var i = 0; i < n; i++) {
+    var v = Math.max(0, vals[i] || 0);
+    var bh = Math.max(1, (v / mx) * (hgt - 4));
+    var x = (w / n) * i;
+    g.fillStyle = (slowMs && v > slowMs) ? '#f0616d' : (v > (configuredMs || 0) * 1.3 ? '#d29922' : '#4c9aff');
+    g.fillRect(x, hgt - bh, bw, bh);
+  }
+  if (configuredMs) {
+    var y = hgt - Math.min(hgt - 2, (configuredMs / mx) * (hgt - 4));
+    g.strokeStyle = 'rgba(255,255,255,.28)'; g.setLineDash([3, 3]); g.lineWidth = 1;
+    g.beginPath(); g.moveTo(0, y + .5); g.lineTo(w, y + .5); g.stroke(); g.setLineDash([]);
+  }
+}
+
+function TabDebug(id) {
+  var snap = null;
+  var lastFetchedAt = 0;
+  var macroSort = { key: 'errorCount', dir: -1 };
+  var knownKinds = ['all'];
+  var loading = false;
+
+  var updatedLbl = h('span.hint', { text: 'never updated' });
+  var liveLbl = h('span.pill.off', null, h('i.dot'), txt('manual only'));
+  var refreshBtn = h('button.btn.sm', { text: 'Refresh' });
+
+  var tickBody = h('div', null, h('div.hint', { text: 'Loading…' }));
+  var netBody = h('div', null, h('div.hint', { text: 'Loading…' }));
+  var botBody = h('div', null, h('div.hint', { text: 'Loading…' }));
+  var evFilter = h('select', null, h('option', { value: 'all', text: 'All kinds' }));
+  var evSummary = h('span.hint', { text: '' });
+  var evBody = h('tbody');
+
+  function debugStat(label, value, cls) {
+    return h('div.stat', null, h('div.k', { text: label }),
+      h('div.v' + (cls ? '.' + cls : ''), { text: value }));
+  }
+  function debugKv(pairs) {
+    var dl = h('dl.kv');
+    pairs.forEach(function (p) { dl.appendChild(h('dt', { text: p[0] })); dl.appendChild(h('dd', { text: p[1] })); });
+    return dl;
+  }
+
+  function setLiveLabel() {
+    var live = ws.status === 'live';
+    clear(liveLbl);
+    liveLbl.className = 'pill ' + (live ? 'on' : 'off');
+    liveLbl.appendChild(h('i.dot')); liveLbl.appendChild(txt(live ? 'live' : 'manual only'));
+  }
+  function refreshUpdatedLabel() {
+    if (!lastFetchedAt) return;
+    var a = agoStr(Date.now() - lastFetchedAt);
+    setText(updatedLbl, 'updated ' + (a === 'just now' ? a : a + ' ago'));
+  }
+  var tickTimer = setInterval(function () { setLiveLabel(); refreshUpdatedLabel(); }, 1000);
+  setLiveLabel();
+
+  function fetchOnce() {
+    if (loading) return;
+    loading = true; refreshBtn.disabled = true;
+    return api.call('instances.debug', { id: id }).then(function (r) {
+      applySnapshot(r);
+    }).catch(function (e) { failed('Debug snapshot', e); })
+      .then(function () { loading = false; refreshBtn.disabled = false; });
+  }
+  refreshBtn.addEventListener('click', fetchOnce);
+
+  function applySnapshot(r) {
+    if (!r) return;
+    snap = r;
+    lastFetchedAt = Date.now();
+    refreshUpdatedLabel();
+    renderTick(); renderNet(); renderBot(); renderEvents();
+  }
+
+  /* ---- tick health + per-macro table ---- */
+
+  function macroCompare(key, dir) {
+    return function (a, b) {
+      var av = a[key], bv = b[key];
+      if (typeof av === 'string' || typeof bv === 'string') {
+        return dir * String(av || '').localeCompare(String(bv || ''));
+      }
+      av = (av === null || av === undefined) ? -Infinity : av;
+      bv = (bv === null || bv === undefined) ? -Infinity : bv;
+      return dir * (av - bv);
+    };
+  }
+  function sortTh(label, key) {
+    var mark = macroSort.key === key ? (macroSort.dir < 0 ? ' ▼' : ' ▲') : '';
+    var th = h('th', { text: label + mark, 'aria-sort': macroSort.key === key ?
+      (macroSort.dir < 0 ? 'descending' : 'ascending') : 'none' });
+    th.style.cursor = 'pointer';
+    th.addEventListener('click', function () {
+      if (macroSort.key === key) macroSort.dir = -macroSort.dir;
+      else { macroSort.key = key; macroSort.dir = key === 'name' ? 1 : -1; }
+      renderTick();
+    });
+    return th;
+  }
+  function macroTable(macros) {
+    var tb = h('tbody');
+    var rows = (macros || []).slice().sort(macroCompare(macroSort.key, macroSort.dir));
+    if (!rows.length) tb.appendChild(h('tr', null, h('td', { colspan: '6' }, emptyBox('No macros reported.'))));
+    rows.forEach(function (m) {
+      tb.appendChild(h('tr' + (m.errorCount ? '.errrow' : ''), null,
+        h('td', { text: m.label || m.name }),
+        h('td', null, h('span.pill.' + (m.on ? 'on' : 'off'), null, h('i.dot'), txt(m.on ? 'on' : 'off'))),
+        h('td.mono', { text: m.lastRanAt ? agoStr(Date.now() - m.lastRanAt) + ' ago' : '-' }),
+        h('td.num', { text: msFmt(m.lastDurationMs) }),
+        h('td.num', { text: num(m.errorCount || 0) }),
+        h('td', { text: m.lastError || '-' })));
+    });
+    var table = h('table.grid-table', null,
+      h('thead', null, h('tr', null,
+        sortTh('Macro', 'name'), sortTh('On', 'on'), sortTh('Last ran', 'lastRanAt'),
+        sortTh('Last duration', 'lastDurationMs'), sortTh('Errors', 'errorCount'),
+        h('th', { text: 'Last error' }))),
+      tb);
+    return h('div.tablewrap', { style: { marginTop: '10px' } }, table);
+  }
+  function renderTick() {
+    var t = (snap && snap.tick) || {};
+    clear(tickBody);
+    var cv = h('canvas.chart', { style: { height: '56px' },
+      'aria-label': 'last ' + ((t.durationsMs || []).length) + ' tick durations' });
+    tickBody.appendChild(h('div', null,
+      h('div.statgrid', null,
+        debugStat('Interval (last / cfg)', msFmt(t.lastMs) + ' / ' + msFmt(t.configuredMs),
+          (t.lastMs && t.configuredMs && t.lastMs > t.configuredMs * 1.5) ? 'neg' : null),
+        debugStat('Avg interval', msFmt(t.avgMs)),
+        debugStat('Slow ticks', num(t.slowCount || 0) +
+          (t.slowThresholdMs ? ' (> ' + msFmt(t.slowThresholdMs) + ')' : ''), t.slowCount ? 'neg' : null)),
+      h('div', { style: { marginTop: '10px' } }, cv),
+      macroTable(t.macros)));
+    drawTickBars(cv, t.durationsMs || [], t.configuredMs, t.slowThresholdMs);
+  }
+
+  /* ---- network health ---- */
+
+  function renderNet() {
+    var n = (snap && snap.network) || {};
+    var stale = n.connected === false ||
+      (n.lastPacketAgeMs != null && n.staleThresholdMs && n.lastPacketAgeMs > n.staleThresholdMs);
+    clear(netBody);
+    netBody.appendChild(h('div', null,
+      h('div.statgrid', null,
+        debugStat('Connected', n.connected ? 'yes' : 'no', n.connected ? 'pos' : 'neg'),
+        debugStat('Ping', msFmt(n.pingMs)),
+        debugStat('Packets in / out', num(n.packetsIn || 0) + ' / ' + num(n.packetsOut || 0)),
+        debugStat('Reconnects', num(n.reconnects || 0)),
+        debugStat('Last packet', n.lastPacketAgeMs != null ? agoStr(n.lastPacketAgeMs) + ' ago' : '-',
+          stale ? 'neg' : null)),
+      stale ? h('div.warnbox', { style: { marginTop: '10px' },
+        text: 'No packets for ' + agoStr(n.lastPacketAgeMs) + ' (threshold ' + msFmt(n.staleThresholdMs) +
+              ') — the worker looks disconnected or stalled.' }) : null,
+      n.lastError ? h('div.hint', { style: { marginTop: '6px' }, text: 'Last error: ' + n.lastError }) : null));
+  }
+
+  /* ---- per-module bot state ---- */
+
+  function renderBot() {
+    var b = (snap && snap.bot) || {};
+    var p = (snap && snap.path) || {};
+    var cave = b.cavebot || {}, targ = b.targetbot || {}, heal = b.healbot || {},
+        atk = b.attackbot || {}, stan = b.stances || {};
+    var stuckMs = cave.stuckSince ? (Date.now() - cave.stuckSince) : 0;
+    var stuck = !!cave.stuckSince && stuckMs > (cave.stuckThresholdMs || 8000);
+    function lastActionKv(m) {
+      return debugKv([['Last action', m.lastAction || '-'],
+        ['When', m.lastActionAt ? agoStr(Date.now() - m.lastActionAt) + ' ago' : '-']]);
+    }
+    clear(botBody);
+    botBody.appendChild(h('div.grid.c3', null,
+      h('div.card' + (stuck ? '.warn' : ''), null, h('h3', { text: 'CaveBot' }),
+        debugKv([
+          ['Waypoint', cave.waypointLabel ? cave.waypointLabel +
+            (cave.waypointCount ? ' (' + cave.waypointIndex + '/' + cave.waypointCount + ')' : '') : '-'],
+          ['Path', p.blocked ? 'blocked' :
+            (p.lengthTiles !== undefined && p.lengthTiles !== null
+              ? p.lengthTiles + ' tile(s), computed ' + agoStr(Date.now() - (p.lastComputedAt || 0)) + ' ago'
+              : '-')]
+        ]),
+        stuck ? h('div.warnbox', { style: { marginTop: '8px' },
+          text: 'Stuck for ' + agoStr(stuckMs) + ' — no waypoint progress past the ' +
+                msFmt(cave.stuckThresholdMs) + ' threshold.' }) : null),
+      h('div.card', null, h('h3', { text: 'TargetBot' }),
+        debugKv([['Candidate', targ.candidate || '-'], ['Target', targ.target || '-'],
+                 ['Looting', targ.lootingState || '-']])),
+      h('div.card', null, h('h3', { text: 'HealBot' }), lastActionKv(heal)),
+      h('div.card', null, h('h3', { text: 'AttackBot' }), lastActionKv(atk)),
+      h('div.card', null, h('h3', { text: 'Stances' }), lastActionKv(stan))
+    ));
+  }
+
+  /* ---- structured event log ---- */
+
+  function syncKindOptions(events) {
+    var kinds = ['all'];
+    events.forEach(function (e) { if (kinds.indexOf(e.kind) < 0) kinds.push(e.kind); });
+    if (kinds.join(',') === knownKinds.join(',')) return;
+    knownKinds = kinds;
+    var cur = evFilter.value || 'all';
+    clear(evFilter);
+    kinds.forEach(function (k) {
+      evFilter.appendChild(h('option', { value: k, text: k === 'all' ? 'All kinds' : eventKindLabel(k) }));
+    });
+    evFilter.value = kinds.indexOf(cur) >= 0 ? cur : 'all';
+  }
+  function renderEvents() {
+    var events = (snap && snap.events) || [];
+    syncKindOptions(events);
+    var counts = {};
+    events.forEach(function (e) { counts[e.kind] = (counts[e.kind] || 0) + 1; });
+    var parts = Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a]; })
+      .map(function (k) { var n = counts[k]; return n + ' ' + eventKindLabel(k) + (n === 1 ? '' : 's'); });
+    setText(evSummary, events.length ? (events.length + ' events — ' + parts.join(', ')) : 'no events yet');
+
+    var filt = evFilter.value === 'all' ? events : events.filter(function (e) { return e.kind === evFilter.value; });
+    clear(evBody);
+    var shown = filt.slice().reverse().slice(0, 300);   // newest first
+    if (!shown.length) {
+      evBody.appendChild(h('tr', null, h('td', { colspan: '3' }, emptyBox('No events match this filter.'))));
+      return;
+    }
+    shown.forEach(function (e) {
+      evBody.appendChild(h('tr', null,
+        h('td.mono', { text: clockOf(e.tMs) }),
+        h('td', null, h('span.tag.evk-' + eventKindClass(e.kind), { text: eventKindLabel(e.kind) })),
+        h('td', { text: e.detail || '' })));
+    });
+  }
+  evFilter.addEventListener('change', renderEvents);
+
+  var el = h('div', null,
+    h('div.row', { style: { marginBottom: '10px' } },
+      h('span.hint', { text: 'Debug: tick health, network health, per-module bot state and a structured event log.' }),
+      h('span.spacer'), liveLbl, updatedLbl, refreshBtn),
+    h('div.card', null, h('h3', { text: 'Tick health' }), tickBody),
+    h('div.card', null, h('h3', { text: 'Network health' }), netBody),
+    botBody,
+    h('div.card', null,
+      h('div.row', null, h('h3', { text: 'Event log', style: { margin: '0' } }), h('span.spacer'),
+        evSummary, h('div', { style: { width: '160px', flex: '0 0 auto' } }, evFilter)),
+      h('div.tablewrap', { style: { marginTop: '8px', maxHeight: '360px', overflowY: 'auto' } },
+        h('table.grid-table', null,
+          h('thead', null, h('tr', null, h('th', { text: 'Time' }), h('th', { text: 'Kind' }),
+            h('th', { text: 'Detail' }))),
+          evBody)))
+  );
+
+  fetchOnce();
+
+  return {
+    el: el,
+    onEvent: function (ev, data) {
+      if (ev === 'debug' && data && data.id === id) applySnapshot(data);
+    },
+    destroy: function () { clearInterval(tickTimer); }
   };
 }
 

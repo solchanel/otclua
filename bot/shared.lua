@@ -339,12 +339,35 @@ function S:say(words)
     return snd:talk(1, 0, '', words, 0)
 end
 
---- castSpellAt(words, pos) -- talkSpell(text, SpellAimCursor = 2, pos).
-function S:sayAt(words, pos)
+--- castAtPos(text, position, delay) -- AB:1556-1569.  castSpellAt with the SAME
+--- SpellCastTable dedup/delay bookkeeping S:cast (vlib.lua:258-277) already has, so
+--- CustomCooldown mode works identically for aimed casts as it does for plain ones (in
+--- ServerCooldown mode executeCooldown is 30, which is < 100, so this degenerates to a
+--- plain aimed send -- the common case is unaffected).  `delayMs` nil or < 100 is a
+--- plain, un-deduped send: every pre-existing call site that never passed a third
+--- argument keeps behaving exactly as before.
+--- NOTE: like S:cast, the timestamp is refreshed ONLY by the own-talk echo (never here),
+--- so a stale/un-echoed cast keeps re-firing every tick until the echo lands or the
+--- delay elapses -- reproduced verbatim.
+function S:sayAt(words, pos, delayMs)
     local snd = self.sender
     if not snd or type(words) ~= 'string' or #words == 0 then return nil, 'no sender' end
-    self.sends = self.sends + 1
-    return snd:talkSpell(words, 2, pos)
+    local w = words:lower()
+    if not delayMs or delayMs < 100 then
+        self.sends = self.sends + 1
+        return snd:talkSpell(w, 2, pos)
+    end
+    local rec = self.castTable[w]
+    if not rec or rec.d ~= delayMs then
+        self.castTable[w] = { t = self:now() - delayMs, d = delayMs }
+        self.sends = self.sends + 1
+        return snd:talkSpell(w, 2, pos)
+    end
+    if (self:now() - rec.t) > rec.d then
+        self.sends = self.sends + 1
+        return snd:talkSpell(w, 2, pos)
+    end
+    return nil
 end
 
 --- cast(text, delayMs) -- vlib.lua:258-277.  delay nil or < 100 => a plain say.

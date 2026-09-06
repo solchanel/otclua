@@ -390,6 +390,151 @@ function cavebotDiffNeedsExec(oldArr, newArr) {
 var LOGS = {}, CHAT = {}, HIST = {};
 DB.instances.forEach(function (i) { LOGS[i.id] = []; CHAT[i.id] = []; HIST[i.id] = []; });
 
+/* -------------------- debug snapshot (R3) ------------------------- */
+/* Per-instance tick/network/bot/path health plus a structured event ring
+   buffer. Mirrors panel/api.js's `instances.debug` comment -- ASSUMED
+   shape pending R2 (the hub side, built concurrently); see the R3 work
+   item report's crossFileRequests if this needs reconciling. */
+
+var TICK_CONFIGURED_MS = 50;
+var TICK_SLOW_MS = 180;
+var STALE_THRESHOLD_MS = 8000;
+var STUCK_THRESHOLD_MS = 12000;
+var DEBUG_EVENT_CAP = 300;
+var TICK_RING_CAP = 60;
+
+var DEBUG = {};        // instanceId -> mutable debug state
+var macroDebug = {};   // instanceId -> macroName -> {lastRanAt,lastDurationMs,errorCount,lastError}
+
+function blankDebug() {
+  return {
+    tick: { durations: [], slowCount: 0 },
+    network: { pingMs: null, packetsIn: 0, packetsOut: 0, lastError: null, lastPacketAt: now() },
+    bot: {
+      cavebot: { stuckSince: null },
+      targetbot: { candidate: null, target: null, lootingState: 'idle' },
+      healbot: { lastAction: null, lastActionAt: null },
+      attackbot: { lastAction: null, lastActionAt: null },
+      stances: { lastAction: null, lastActionAt: null }
+    },
+    path: { lastComputedAt: now(), lengthTiles: null, blocked: false },
+    events: []
+  };
+}
+function pushDebugEvent(inst, kind, detail, tMs) {
+  var d = DEBUG[inst.id]; if (!d) return;
+  d.events.push({ tMs: tMs || now(), kind: kind, detail: detail || '' });
+  if (d.events.length > DEBUG_EVENT_CAP) d.events.shift();
+}
+function avgOf(arr) {
+  if (!arr || !arr.length) return null;
+  var s = 0;
+  for (var i = 0; i < arr.length; i++) s += arr[i];
+  return s / arr.length;
+}
+function snapshotFor(i) {
+  var d = DEBUG[i.id] || (DEBUG[i.id] = blankDebug());
+  var L = i.live;
+  var macros = (macroState[i.id] || []).map(function (m) {
+    var md = (macroDebug[i.id] || {})[m.name] || {};
+    return { name: m.name, label: m.label, on: m.on,
+             lastRanAt: md.lastRanAt || null,
+             lastDurationMs: md.lastDurationMs !== undefined ? md.lastDurationMs : null,
+             errorCount: md.errorCount || 0, lastError: md.lastError || null };
+  });
+  var connected = i.state === 'online';
+  var lastPacketAgeMs = d.network.lastPacketAt != null ? now() - d.network.lastPacketAt : null;
+  return {
+    id: i.id,
+    generatedAt: now(),
+    tick: {
+      configuredMs: TICK_CONFIGURED_MS,
+      lastMs: d.tick.durations.length ? d.tick.durations[d.tick.durations.length - 1] : null,
+      avgMs: avgOf(d.tick.durations),
+      durationsMs: d.tick.durations.slice(),
+      slowThresholdMs: TICK_SLOW_MS,
+      slowCount: d.tick.slowCount,
+      macros: macros
+    },
+    network: {
+      connected: connected,
+      pingMs: connected ? d.network.pingMs : null,
+      packetsIn: d.network.packetsIn,
+      packetsOut: d.network.packetsOut,
+      reconnects: L.reconnects || 0,
+      lastError: d.network.lastError,
+      lastPacketAt: d.network.lastPacketAt,
+      lastPacketAgeMs: lastPacketAgeMs,
+      staleThresholdMs: STALE_THRESHOLD_MS
+    },
+    bot: {
+      cavebot: { enabled: i.botEnabled, waypointIndex: L.waypointIndex, waypointCount: L.waypointCount,
+                 waypointLabel: L.waypoint, stuckSince: d.bot.cavebot.stuckSince,
+                 stuckThresholdMs: STUCK_THRESHOLD_MS },
+      targetbot: { enabled: i.botEnabled, candidate: d.bot.targetbot.candidate,
+                   target: d.bot.targetbot.target, lootingState: d.bot.targetbot.lootingState },
+      healbot: { enabled: i.botEnabled, lastAction: d.bot.healbot.lastAction,
+                 lastActionAt: d.bot.healbot.lastActionAt },
+      attackbot: { enabled: i.botEnabled, lastAction: d.bot.attackbot.lastAction,
+                   lastActionAt: d.bot.attackbot.lastActionAt },
+      stances: { enabled: i.botEnabled, lastAction: d.bot.stances.lastAction,
+                 lastActionAt: d.bot.stances.lastActionAt }
+    },
+    path: { lastComputedAt: d.path.lastComputedAt, lengthTiles: d.path.lengthTiles,
+            blocked: d.path.blocked, sourcePos: L.pos, targetPos: null },
+    events: d.events.slice(-200)
+  };
+}
+
+DB.instances.forEach(function (i) { DEBUG[i.id] = blankDebug(); macroDebug[i.id] = {}; });
+
+/* seed enough backlog that the Debug tab is not empty on first open, and --
+   on the demo instance -- reproduce exactly the scenario this work item's
+   own spec names as an example ("3 resyncs, 1 macro error") so the event
+   log's count-by-kind summary is not a coincidence. */
+(function seedDebug() {
+  DB.instances.forEach(function (i) {
+    var d = DEBUG[i.id];
+    for (var k = 0; k < TICK_RING_CAP; k++) {
+      var v = Math.round(TICK_CONFIGURED_MS * (0.7 + rnd() * 0.6));
+      if (rnd() < 0.04) { v = TICK_CONFIGURED_MS + ri(TICK_SLOW_MS, TICK_SLOW_MS * 2); d.tick.slowCount++; }
+      d.tick.durations.push(v);
+    }
+    d.network.pingMs = ri(30, 140);
+    d.network.packetsIn = ri(2000, 40000);
+    d.network.packetsOut = Math.round(d.network.packetsIn * 0.4);
+    var online = i.state === 'online';
+    d.bot.targetbot.candidate = online ? pick(MONSTERS) : null;
+    d.bot.targetbot.target = i.live.target;
+    d.bot.targetbot.lootingState = online ? pick(['idle', 'looking', 'opening', 'looting']) : 'idle';
+    d.bot.healbot.lastAction = online ? 'exura vita' : null;
+    d.bot.healbot.lastActionAt = online ? now() - ri(500, 30000) : null;
+    d.bot.attackbot.lastAction = online ? 'exori mas res' : null;
+    d.bot.attackbot.lastActionAt = online ? now() - ri(500, 30000) : null;
+    d.bot.stances.lastAction = online ? pick(STANCES_CATALOG).words : null;
+    d.bot.stances.lastActionAt = online ? now() - ri(2000, 60000) : null;
+    d.path.lengthTiles = online ? ri(3, 40) : null;
+    d.path.lastComputedAt = now() - ri(200, 4000);
+    for (var e = 6; e >= 1; e--) pushDebugEvent(i, 'info', 'cavebot: waypoint advanced', now() - e * 40000);
+  });
+
+  var demo = DB.instances[0];
+  if (demo) {
+    pushDebugEvent(demo, 'reconnect', 'proxy ' + (demo.proxyLabel || 'direct') +
+      ': connection reset, reconnecting', now() - 620000);
+    pushDebugEvent(demo, 'resync', 'worker resync after reconnect (attempt 1)', now() - 610000);
+    pushDebugEvent(demo, 'resync', 'worker resync after reconnect (attempt 2)', now() - 480000);
+    pushDebugEvent(demo, 'resync', 'container/creature state resynced after a missed packet', now() - 195000);
+    pushDebugEvent(demo, 'macro_error',
+      "equip_manager:14: attempt to index a nil value (field 'slot')", now() - 90000);
+    macroDebug[demo.id].equip_manager = {
+      lastRanAt: now() - 90000, lastDurationMs: 4, errorCount: 3,
+      lastError: "equip_manager:14: attempt to index a nil value (field 'slot')"
+    };
+    (macroState[demo.id] || []).forEach(function (m) { if (m.name === 'equip_manager') m.on = false; });
+  }
+})();
+
 /* seed 60 minutes of history and a bit of log/chat backlog */
 (function seedHistory() {
   DB.instances.forEach(function (i) {
@@ -632,6 +777,68 @@ function tick() {
       pushLog(i, 'error', 'proxy ' + (i.proxyLabel || 'direct') + ': connect failed (ETIMEDOUT), retry #' + L.reconnects);
       if (visible(i)) emit('error', { id: i.id, message: 'proxy connect failed (ETIMEDOUT)' });
     }
+
+    /* ---- debug snapshot (R3): tick/network/bot/path/events ---- */
+    var d = DEBUG[i.id];
+    if (d) {
+      var v = Math.round(TICK_CONFIGURED_MS * (0.75 + rnd() * 0.5));
+      if (i.state === 'online' && rnd() < 0.03) v = TICK_CONFIGURED_MS + ri(TICK_SLOW_MS, TICK_SLOW_MS * 2);
+      d.tick.durations.push(v);
+      if (d.tick.durations.length > TICK_RING_CAP) d.tick.durations.shift();
+      if (v > TICK_SLOW_MS) {
+        d.tick.slowCount++;
+        pushDebugEvent(i, 'slow_tick', 'tick took ' + v + ' ms (> ' + TICK_SLOW_MS + ' ms threshold)');
+      }
+
+      if (i.state === 'online' && rnd() < 0.25) {
+        var on = (macroState[i.id] || []).filter(function (m) { return m.on; });
+        if (on.length) {
+          var mm = pick(on);
+          var stats = macroDebug[i.id] || (macroDebug[i.id] = {});
+          var ms2 = stats[mm.name] || (stats[mm.name] = { errorCount: 0 });
+          ms2.lastRanAt = now();
+          ms2.lastDurationMs = ri(1, 12);
+          if (rnd() < 0.015) {
+            ms2.errorCount = (ms2.errorCount || 0) + 1;
+            ms2.lastError = mm.name + ': ' + pick([
+              'attempt to call a nil value (method \'process\')',
+              "attempt to index a nil value (field 'slot')", 'stack overflow']);
+            pushDebugEvent(i, 'macro_error', ms2.lastError);
+          }
+        }
+      }
+
+      d.network.pingMs = clamp(Math.round((d.network.pingMs || 60) + ri(-8, 8)), 15, 400);
+      d.network.packetsIn += ri(3, 30);
+      d.network.packetsOut += ri(1, 10);
+      if (i.state === 'online') d.network.lastPacketAt = now();
+      /* an 'error' instance's packets deliberately stop refreshing here, so its
+         Debug tab demonstrates the stale/disconnected warning without a click. */
+      if (i.state === 'error' && rnd() < 0.15) d.network.lastError = 'read timeout (ETIMEDOUT)';
+      if (i.state === 'online' && rnd() < 0.01) pushDebugEvent(i, 'reconnect', 'connection reset, reconnecting');
+      if (i.state === 'online' && rnd() < 0.012) pushDebugEvent(i, 'resync', 'worker resync after reconnect');
+
+      if (i.state === 'online' && i.botEnabled) {
+        if (!d.bot.cavebot.stuckSince && rnd() < 0.01) {
+          d.bot.cavebot.stuckSince = now();
+          pushDebugEvent(i, 'stuck', 'cavebot has not advanced its waypoint');
+        } else if (d.bot.cavebot.stuckSince && rnd() < 0.15) {
+          d.bot.cavebot.stuckSince = null;
+        }
+        d.bot.targetbot.candidate = L.target || (rnd() < 0.2 ? pick(MONSTERS) : d.bot.targetbot.candidate);
+        d.bot.targetbot.target = L.target;
+        if (rnd() < 0.1) d.bot.targetbot.lootingState = pick(['idle', 'looking', 'opening', 'looting']);
+        if (rnd() < 0.08) { d.bot.healbot.lastAction = pick(['exura vita', 'exura gran', 'mana potion']); d.bot.healbot.lastActionAt = now(); }
+        if (rnd() < 0.08 && L.target) { d.bot.attackbot.lastAction = pick(['exori mas res', 'exori gran mas nia', 'GFB rune']); d.bot.attackbot.lastActionAt = now(); }
+        if (rnd() < 0.04) { d.bot.stances.lastAction = pick(STANCES_CATALOG).words; d.bot.stances.lastActionAt = now(); }
+        d.path.lengthTiles = L.target ? ri(1, 10) : ri(2, 40);
+        d.path.blocked = rnd() < 0.03;
+        if (d.path.blocked) pushDebugEvent(i, 'path_blocked', 'no walkable tile toward the next waypoint');
+        d.path.lastComputedAt = now();
+      }
+
+      if (visible(i)) emitTo('debug', i.id, 'debug', snapshotFor(i));
+    }
   });
 }
 
@@ -839,6 +1046,7 @@ var ROUTES = {
   inst.autoRelogin = a.autoRelogin !== false;
   DB.instances.push(inst);
   LOGS[inst.id] = []; CHAT[inst.id] = []; HIST[inst.id] = [];
+  DEBUG[inst.id] = blankDebug(); macroDebug[inst.id] = {};
   macroState[inst.id] = MACROS.map(function (m) { return { name: m.name, label: m.label, on: false }; });
   audit('instance.create', ch.name, 'ok', '');
   emit('instance', { id: inst.id, instance: pubInstance(inst) });
@@ -1001,6 +1209,14 @@ var ROUTES = {
   CHAT[i.id].push(m);
   emitTo('chat', i.id, 'chat', m);
   return {};
+},
+
+/* ---- debug (R3) ---- */
+
+'GET /api/instances/:id/debug': function (c) {
+  needAuth();
+  var i = findInstance(c.params.id);
+  return snapshotFor(i);
 },
 
 /* ---- bot config (CONFIGAPI.md) ---- */
@@ -1488,7 +1704,7 @@ function FakeWebSocket(url) {
   this.readyState = 0;                 // CONNECTING
   this.onopen = this.onmessage = this.onclose = this.onerror = null;
   this._ready = false;
-  this._subs = { logs: null, chat: null };
+  this._subs = { logs: null, chat: null, debug: null };
   sockets.push(this);
   soon(function () {
     if (self.readyState !== 0) return;
@@ -1511,7 +1727,8 @@ FakeWebSocket.prototype.send = function (raw) {
     return;
   }
   if (!this._ready) return;
-  if (f.type === 'subscribe') { this._subs = { logs: f.logs || null, chat: f.chat || null }; return; }
+  if (f.type === 'subscribe') { this._subs.logs = f.logs || null; this._subs.chat = f.chat || null; return; }
+  if (f.type === 'subscribeDebug') { this._subs.debug = f.id || null; return; }
   if (f.type === 'ping') { this._push('pong', { t: f.t }); return; }
 };
 FakeWebSocket.prototype._push = function (ev, data) {

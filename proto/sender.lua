@@ -65,6 +65,8 @@ local OP = {
     ChangeFightModes      = 0xA0,
     Attack                = 0xA1,
     Follow                = 0xA2,
+    InviteToParty         = 0xA3,
+    JoinParty             = 0xA4,
     CancelAttackAndFollow = 0xBE,
     SeekInContainer       = 0xCC,
     RequestOutfit         = 0xD2,
@@ -79,6 +81,10 @@ local OP = {
     ApplyImbuement        = 0xD5,
     ClearImbuement        = 0xD6,
     CloseImbuingWindow    = 0xD7,
+    -- supply stash (protocolcodes.h:268 -- ClientUseStash shares one opcode with withdraw)
+    UseStash              = 0x28,
+    -- exaltation forge (protocolcodes.h:362)
+    ForgeEnter            = 0xBF,
 }
 sender.OPCODES = OP
 
@@ -498,6 +504,23 @@ function sender:cancelAttackAndFollow()
     return self:_send(op(self, OP.CancelAttackAndFollow))
 end
 
+-- ---------------------------------------------------------------------------
+-- party
+-- ---------------------------------------------------------------------------
+-- 0xA3 / 0xA4: u32 creatureId (protocolgamesend.cpp:843-857 sendInviteToParty /
+-- sendJoinParty -- identical one-field bodies, only the opcode differs).
+function sender:partyInvite(creatureId)
+    local w = op(self, OP.InviteToParty)
+    w:u32(math.floor(creatureId or 0))
+    return self:_send(w)
+end
+
+function sender:partyJoin(creatureId)
+    local w = op(self, OP.JoinParty)
+    w:u32(math.floor(creatureId or 0))
+    return self:_send(w)
+end
+
 -- 0xA0: GameTacticsWithoutFightMode (136) is ON at 1530, so the fightMode byte is OMITTED.
 -- Field order and values (protocolgamesend.cpp:800-822):
 --   u8 chaseMode  0 DontChase, 1 ChaseOpponent
@@ -676,6 +699,55 @@ end
 function sender:imbuementDurations(isOpen)
     local w = op(self, OP.ImbuementDurations)
     w:u8(boolByte(isOpen))
+    return self:_send(w)
+end
+
+-- ---------------------------------------------------------------------------
+-- exaltation forge  (Otc::ForgeAction_t, const.h:531-537)
+-- ---------------------------------------------------------------------------
+-- 0xBF: u8 actionType; ONLY when actionType is FUSION(0) or TRANSFER(1)
+-- (protocolgamesend.cpp:1670-1684 sendForgeRequest) does the body grow: u8 convergence,
+-- u16 firstItemId, u8 firstItemTier, u16 secondItemId, u8 improveChance, u8 tierLoss.
+-- vBot's own forge waypoint (cavebot/route_tools.lua) only ever calls this with
+-- DUST2SLIVER(2) or INCREASELIMIT(4), which take NO extra fields -- the trailing
+-- parameters exist purely so a future FUSION/TRANSFER caller has the real signature.
+sender.FORGE_ACTION = { FUSION = 0, TRANSFER = 1, DUST2SLIVER = 2, SLIVER2CORE = 3,
+                        INCREASELIMIT = 4 }
+function sender:forgeRequest(actionType, convergence, firstItemId, firstItemTier,
+                             secondItemId, improveChance, tierLoss)
+    local at = u8arg(actionType)
+    local w = op(self, OP.ForgeEnter)
+    w:u8(at)
+    if at == sender.FORGE_ACTION.FUSION or at == sender.FORGE_ACTION.TRANSFER then
+        w:u8(boolByte(convergence))
+        w:u16(math.floor(firstItemId or 0))
+        w:u8(u8arg(firstItemTier))
+        w:u16(math.floor(secondItemId or 0))
+        w:u8(boolByte(improveChance))
+        w:u8(boolByte(tierLoss))
+    end
+    return self:_send(w)
+end
+
+-- ---------------------------------------------------------------------------
+-- supply stash  (Otc::Supply_Stash_Actions_t, const.h:889-895)
+-- ---------------------------------------------------------------------------
+-- 0x28 (shares ClientUseStash with sendStashWithdraw): u8 action, Position(5), u16
+-- itemId, u8 stackpos, then a u32 count -- but ONLY when action is STOW_ITEM(0)
+-- (protocolgamesend.cpp:1815-1828 sendStashStow).  depositor.lua's "stow all of this
+-- item type" call always passes action=2 (STOW_STACK), which is why route_tools'/
+-- depositor's own call sites pass count=0 -- it is never written to the wire for them.
+sender.STASH_ACTION = { STOW_ITEM = 0, STOW_CONTAINER = 1, STOW_STACK = 2, WITHDRAW = 3 }
+function sender:stashStowItem(pos, itemId, count, stackpos, action)
+    local act = u8arg(action)
+    local w = op(self, OP.UseStash)
+    w:u8(act)
+    writePos(w, pos)
+    w:u16(math.floor(itemId or 0))
+    w:u8(u8arg(stackpos))
+    if act == sender.STASH_ACTION.STOW_ITEM then
+        w:u32(math.floor(count or 0))
+    end
     return self:_send(w)
 end
 

@@ -431,6 +431,26 @@ function WS:close()
     pcall(function() self.sock:close() end)
 end
 
+-- WORK ITEM FIX: how many events of `name` this socket has seen so far, and
+-- whether that count stays put for a whole window -- the shape a "this must
+-- NOT be pushed" assertion needs, which waitUntil (built for "this DOES
+-- eventually become true") cannot express.
+local function countEvents(c, name)
+    c:drain()
+    local n = 0
+    for i = 1, #c.events do if c.events[i].event == name then n = n + 1 end end
+    return n
+end
+
+local function staysAtCount(c, name, expectN, ms)
+    local t0 = sys.nowMs()
+    while sys.nowMs() - t0 < ms do
+        if countEvents(c, name) ~= expectN then return false end
+        sys.sleepMs(20)
+    end
+    return countEvents(c, name) == expectN
+end
+
 -- ===========================================================================
 -- 1. offline unit checks -- no process, no socket
 -- ===========================================================================
@@ -467,15 +487,16 @@ runSuite('parsers and name rules (pure)', function()
     truthy(not control._constantTimeEqual(nil, 'abcdef'), 'nil never matches')
 
     -- The command table is exactly PANEL.md's list, plus CONFIGAPI.md's three
-    -- config.* commands (work item N2).
+    -- config.* commands (work item N2), plus R2's debug.snapshot.
     local want = { 'status', 'login', 'logout', 'relogin', 'bot.enable', 'bot.setCavebot',
                    'bot.setTargetbot', 'bot.listConfigs', 'bot.reload', 'script.put',
                    'script.remove', 'script.list', 'exec', 'stats', 'shutdown',
-                   'bot.setMacro', 'say', 'config.get', 'config.set', 'config.list' }
+                   'bot.setMacro', 'say', 'config.get', 'config.set', 'config.list',
+                   'debug.snapshot' }
     local have = {}
     for _, n2 in ipairs(commands.names()) do have[n2] = true end
     for _, n2 in ipairs(want) do truthy(have[n2], 'command ' .. n2 .. ' exists') end
-    eq(#commands.names(), #want, 'no commands beyond PANEL.md\'s + CONFIGAPI.md\'s list')
+    eq(#commands.names(), #want, 'no commands beyond PANEL.md\'s + CONFIGAPI.md\'s + R2\'s list')
 end)
 
 -- ===========================================================================
@@ -917,6 +938,48 @@ runSuite('WebSocket: requests, pushes and the 1 Hz status', function()
     c:close()
     W:pump()
     truthy(W.h:isRunning(), 'the worker survived the WebSocket session')
+end)
+
+-- WORK ITEM FIX: the `debug` event push used to be gated on `S.clientCount >
+-- 0`, but the worker's ONLY /ws client under hub supervision is
+-- hub/supervisor.lua's own permanent, always-open status-poll control link
+-- (_connectControl), which never sends anything resembling a debug
+-- subscription. So this connection below -- one raw socket that connects and
+-- only ever asks for `status`, exactly like that control link -- proves the
+-- bug directly: before the fix it received an unsolicited `debug` event
+-- within one debugIntervalMs of connecting; after the fix it must not.
+runSuite('debug event push is gated on an explicit subscription, not clientCount', function()
+    local c = assert(wsConnect(W))
+    truthy(c:waitHandshake(6000) and c.status == 101,
+           'connected exactly like the supervisor\'s bare status-poll link')
+    truthy(c:waitEvent('status', 4000), 'the usual immediate status push still arrives')
+
+    truthy(staysAtCount(c, 'debug', 0, 3500),
+           'no debug event is pushed to a connection that never subscribed ' ..
+           '(waited past debugIntervalMs while clientCount stayed > 0)')
+
+    -- hub/telemetry.lua forwards exactly this command over the control link
+    -- the moment a panel socket's Debug tab opens for this instance.
+    local sub = c:call(300, 'debug.subscribe')
+    truthy(sub, 'debug.subscribe answers')
+    eq(sub and sub.ok, true, 'and succeeds')
+    eq(sub and sub.result and sub.result.debugWanted, true,
+       'reporting the flag is now on')
+
+    truthy(c:waitEvent('debug', 4000), 'a debug event now arrives once subscribed')
+
+    local unsub = c:call(301, 'debug.unsubscribe')
+    eq(unsub and unsub.ok, true, 'debug.unsubscribe succeeds')
+    eq(unsub and unsub.result and unsub.result.debugWanted, false,
+       'reporting the flag is off again')
+
+    local before = countEvents(c, 'debug')
+    truthy(staysAtCount(c, 'debug', before, 3500),
+           'no further debug events arrive after unsubscribing')
+
+    c:close()
+    W:pump()
+    truthy(W.h:isRunning(), 'the worker survived the debug-subscription probe')
 end)
 
 runSuite('shutdown ends the process cleanly', function()
@@ -2137,6 +2200,200 @@ runSuite('config.get/set/list against a running bot instance (in-process, all si
         end
         truthy(sawNewBody, 'the new function body is really in effect after the exec-asserted write')
     end
+
+    b:stop()
+    removeN2Profile(dir)
+end)
+
+-- ===========================================================================
+-- work item R2: debug.snapshot -- real numbers, not placeholders, from a
+-- running bot.  In-process (like the N2 suite above it) rather than a spawned
+-- worker, because it needs a CONTROLLED clock: bot/init.lua's macro jitter
+-- (0-100ms) plus each module's own period means a handful of real-time
+-- `b:tick()` calls in a tight loop cannot reliably clear that threshold, so
+-- this drives the bot's `opts.clock` deterministically instead of racing the
+-- wall clock -- the numbers debug.snapshot reports are still the REAL ones
+-- bot/init.lua/bot/path.lua/bot/walker.lua computed, just on a clock this
+-- suite gets to advance on purpose.
+-- ===========================================================================
+runSuite('debug.snapshot -- real, non-placeholder numbers from a running bot (in-process)', function()
+    local dir = buildN2Profile()
+
+    local function fakeSender()
+        local calls = {}
+        local S = { calls = calls }
+        return setmetatable(S, { __index = function(_, k)
+            return function(...) calls[#calls + 1] = { method = k, ... }; return true end
+        end })
+    end
+
+    local fakeNow = 1000000.0
+    local function clock() return fakeNow end
+
+    local LC = { log = require('lib.log'), sys = sys, sched = require('lib.sched'),
+                events = require('lib.events').new(), config = { dryRun = true, bot = true } }
+    LC.state = require('game.state').new()
+    -- A FEW tiles off the fixture route's first waypoint (1000,1000,7), so
+    -- CaveBot's `goto` really has to call path:getPath rather than finding
+    -- itself already there.
+    LC.state.player.pos = { x = 990, y = 995, z = 7 }
+    LC.state.player.health, LC.state.player.maxHealth = 100, 100
+    LC.state.player.mana, LC.state.player.maxMana     = 100, 100
+    LC.sender = fakeSender()
+
+    local botmod = require('bot.init')
+    local ok, b = pcall(botmod.new, LC, { profileDir = dir, vprofile = 1,
+                                          readOnlyProfile = true, clock = clock })
+    truthy(ok, 'a bot builds on the R2 scratch profile', tostring(b))
+    if not ok then removeN2Profile(dir); return end
+    LC.bot = b
+    b.inGame = true                 -- the HealBot / AttackBot death+offline gate
+    b:wireModules{}
+    b:start()
+
+    local ctx = { LC = LC, server = { instanceName = 'r2', startedMs = sys.nowMs() } }
+    local function call(cmd, args) return commands.dispatch(ctx, cmd, args) end
+
+    local okc = call('bot.setCavebot', { name = 'testroute' })
+    local okt = call('bot.setTargetbot', { name = 'testtargets' })
+    truthy(okc, 'the fixture cavebot route selects')
+    truthy(okt, 'the fixture targetbot config selects')
+
+    -- Prime the instrumentation ONCE before driving ticks: debug.snapshot wraps
+    -- bot.tick/_invoke/path.getPath THE FIRST TIME it is called (see
+    -- control/commands.lua's botRecorder), so its own very first call can only
+    -- see data recorded AFTER that point -- exactly like a worker's first
+    -- `debug` broadcast after `bot.enable` would.  Priming here means the real
+    -- assertions below are against ticks that were actually observed, not an
+    -- artifact of when instrumentation happened to switch on.
+    call('debug.snapshot')
+
+    -- Drive 80 ticks, 20ms of simulated time apart (1.6s): comfortably past
+    -- every macro's period + the 0-100ms registration jitter, so every one of
+    -- BOT.md's macros (healbot x4, attackbot, stances, targetbot, cavebot x2)
+    -- has really run by the end, not just been due.
+    local function ticks(n)
+        for _ = 1, n do fakeNow = fakeNow + 20; b:tick() end
+    end
+    ticks(80)
+
+    local ok1, snap1 = call('debug.snapshot')
+    truthy(ok1, 'debug.snapshot succeeds while the bot is running', tostring(snap1))
+    truthy(type(snap1) == 'table', 'and returns a table')
+
+    -- ---- tick: real numbers, not zeros pretending to be real ----------
+    eq(snap1.tick.intervalMs, b.tickMs, "tick.intervalMs is the bot's own tickMs, not a guess")
+    truthy(type(snap1.tick.lastTickMs) == 'number' and snap1.tick.lastTickMs > 1000000,
+           'tick.lastTickMs is the real simulated clock value, not nil or 0')
+    truthy(type(snap1.tick.lastTickDurationMs) == 'number' and snap1.tick.lastTickDurationMs >= 0,
+           'tick.lastTickDurationMs is a real measured duration')
+    truthy(type(snap1.tick.avgTickDurationMs) == 'number' and snap1.tick.avgTickDurationMs >= 0,
+           'tick.avgTickDurationMs is a real running average')
+    truthy(snap1.tick.macroCount >= 9,
+           ('macroCount is real: BOT.md lists 9 (got %s)'):format(tostring(snap1.tick.macroCount)))
+    eq(#snap1.tick.macros, snap1.tick.macroCount, 'the macros array has exactly macroCount rows')
+
+    local anyRan, allLabelled = false, true
+    for _, m in ipairs(snap1.tick.macros) do
+        if type(m.lastRanMs) == 'number' then anyRan = true end
+        if type(m.name) ~= 'string' or #m.name == 0 then allLabelled = false end
+    end
+    truthy(anyRan, 'after 80 driven ticks, at least one macro has a real lastRanMs')
+    truthy(allLabelled, 'every macro row is labelled -- named or by call site, never blank')
+
+    -- ---- a deliberately broken test macro: a real error, a real event -----
+    b:macro(50, function() error('debug-test-boom') end)
+    ticks(10)
+    local ok2, snap2 = call('debug.snapshot')
+    truthy(ok2, 'debug.snapshot still succeeds after a macro throws')
+    local sawBrokenMacro, sawErrorEvent = false, false
+    for _, m in ipairs(snap2.tick.macros) do
+        if type(m.lastError) == 'string' and m.lastError:find('debug-test-boom', 1, true) then
+            sawBrokenMacro = true
+            truthy((m.errorCount or 0) > 0, "the broken macro's errorCount is real, not zero")
+        end
+    end
+    for _, e in ipairs(snap2.events) do
+        if e.kind == 'macro_error' and type(e.detail) == 'table'
+           and tostring(e.detail.error or ''):find('debug-test-boom', 1, true) then
+            sawErrorEvent = true
+        end
+    end
+    truthy(sawBrokenMacro, "the broken macro's own error text reaches debug.snapshot")
+    truthy(sawErrorEvent, 'and a real macroError event lands in the ring buffer')
+
+    -- ---- a walker resync: a real event, off the ACTUAL shared walker ------
+    truthy(b.walker ~= nil, 'the shared walker exists (BOT.md: ONE walker for cavebot+targetbot)')
+    local resyncsBefore = b.walker.stats.resyncs or 0
+    b.walker:resyncToServer('debug-test-resync')
+    eq(b.walker.stats.resyncs, resyncsBefore + 1, 'the walker really counted its own resync')
+    local ok3, snap3 = call('debug.snapshot')
+    truthy(ok3, 'debug.snapshot succeeds after a resync')
+    local sawResync = false
+    for _, e in ipairs(snap3.events) do
+        if e.kind == 'resync' and type(e.detail) == 'table' and e.detail.why == 'debug-test-resync' then
+            sawResync = true
+        end
+    end
+    truthy(sawResync, "the resync reaches the event ring buffer with the walker's real reason")
+
+    -- ---- network: honestly empty with no transport at all (--dry-run) -----
+    eq(snap1.network.connected, false, 'network.connected is honestly false with no transport')
+    eq(snap1.network.reconnects, 0, 'network.reconnects is 0, not fabricated, with no transport')
+    eq(snap1.network.packetsIn, 0, 'network.packetsIn is 0, not fabricated, with no transport')
+
+    -- ---- bot.*: real module state, not canned strings ----------------------
+    truthy(snap1.bot.cavebot ~= nil, 'cavebot debug block is present once a route is selected')
+    eq(snap1.bot.cavebot.config, 'testroute', 'cavebot.config names the real selected route')
+    truthy(type(snap1.bot.cavebot.waypointCount) == 'number' and snap1.bot.cavebot.waypointCount > 0,
+           'cavebot.waypointCount is real (' .. tostring(snap1.bot.cavebot.waypointCount) .. ')')
+    truthy(type(snap1.bot.cavebot.stuckSince) == 'number' and snap1.bot.cavebot.stuckSince >= 0,
+           'cavebot.stuckSince is a real, non-negative ms figure')
+    truthy(snap1.bot.targetbot ~= nil, 'targetbot debug block is present')
+    eq(snap1.bot.targetbot.config, 'testtargets', 'targetbot.config names the real selected config')
+    truthy(type(snap1.bot.targetbot.candidateCount) == 'number',
+           'targetbot.candidateCount is a real number, not nil')
+    truthy(snap1.bot.targetbot.looting ~= nil and type(snap1.bot.targetbot.looting.queueLength) == 'number',
+           'targetbot.looting.queueLength is real, from bot/loot.lua\'s own snapshot')
+    truthy(snap1.bot.healbot ~= nil and snap1.bot.healbot.on == true,
+           'healbot debug block reflects the real (enabled) profile')
+    truthy(snap1.bot.attackbot ~= nil and snap1.bot.attackbot.on == true,
+           'attackbot debug block reflects the real (enabled) profile')
+    truthy(snap1.bot.stances ~= nil and type(snap1.bot.stances.activeStanceIds) == 'table',
+           'stances debug block is present with a real (possibly empty) id list')
+
+    -- ---- path: a real search really happened during those 80 ticks --------
+    truthy(snap1.path.lastFindMs ~= nil, 'a real pathfind happened during the driven ticks')
+    truthy(type(snap1.path.lastFindDurationMs) == 'number' and snap1.path.lastFindDurationMs >= 0,
+           'path.lastFindDurationMs is a real measured duration')
+    truthy(snap1.path.lastFindResult == 'ok' or snap1.path.lastFindResult == 'nopath'
+           or snap1.path.lastFindResult == 'timeout',
+           'path.lastFindResult is one of the documented values, not nil',
+           tostring(snap1.path.lastFindResult))
+
+    -- ---- a config.set fires a real configReload debug event ---------------
+    local okg, r1 = call('config.get', { kind = 'healbot' })
+    truthy(okg, 'config.get healbot for the reload-event check')
+    local oks, sres = call('config.set', { kind = 'healbot', data = r1.data })
+    truthy(oks, 'config.set healbot is accepted', tostring(sres))
+    local ok4, snap4 = call('debug.snapshot')
+    truthy(ok4, 'debug.snapshot succeeds after a config.set')
+    local sawReload = false
+    for _, e in ipairs(snap4.events) do
+        if e.kind == 'config_reload' and type(e.detail) == 'table' and e.detail.kind == 'healbot' then
+            sawReload = true
+        end
+    end
+    truthy(sawReload, 'config.set healbot produced a real configReload debug event')
+
+    -- ---- the ring buffer is really capped, and keeps the newest entries ----
+    ctx.server.debugEventsMax = 3
+    for i = 1, 10 do commands.pushDebugEvent(ctx, 'synthetic', { i = i }) end
+    local ok5, snap5 = call('debug.snapshot')
+    truthy(ok5, 'debug.snapshot succeeds with a tiny events cap')
+    eq(#snap5.events, 3, 'the ring buffer is really capped at debugEventsMax')
+    eq(snap5.events[#snap5.events].detail.i, 10, 'and keeps the NEWEST entries, not the oldest')
+    eq(snap5.events[1].detail.i, 8, 'the oldest of the three survivors is exactly #8')
 
     b:stop()
     removeN2Profile(dir)

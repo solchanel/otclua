@@ -58,8 +58,8 @@ its copy in the same callback.
 
 commands  status login logout relogin bot.enable bot.setCavebot bot.setTargetbot
           bot.listConfigs bot.reload script.put script.remove script.list exec
-          stats shutdown
-events    status stats log chat loginState gameStart gameEnd death error
+          stats debug.snapshot shutdown
+events    status stats debug log chat loginState gameStart gameEnd death error
 
 ================================================================================
 LIFECYCLE
@@ -1109,6 +1109,168 @@ local function flattenLive(data)
 end
 Sup.flattenLive = flattenLive
 
+-- ---------------------------------------------------------------------------
+-- work item R2's debug.snapshot -> the shape panel/app.js's Debug tab (work
+-- item R3, already built) assumes -- see panel/api.js's `instances.debug`
+-- comment and panel/rpc.js's WsClient#subscribeDebug doc comment, both marked
+-- "ASSUMED shape pending R2".  This is exactly `flattenLive` above's job for
+-- status/stats, for the same reason: "the worker answers with its own natural
+-- shape ... and hub/supervisor.lua's flattenLive() folds that into the flat
+-- shape the panel draws. That translation happens once, in the hub." R2's
+-- shape is control/commands.lua's own documented contract (BOT.md-adjacent,
+-- not this file's to redefine); this only RENAMES/reshapes it for the one
+-- consumer that assumed something else before R2 existed to ask.
+--
+-- Known, deliberate simplifications where the two sides disagree on MEANING,
+-- not just spelling (see this work item's crossFileRequests for the fuller
+-- account):
+--   * R3's `stuckSince` is a TIMESTAMP (`Date.now() - stuckSince`); R2's is
+--     already a DURATION ("ms since the waypoint index last advanced").
+--     Converted here as `generatedAt - stuckSince` so panel/app.js's existing
+--     arithmetic keeps working unmodified.
+--   * R3 wants `network.staleThresholdMs`, a concept R2 has no configured
+--     value for; STALE_THRESHOLD_MS below is this file's own reasonable
+--     constant, not read from anywhere upstream.
+--   * every event's `detail` is rendered as a plain DOM text node in
+--     panel/app.js (`h('td', {text: e.detail})`), so a structured R2 detail
+--     table is compacted into one readable string here rather than handed
+--     over as an object (which would render as "[object Object]").
+--   * CLOCK DOMAIN (found and fixed during this integration pass, not part of
+--     either R2's or R3's original design note above): every "moment" field
+--     control/commands.lua reports (`macro.lastRanMs`, `heal/atk/stances
+--     .last{Cast,Fired}Ms`, `path.lastFindMs`, each event's `tMs`, and the
+--     `generatedAt`/`tMs` the snapshot is stamped with) comes from
+--     `sys.nowMs()`, which lib/sys.lua documents as "monotonic milliseconds
+--     since the first call" -- i.e. since THAT WORKER PROCESS started, not
+--     Unix epoch.  panel/app.js's TabDebug (R3) was built assuming these are
+--     epoch ms and compares them straight against the browser's `Date.now()`
+--     (`agoStr(Date.now() - m.lastRanAt)`, `new Date(e.tMs)` in `clockOf`,
+--     etc.) -- with the raw worker value passed through, a macro that ran one
+--     tick ago would render as having last run decades ago.  Fixed the same
+--     way hub/storage.lua already anchors its own wall-clock estimate: at
+--     flatten time we know both the worker's monotonic "now"
+--     (`data.tMs`) and the hub's own wall-clock "now" (`os.time()*1000`), so
+--     `EPOCH_OFFSET_MS = wallNow - data.tMs` converts any other moment from
+--     that same snapshot into an epoch-comparable value with one addition.
+--     Duration fields (`lastDurationMs`, `lastPacketAgeMs`, tick
+--     `durationsMs`, etc.) are NOT touched -- a difference of two
+--     monotonic moments is already a correct duration regardless of epoch.
+local STALE_THRESHOLD_MS = 5000
+
+local function describeDetail(detail)
+  if type(detail) ~= 'table' then return tostring(detail or '') end
+  local parts = {}
+  for k, v in pairs(detail) do
+    if type(v) ~= 'table' then parts[#parts + 1] = tostring(k) .. '=' .. tostring(v) end
+  end
+  table.sort(parts)
+  return table.concat(parts, ' ')
+end
+
+--- Convert one worker-monotonic "moment" (as produced by `sys.nowMs()` inside
+--- control/commands.lua) into an epoch-ms value comparable to a browser's
+--- `Date.now()`, using the per-snapshot offset computed in `flattenDebug`.
+--- `nil` in, `nil` out, so an absent timestamp still renders as "-" instead
+--- of becoming a bogus `offset`.
+local function toEpochMs(momentMs, offset)
+  if momentMs == nil then return nil end
+  return momentMs + offset
+end
+
+local function flattenDebugEvents(events, offset)
+  local out = {}
+  for i = 1, #(events or {}) do
+    local e = events[i]
+    out[i] = { tMs = toEpochMs(e.tMs, offset), kind = e.kind, detail = describeDetail(e.detail) }
+  end
+  return out
+end
+
+local function flattenDebugTick(t, offset)
+  t = t or {}
+  local macros = {}
+  for i, m in ipairs(t.macros or {}) do
+    macros[i] = { name = m.name, label = m.name, on = m.enabled,
+                  lastRanAt = toEpochMs(m.lastRanMs, offset), lastDurationMs = m.lastDurationMs,
+                  errorCount = m.errorCount, lastError = m.lastError }
+  end
+  return { configuredMs = t.intervalMs, lastMs = t.lastTickDurationMs, avgMs = t.avgTickDurationMs,
+           durationsMs = t.durationsMs or {}, slowThresholdMs = t.slowThresholdMs,
+           slowCount = t.slowTicks, macros = macros }
+end
+
+local function flattenDebugNetwork(n)
+  n = n or {}
+  return { connected = n.connected, pingMs = n.ping, packetsIn = n.packetsIn, packetsOut = n.packetsOut,
+           bytesIn = n.bytesIn, bytesOut = n.bytesOut, reconnects = n.reconnects,
+           lastError = n.lastDesyncOrError, lastPacketAgeMs = n.lastPacketAgeMs,
+           staleThresholdMs = STALE_THRESHOLD_MS }
+end
+
+--- `generatedAt` here is the already-converted EPOCH ms of the snapshot
+--- (`flattenDebug`'s `wallNow`), so `cave.stuckSince` -- a DURATION on the
+--- wire ("ms since the waypoint index last advanced") -- becomes
+--- `wallNow - duration`, an epoch moment panel/app.js can diff against its
+--- own `Date.now()` directly, exactly like every other `*At` field here.
+local function flattenDebugBot(b, generatedAt, offset)
+  b = b or {}
+  local cave, targ, heal, atk, stan = b.cavebot, b.targetbot, b.healbot, b.attackbot, b.stances
+  local out = {}
+  if cave then
+    out.cavebot = {
+      enabled = cave.on, waypointIndex = cave.waypointIndex, waypointCount = cave.waypointCount,
+      waypointLabel = cave.currentAction,
+      stuckSince = (cave.stuckSince and generatedAt) and (generatedAt - cave.stuckSince) or nil,
+      stuckThresholdMs = cave.stuckThresholdMs,
+    }
+  end
+  if targ then
+    local n = tonumber(targ.candidateCount) or 0
+    out.targetbot = {
+      enabled = targ.on, candidate = n .. ' candidate' .. (n == 1 and '' or 's'),
+      target = targ.target and targ.target.name or nil,
+      lootingState = targ.looting and targ.looting.state or nil,
+    }
+  end
+  if heal then out.healbot = { enabled = heal.on, lastAction = heal.lastRuleFired, lastActionAt = toEpochMs(heal.lastCastMs, offset) } end
+  if atk  then out.attackbot = { enabled = atk.on, lastAction = atk.lastSpell, lastActionAt = toEpochMs(atk.lastFiredMs, offset) } end
+  if stan then
+    local ids = stan.activeStanceIds or {}
+    out.stances = { enabled = stan.on, lastActionAt = toEpochMs(stan.lastCastMs, offset),
+                    lastAction = #ids == 0 and 'none' or (#ids .. ' active stance' .. (#ids == 1 and '' or 's')) }
+  end
+  return out
+end
+
+local function flattenDebugPath(p, offset)
+  p = p or {}
+  return { lastComputedAt = toEpochMs(p.lastFindMs, offset), lengthTiles = p.lastFindTileCount,
+           blocked = (p.lastFindResult == 'nopath' or p.lastFindResult == 'timeout') }
+end
+
+--- data = control/commands.lua's `debug.snapshot` result, exactly as the
+--- worker answered it (or as hub/api.lua's on-demand route received it).
+--- instanceId is the HUB's id (a hub/model.lua row id), which the worker has
+--- no way to know about itself.
+local function flattenDebug(data, instanceId)
+  data = type(data) == 'table' and data or {}
+  local wallNow = os.time() * 1000
+  -- offset from the WORKER's monotonic clock to the HUB's wall clock, valid
+  -- for every "moment" field on THIS snapshot (see the clock-domain note
+  -- above `STALE_THRESHOLD_MS`). 0 when the worker never stamped a `tMs`
+  -- (an empty/placeholder snapshot) so toEpochMs's nil-in/nil-out still holds.
+  local offset = data.tMs and (wallNow - data.tMs) or 0
+  return {
+    id = instanceId, generatedAt = wallNow,
+    tick = flattenDebugTick(data.tick, offset),
+    network = flattenDebugNetwork(data.network),
+    bot = flattenDebugBot(data.bot, wallNow, offset),
+    path = flattenDebugPath(data.path, offset),
+    events = flattenDebugEvents(data.events, offset),
+  }
+end
+Sup.flattenDebug = flattenDebug
+
 function Sup:_event(w, event, data)
   data = type(data) == 'table' and data or {}
   if event == 'log' then
@@ -1142,6 +1304,9 @@ function Sup:_event(w, event, data)
     for k, v in pairs(flat) do w.live[k] = v end
     w.live.id = w.id
     data = flat                      -- the panel gets the flat shape too
+  end
+  if event == 'debug' then
+    data = flattenDebug(data, w.id)  -- work item R2 -> R3's assumed shape
   end
   if event == 'gameStart' then
     if w.state ~= 'online' then w.onlineAt = nowMs() end
@@ -1314,6 +1479,15 @@ function Sup:command(id, cmd, args, cb, timeoutMs)
     return nil, 'the worker is not running'
   end
   return w.ctl:send(cmd, args or {}, cb, timeoutMs or self.commandTimeoutMs)
+end
+
+--- work item R2: a fresh, on-demand `debug.snapshot` from the running worker --
+--- the same thing hub/telemetry.lua receives PUSHED every debugIntervalMs, but
+--- pulled once, right now, for hub/api.lua's GET /api/instances/:id/debug.
+--- Plain sugar over :command -- kept here (not inlined in hub/api.lua) so a
+--- caller that only has a Sup handle (a test, say) can ask the same way.
+function Sup:debugSnapshot(id, cb, timeoutMs)
+  return self:command(id, 'debug.snapshot', {}, cb, timeoutMs)
 end
 
 function Sup:live(id)

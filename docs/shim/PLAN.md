@@ -525,13 +525,13 @@ them is how you introduce drift.
 | G1 | no attack/follow target tracked | cache the id in `shim/game.lua`, clear on `attackCancel` |
 | G2 | no RTT | `LC.state.ping` already exists in `main.lua:455` — expose it |
 | ~~G3~~ **CLOSED** | opcode 0xB7 parsed into `state.unjustified` | before the packet arrives the three `*Remaining` fields answer **255**, not 0 — see COMPAT.md §4 divergence 4 |
-| G4 | `parser.lua:909` discards the supply-stash byte | store it |
+| ~~G4~~ **CLOSED** | ~~`parser.lua:909` discards the supply-stash byte~~ | **DONE** (R1) — stored on `state.player.supplyStashAvailable` |
 | ~~**G5**~~ **CLOSED** | per-thing event emitted | from `state:addThing` / `state:_removeAt`, gated by `enableTileThingLuaCallback` — required by `BotServer.lua:221` |
 | G6 | remote `getVocation()` | return 0 |
-| G7 | party mana (0x8B) | return 100 |
+| G7 | party mana (0x8B) — no genuine byte exists at 1530 (verified R1) | return 100 |
 | ~~G8~~ **CLOSED** | imbuement | B2 closed; senders and parsers both exist |
-| G9 | party invite/join builders | add to `proto/sender.lua` |
-| G10 | `stashStowItem` (0x28) | add to `proto/sender.lua` |
+| ~~G9~~ **CLOSED** | party invite/join builders | **DONE** (R1) — added to `proto/sender.lua` |
+| ~~G10~~ **CLOSED** | `stashStowItem` (0x28) | **DONE** (R1) — added to `proto/sender.lua` |
 
 ---
 

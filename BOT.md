@@ -446,3 +446,48 @@ behaviour-test pass, in parallel. This integration pass reconciled and re-ran al
   `main.lua --selftest` 2772/0, the six `shim_*_suite.lua` 1574/0, `test/fakeserver.lua` 37/0,
   `test/replay.lua` 4 captures/0 failures, `tools/vbot_compat_check.lua` against `scratch-profile/`
   36/0 — identical on Windows and Debian/WSL in every case.
+
+### 17. `debug.snapshot` — a control command for the panel's Debug console (2026-09-06)
+
+A new worker control command, `control/commands.lua`, built for a panel Debug tab (`panel/app.js`'s
+`TabDebug`) that shows tick health, per-macro run/error counts, network health, per-module bot
+state and a structured event log. Nothing in `bot/*.lua` was changed to support it: every number
+comes from either a field a module already maintained (`bot/init.lua`'s per-macro `runs`/`errors`/
+`lastExecution`/`site`, each module's own `:status()`) or from wrapping an existing method **from
+outside**, on the instance, via a metatable-aware monkeypatch confined to `control/commands.lua`
+(tick timing wraps `Bot:tick`, per-macro timing/errors wraps `Bot:_invoke`, path-search timing
+wraps `bot/path.lua`'s shared `getPath`).
+
+```
+debug.snapshot {}
+  -> { tMs, tick: {intervalMs, lastTickMs, lastTickDurationMs, avgTickDurationMs, slowTicks,
+                   slowThresholdMs, durationsMs, macroCount, macros:[{name, enabled, lastRanMs,
+                   lastDurationMs, errorCount, lastError}]},
+       network: {connected, ping, lastPacketAgeMs, packetsIn, packetsOut, bytesIn, bytesOut,
+                 reconnects, lastDesyncOrError},
+       bot: {cavebot, targetbot, healbot, attackbot, stances},   -- each module's own status shape
+       path: {lastFindMs, lastFindDurationMs, lastFindResult, lastFindTileCount},
+       events: [{tMs, kind, detail}] }   -- ring buffer, capped (debugEventsMax, default 200)
+```
+
+`control/server.lua` pushes a `debug` event on a timer (`debugIntervalMs`, default 2000 ms)
+alongside the existing 1 Hz `status` / 5 s `stats` pushes. Event `kind`s: `resync`, `walk_cancel`,
+`macro_error`, `slow_tick`, `stuck`, `path_blocked`, `reconnect`, `config_reload`,
+`module_enable`, `module_disable`.
+
+**CLOCK DOMAIN — read this before trusting a `*Ms`/`*At` field's absolute value.** Every "moment"
+field this command reports (`macro.lastRanMs`, `heal/atk/stances.last{Cast,Fired}Ms`,
+`path.lastFindMs`, each event's `tMs`, and `tMs` itself) comes from `sys.nowMs()`
+(`lib/sys.lua`): **monotonic milliseconds since that worker process started**, not Unix epoch.
+A *duration* derived from two such moments (`lastTickDurationMs`, `lastPacketAgeMs`, a tick's
+`durationsMs` samples) is correct as-is. But an absolute moment is only meaningful to a consumer
+in the SAME process — `hub/supervisor.lua`'s `flattenDebug()` is where this gets converted to an
+epoch-comparable value for the panel (see PANEL.md); a caller reading the RAW worker answer
+directly (as `test/controlsuite.lua`'s in-process assertions do) must do its own conversion before
+comparing a moment field against a wall clock.
+
+Proven end to end against the real hub HTTP API (real hub, real `luajit main.lua --dry-run`
+worker spawned under it, a real broken macro registered over `POST /api/instances/:id/exec`,
+pulled back over the real `GET /api/instances/:id/debug`): the macro's `errorCount`/`lastError`
+and a `macro_error` event both showed up with the real induced error text, on both Windows and
+Debian/WSL. See PANEL.md for the hub-side wiring this command feeds.

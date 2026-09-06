@@ -35,8 +35,20 @@ config.* section for which is which).
                  `{event, data}` objects at any time.
   GET  /health   `{ok:true, instance, uptimeMs}` -- still authenticated.
 
-Events pushed on /ws: `status` (1 Hz), `stats` (every statsIntervalMs), `log`,
-`chat`, `loginState`, `gameStart`, `gameEnd`, `death`, `error`.
+`debug.subscribe` / `debug.unsubscribe` (WORK ITEM FIX, no args, `{debugWanted}`
+result): answered directly by Server:handleRequest, never reaching
+control/commands.lua's dispatch table -- the explicit "someone actually wants
+debug" signal the `debug` push below is gated on. hub/telemetry.lua sends
+these over the control link on a real 0<->1+ transition of panel-side
+Debug-tab subscribers for this instance; nothing else should call them.
+
+Events pushed on /ws: `status` (1 Hz), `stats` (every statsIntervalMs), `debug`
+(every debugIntervalMs while `debug.subscribe` is in effect -- work item R2,
+control/commands.lua's `debug.snapshot` for a panel debug console; WORK ITEM
+FIX: NOT simply "while any /ws client is connected" -- see `debugWanted`
+above, and the _debugTimer comment below, for why that used to be the same
+thing as "always"), `log`, `chat`, `loginState`, `gameStart`, `gameEnd`,
+`death`, `error`.
 
 ------------------------------------------------------------------------------
 AUTHENTICATION AND BINDING
@@ -582,9 +594,26 @@ function M.new(opts)
         allowRemote = opts.allowRemote and true or false,
         statusIntervalMs = tonumber(opts.statusIntervalMs) or 1000,
         statsIntervalMs  = tonumber(opts.statsIntervalMs) or 5000,
+        -- work item R2 (debug console telemetry): a `debug` push, alongside status/
+        -- stats, and the cap on control/commands.lua's structured-event ring buffer.
+        -- Both are deliberately coarser than status/stats -- a debug snapshot is a
+        -- lot heavier (a whole macro table, a whole event tail) -- and hub/telemetry
+        -- .lua's own coalescing (see COALESCE there) is what actually protects a slow
+        -- browser; this interval only bounds how often the WORKER bothers to build one.
+        debugIntervalMs  = tonumber(opts.debugIntervalMs) or 2000,
+        debugEventsMax   = tonumber(opts.debugEventsMax) or 200,
         maxLogQueue = tonumber(opts.maxLogQueue) or 200,
         clients = {},                    -- ws.id -> ws
         clientCount = 0,
+        -- WORK ITEM FIX: whether a real debug-tab subscription exists anywhere
+        -- downstream, as told to us by `debug.subscribe`/`debug.unsubscribe`
+        -- (see Server:handleRequest and the _debugTimer below).  Deliberately
+        -- NOT derived from clientCount -- under hub supervision this worker's
+        -- ONLY /ws client is hub/supervisor.lua's permanent, always-open
+        -- status-poll control link (_connectControl), so clientCount > 0 is
+        -- true for the worker's entire life regardless of whether any human
+        -- has the panel open, let alone its Debug tab.
+        debugWanted = false,
         startedMs = sys.nowMs(),
         stat = { requests = 0, errors = 0, unauthorized = 0, events = 0, wsOpened = 0 },
     }, Server)
@@ -747,6 +776,20 @@ function Server:handleRequest(obj, done)
         self.stat.errors = self.stat.errors + 1
         return reply(answer(nil, false, 'id must be a number or a string'))
     end
+
+    -- WORK ITEM FIX: `debug.subscribe`/`debug.unsubscribe` are answered here,
+    -- directly, and never reach commands.dispatch -- they are not a bot or
+    -- config operation, just the explicit "someone actually wants debug"
+    -- signal the `_debugTimer` below gates on.  hub/telemetry.lua sends these
+    -- over the same control link exactly once per 0<->1+ transition of real
+    -- panel-side debug-tab subscribers for this instance, so a plain boolean
+    -- (not a count) is enough on this side.  Answered synchronously and
+    -- idempotently either way, same as every other worker command.
+    if obj.cmd == 'debug.subscribe' or obj.cmd == 'debug.unsubscribe' then
+        self.debugWanted = (obj.cmd == 'debug.subscribe')
+        return reply(answer(id, true, { debugWanted = self.debugWanted }))
+    end
+
     if not done then
         local ok, res = commands.dispatch(self.ctx, obj.cmd, obj.args)
         if not ok then self.stat.errors = self.stat.errors + 1 end
@@ -1022,6 +1065,31 @@ function Server:start()
     self._statsTimer = sched.every(self.statsIntervalMs, function()
         if S.clientCount > 0 then S:broadcast('stats', S.telemetry:snapshot()) end
     end)
+    -- work item R2: `debug.snapshot` pushed the same way status/stats already are.
+    -- The rate cap the panel actually gets protected by is hub/telemetry.lua's own
+    -- coalescing (a newer `debug` frame replaces a pending one, never queues), so
+    -- pushing here on a plain timer -- rather than trying to throttle from the
+    -- worker side -- is deliberate: one source of truth for "how often", in the
+    -- one place (the hub) that knows about every subscriber's socket.
+    --
+    -- WORK ITEM FIX: gated on `S.debugWanted`, NOT `S.clientCount > 0`. The
+    -- worker's /ws is only ever reached by hub/supervisor.lua's permanent
+    -- control link, so clientCount is >0 for this worker's whole life under
+    -- hub supervision -- that check was gating on nothing. debugWanted starts
+    -- false and only ever flips on a real `debug.subscribe`/`debug.unsubscribe`
+    -- (see Server:handleRequest above), which hub/telemetry.lua sends only
+    -- while at least one panel socket's Debug tab is actually open for this
+    -- instance. This also means commands.debugSnapshot -- and the permanent
+    -- Bot:tick/_invoke/path:getPath instrumentation its botRecorder installs
+    -- on first call -- is not even invoked, let alone every debugIntervalMs
+    -- forever, until that first real subscription arrives.
+    self._debugTimer = sched.every(self.debugIntervalMs, function()
+        if S.debugWanted then
+            local ok, snap = pcall(commands.debugSnapshot, S.ctx)
+            if ok then S:broadcast('debug', snap)
+            else log.warn('control: debug.snapshot failed: %s', tostring(snap)) end
+        end
+    end)
 
     log.info('control: listening on %s:%d (instance %s, token required)',
              self.host, port, self.instanceName)
@@ -1031,6 +1099,7 @@ end
 function Server:stop()
     if self._statusTimer then pcall(sched.cancel, self._statusTimer); self._statusTimer = nil end
     if self._statsTimer  then pcall(sched.cancel, self._statsTimer);  self._statsTimer  = nil end
+    if self._debugTimer  then pcall(sched.cancel, self._debugTimer);  self._debugTimer  = nil end
     self:_unwireEvents()
     if self.telemetry then self.telemetry:detach() end
     for id, ws in pairs(self.clients) do
@@ -1038,6 +1107,7 @@ function Server:stop()
         self.clients[id] = nil
     end
     self.clientCount = 0
+    self.debugWanted = false      -- every subscriber's socket just got closed above
     if self.http then pcall(function() self.http:stop() end); self.http = nil end
     self.boundPort = nil
     return true

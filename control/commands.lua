@@ -32,6 +32,7 @@ Commands (exactly PANEL.md's list):
     script.list                 loaded scripts, with sizes and load times
     exec {code}                 run one chunk in the same environment
     stats                       the lib/stats.lua snapshot
+    debug.snapshot              structured diagnostics for a panel debug console (work item R2)
     shutdown {code}             clean exit
 
 ------------------------------------------------------------------------------
@@ -92,6 +93,28 @@ local function optString(t, key)
     if type(v) ~= 'string' then return nil, ('%s must be a string'):format(key) end
     return v
 end
+
+-- ---------------------------------------------------------------------------
+-- work item R2: the debug-console event ring buffer.  Declared up here (not
+-- beside the rest of `debug.snapshot` near the bottom of this file) because
+-- several EARLIER command handlers (bot.enable, bot.setCavebot/setTargetbot,
+-- bot.setMacro, bot.reload, config.set) push one structured event each, at
+-- the exact moment they already act -- see the `debug.snapshot` section below
+-- for the full rationale.  Lives on ctx.server (not the bot instance) so it
+-- survives a bot.reload -- the reload itself is one of the events worth
+-- keeping.
+local DEBUG_EVENTS_DEFAULT = 200
+
+local function pushDebugEvent(ctx, kind, detail)
+    local srv = ctx and ctx.server
+    if not srv then return end
+    local buf = srv._debugEvents
+    if not buf then buf = {}; srv._debugEvents = buf end
+    local cap = tonumber(srv.debugEventsMax) or DEBUG_EVENTS_DEFAULT
+    buf[#buf + 1] = { tMs = sys.nowMs(), kind = kind, detail = detail }
+    while #buf > cap do table.remove(buf, 1) end
+end
+M.pushDebugEvent = pushDebugEvent
 
 --- A script name has to be a plain file name we are willing to create: no path
 --- separators, no '..', no drive letters, no NUL.  '.lua' is optional on input and
@@ -418,18 +441,21 @@ cmds['bot.enable'] = function(ctx, args)
         if type(LC.startBot) ~= 'function' then return nil, 'no startBot entry point' end
         LC.startBot()
         if not LC.bot then return nil, 'the bot layer failed to start (see the log)' end
+        pushDebugEvent(ctx, 'module_enable', { module = 'bot' })
         return { on = true, changed = true }
     end
     if not LC.bot then return { on = false, changed = false } end
     if type(LC.stopBot) ~= 'function' then return nil, 'no stopBot entry point' end
     LC.stopBot()
     if LC.config then LC.config.bot = false end
+    pushDebugEvent(ctx, 'module_disable', { module = 'bot' })
     return { on = false, changed = true }
 end
 
 --- One implementation for both config pickers: they differ only in the storage
 --- directory key, the module name and how that module is told to re-read.
-local function setConfig(LC, which, name)
+local function setConfig(ctx, which, name)
+    local LC = ctx.LC
     local b = LC.bot
     if not b then return nil, 'the bot layer is not running' end
     if name ~= nil and type(name) ~= 'string' then return nil, 'name must be a string' end
@@ -443,6 +469,7 @@ local function setConfig(LC, which, name)
             if which == 'cavebot' then pcall(mod.disable, mod) else pcall(mod.setOff, mod) end
         end
         if LC.config then LC.config[which] = nil end
+        pushDebugEvent(ctx, 'module_disable', { module = which })
         return { config = '', on = false }
     end
 
@@ -466,21 +493,23 @@ local function setConfig(LC, which, name)
         local ok, err = pcall(mod.reload, mod, name)
         if not ok then return nil, 'cavebot reload failed: ' .. tostring(err) end
         pcall(mod.enable, mod)
+        pushDebugEvent(ctx, 'config_reload', { module = which, config = name })
         return { config = name, on = mod.isOn and mod:isOn() or true }
     end
     local ok, err = pcall(mod.setCurrentProfile, mod, name)
     if not ok then return nil, 'targetbot reload failed: ' .. tostring(err) end
+    pushDebugEvent(ctx, 'config_reload', { module = which, config = name })
     return { config = name, on = mod.isOn and mod:isOn() or true }
 end
 
 cmds['bot.setCavebot'] = function(ctx, args)
     local a = argTable(args); if not a then return nil, 'args must be an object' end
-    return setConfig(ctx.LC, 'cavebot', a.name)
+    return setConfig(ctx, 'cavebot', a.name)
 end
 
 cmds['bot.setTargetbot'] = function(ctx, args)
     local a = argTable(args); if not a then return nil, 'args must be an object' end
-    return setConfig(ctx.LC, 'targetbot', a.name)
+    return setConfig(ctx, 'targetbot', a.name)
 end
 
 cmds['bot.listConfigs'] = function(ctx)
@@ -550,6 +579,7 @@ cmds['bot.setMacro'] = function(ctx, args)
     for _, m in ipairs(b._macros or {}) do
         if m.name == name then
             if on then m.setOn() else m.setOff() end
+            pushDebugEvent(ctx, on and 'module_enable' or 'module_disable', { macro = name })
             return { macro = { name = name, label = name, on = m.enabled and true or false,
                                hotkey = (m.hotkey ~= '' and m.hotkey) or nil } }
         end
@@ -613,6 +643,7 @@ cmds['bot.reload'] = function(ctx)
     LC.config.bot = true
     LC.startBot()
     if not LC.bot then return nil, 'the bot layer failed to restart (see the log)' end
+    pushDebugEvent(ctx, 'config_reload', { scope = 'bot.reload' })
     return { on = true, wasRunning = was,
              note = 'scripts loaded through script.put are NOT restored by a reload' }
 end
@@ -936,6 +967,7 @@ cmds['config.set'] = function(ctx, args)
     elseif kind == 'cavebot' then    res, err = setCavebot(b, a.data, a.execCapability == true, readOnly)
     end
     if not res then return nil, err or 'config.set failed' end
+    if res.applied then pushDebugEvent(ctx, 'config_reload', { kind = kind }) end
     return res
 end
 
@@ -1085,6 +1117,366 @@ cmds['stats'] = function(ctx)
     if not srv or not srv.telemetry then return nil, 'no telemetry engine' end
     return srv.telemetry:snapshot(true)
 end
+
+-- ============================================================================
+-- debug.snapshot -- work item R2: structured diagnostics for the panel's own
+-- Debug tab (work item R3, already built -- panel/app.js's TabDebug), a
+-- separate stream from the plain text log stream and the chat feed on the
+-- Console tab (see panel/app.js's Console view, read but not touched here).
+-- ============================================================================
+-- OWNERSHIP NOTE.  This file owns control/*.lua only -- not a single bot/*.lua
+-- or proto/*.lua line changed for this feature.  Every number below is REAL,
+-- pulled from the running bot/transport by instrumenting them FROM OUTSIDE:
+-- a handful of instance-level function wraps (never a source edit) that call
+-- straight through to the original behaviour and additionally record a
+-- timestamp or bump a counter.  Two techniques, used throughout:
+--   * `wrapOnce` reads `obj[method]` -- which resolves through the object's
+--     OWN metatable, so this needs no cooperating export from bot/path.lua,
+--     bot/init.lua or proto/transport.lua -- and replaces it on the INSTANCE,
+--     which every real call site reaches because they all call
+--     `obj:method(...)`, resolved fresh at call time (Lua does not cache
+--     method lookups across calls).  Idempotent via a marker field, so a
+--     bot.reload's fresh bot/path/walker objects each get wrapped exactly
+--     once and a repeated debug.snapshot never double-wraps.
+--   * a handful of existing command handlers (bot.enable, bot.setCavebot/
+--     setTargetbot, bot.setMacro, bot.reload, config.set) push one
+--     structured event each, at the exact moment they already act -- no
+--     polling needed for those, since this file IS where they happen.
+-- Fields no amount of outside instrumentation can honestly produce today are
+-- listed in this work item's crossFileRequests rather than being invented
+-- here: see that list before assuming a field is a placeholder.
+--
+-- EVENT KINDS.  panel/app.js's DEBUG_EVENT_LABEL already special-cases seven:
+-- `resync`, `reconnect`, `macro_error`, `slow_tick`, `stuck`, `path_blocked`,
+-- `info` (anything else still renders -- eventKindLabel() falls back to the
+-- raw kind with underscores turned to spaces -- just without a curated label).
+-- Every one of the seven is emitted below except `info`, which this file never
+-- had a reason to raise on its own: resync/walk_cancel/macro_error/slow_tick/
+-- stuck/path_blocked/reconnect/config_reload/module_enable/module_disable.
+-- The last three are outside panel/app.js's curated set but follow the same
+-- snake_case convention and still render via the fallback.
+local SLOW_TICK_FLOOR_MS = 30        -- a 10ms-tick bot should not warn on 31ms alone
+local STUCK_THRESHOLD_MS = 8000      -- panel/app.js's DEBUG_EVENT_LABEL 'stuck'
+local TICK_DURATIONS_MAX = 30        -- panel/app.js's tick sparkline sample count
+
+--- A human-usable label for a macro record.  Most of BOT.md's macro table is
+--- UNNAMED (only CaveBot's two macros carry a name) -- healbot alone
+--- registers four -- so falling back to the call site bot/init.lua's own
+--- `macro()` already captures (`m.site`, e.g. "bot/healbot.lua:123") is what
+--- makes the debug console's macro list identify which module owns which
+--- row, without bot/init.lua adding a name field.
+local function macroLabel(m)
+    if type(m.name) == 'string' and #m.name > 0 then return m.name end
+    if type(m.site) == 'string' and #m.site > 0 then return m.site end
+    return '?'
+end
+
+--- Wrap `obj[method]` exactly once.  `wrap(orig)` receives the CURRENT
+--- function (read through the metatable, so nothing needs to export it) and
+--- returns the replacement; the replacement decides how to call `orig`
+--- (method-style vs a plain callback -- both shapes are used below).
+local function wrapOnce(obj, method, markerField, wrap)
+    if not obj or obj[markerField] then return end
+    local orig = obj[method]
+    if type(orig) ~= 'function' then return end
+    obj[method] = wrap(orig)
+    obj[markerField] = true
+end
+
+--- Per-bot-instance recorder: tick timing, per-path-search timing, and the
+--- diff trackers the events below need (cavebot waypoint stall, walker
+--- resync/cancel counts).  Cached on the bot instance itself, so a
+--- bot.reload's brand new bot object starts with a clean recorder -- exactly
+--- right, since its tick/macro history legitimately restarts too.
+local function botRecorder(ctx)
+    local b = ctx.LC and ctx.LC.bot
+    if not b then return nil end
+    if b._debugRec then return b._debugRec end
+
+    local rec = {
+        tick = { lastTickMs = nil, lastTickDurationMs = nil, avgTickDurationMs = nil,
+                 slowTicks = 0, slowThresholdMs = math.max(SLOW_TICK_FLOOR_MS, (b.tickMs or 10) * 3),
+                 durations = {} },
+        path = { lastFindMs = nil, lastFindDurationMs = nil, lastFindResult = nil,
+                 lastFindTileCount = nil },
+        cavebot = { lastIndex = nil, lastAdvanceMs = nil },
+        walker  = { lastResyncSeenAt = nil, lastCancels = 0 },
+    }
+    b._debugRec = rec
+
+    -- tick timing: wraps bot/init.lua's Bot:tick, called every `tickMs` from
+    -- main.lua's `b.sched.every(b.tickMs, function() b:tick() end)`.
+    wrapOnce(b, 'tick', '_debugTickWrapped', function(orig)
+        return function(self, ...)
+            local t0 = sys.nowMs()
+            local ok, err = pcall(orig, self, ...)
+            local dt = sys.nowMs() - t0
+            rec.tick.lastTickMs = self.now or sys.nowMs()
+            rec.tick.lastTickDurationMs = dt
+            rec.tick.avgTickDurationMs = rec.tick.avgTickDurationMs
+                and (rec.tick.avgTickDurationMs * 0.9 + dt * 0.1) or dt
+            local durs = rec.tick.durations
+            durs[#durs + 1] = dt
+            while #durs > TICK_DURATIONS_MAX do table.remove(durs, 1) end
+            if dt > rec.tick.slowThresholdMs then
+                rec.tick.slowTicks = rec.tick.slowTicks + 1
+                pushDebugEvent(ctx, 'slow_tick', { ms = dt, thresholdMs = rec.tick.slowThresholdMs })
+            end
+            if not ok then error(err, 0) end
+        end
+    end)
+
+    -- per-macro timing/errors: wraps bot/init.lua's Bot:_invoke, the ONE
+    -- place every macro (and hotkey command) actually runs
+    -- (`pcall(self._invoke, self, m, m.fn)`).  A hotkey command's record has
+    -- no `.timeout` field (bot/init.lua's Bot:command), which is what tells
+    -- the two apart without needing either to say so itself.
+    wrapOnce(b, '_invoke', '_debugInvokeWrapped', function(orig)
+        return function(self, record, fn, ...)
+            local t0 = sys.nowMs()
+            local ok, res = pcall(orig, self, record, fn, ...)
+            if ok and res == false then
+                -- record.delay held it (b:delay() from a previous run): nothing ran
+                -- this tick, so the LAST real duration/error stays exactly as it was.
+            elseif ok then
+                record._dbgLastDurationMs = sys.nowMs() - t0
+                record._dbgLastError = nil
+            else
+                record._dbgLastDurationMs = sys.nowMs() - t0
+                record._dbgLastError = tostring(res)
+                if record.timeout ~= nil then
+                    pushDebugEvent(ctx, 'macro_error',
+                                   { name = macroLabel(record), error = tostring(res) })
+                end
+            end
+            if not ok then error(res, 0) end
+            return res
+        end
+    end)
+
+    -- path search timing/result: wraps bot/path.lua's P:getPath, the ONE
+    -- entry point bot/walker.lua, bot/cavebot.lua and bot/targetbot.lua all
+    -- call (`self.path:getPath(...)`) against the ONE shared pathfinder
+    -- BOT.md's "As built" #3 documents.
+    if b.path then
+        wrapOnce(b.path, 'getPath', '_debugGetPathWrapped', function(orig)
+            return function(self, ...)
+                local t0 = sys.nowMs()
+                local dirs, why, F = orig(self, ...)
+                rec.path.lastFindMs = sys.nowMs()
+                rec.path.lastFindDurationMs = rec.path.lastFindMs - t0
+                rec.path.lastFindTileCount = F and (F.complexity or F.classified) or nil
+                if dirs ~= nil then rec.path.lastFindResult = 'ok'
+                elseif why == 'max-complexity' then rec.path.lastFindResult = 'timeout'
+                else rec.path.lastFindResult = 'nopath' end
+                -- edge-triggered: a route that keeps failing every tick reports
+                -- ONE `path_blocked` event per failure episode, not one per tick.
+                if rec.path.lastFindResult == 'nopath' and rec.path.lastReportedResult ~= 'nopath' then
+                    pushDebugEvent(ctx, 'path_blocked', { why = why })
+                end
+                rec.path.lastReportedResult = rec.path.lastFindResult
+                return dirs, why, F
+            end
+        end)
+    end
+
+    return rec
+end
+
+--- Per-transport recorder.  A relogin builds a BRAND NEW transport object
+--- (main.lua's openSession), so this is keyed off `LC` (which outlives every
+--- transport) and re-wraps whenever the transport identity changes -- which
+--- is also how a real "how many times has this worker reconnected" count
+--- falls out, without control/server.lua's own header comment ("reconnects:
+--- the hub's supervisor bookkeeping, not the worker's") having to change:
+--- this is a genuinely different, complementary count, kept honest by
+--- calling it what it is below.
+local function netRecorder(ctx)
+    local LC = ctx.LC
+    local t = LC and LC.transport
+    if not t then return nil end
+    local net = LC._debugNet
+    if not net then net = { connects = 0, lastTransport = nil, lastRecvMs = nil }; LC._debugNet = net end
+    if net.lastTransport ~= t then
+        net.lastTransport = t
+        net.connects = net.connects + 1
+        if net.connects > 1 then
+            pushDebugEvent(ctx, 'reconnect', { connects = net.connects })
+        end
+        wrapOnce(t, 'onMessage', '_debugOnMessageWrapped', function(orig)
+            return function(payload)
+                net.lastRecvMs = sys.nowMs()
+                return orig(payload)
+            end
+        end)
+    end
+    return net
+end
+
+local function tickDebug(b, rec)
+    local macros = {}
+    if b then
+        for i, m in ipairs(b._macros or {}) do
+            macros[i] = {
+                name = macroLabel(m), enabled = m.enabled and true or false,
+                lastRanMs = m.lastExecution, lastDurationMs = m._dbgLastDurationMs,
+                errorCount = m.errors or 0, lastError = m._dbgLastError,
+            }
+        end
+    end
+    return {
+        intervalMs = b and b.tickMs or nil,
+        lastTickMs = (rec and rec.tick.lastTickMs) or (b and b.now) or nil,
+        lastTickDurationMs = rec and rec.tick.lastTickDurationMs or nil,
+        avgTickDurationMs  = rec and rec.tick.avgTickDurationMs or nil,
+        slowTicks  = rec and rec.tick.slowTicks or 0,
+        slowThresholdMs = rec and rec.tick.slowThresholdMs or nil,
+        durationsMs = rec and rec.tick.durations or {},
+        macroCount = b and #(b._macros or {}) or 0,
+        macros     = macros,
+    }
+end
+
+local function networkDebug(ctx)
+    local LC = ctx.LC
+    local t, st = LC.transport, LC.state
+    local net = netRecorder(ctx)
+    return {
+        connected = (t and t.state == 'connected' and not t.dead) and true or false,
+        ping = st and st.ping or nil,
+        lastPacketAgeMs = (net and net.lastRecvMs) and (sys.nowMs() - net.lastRecvMs) or nil,
+        packetsIn  = (t and t.stats and t.stats.recv) or 0,
+        packetsOut = (t and t.stats and t.stats.sent) or 0,
+        bytesIn    = (t and t.stats and t.stats.bytesIn) or 0,
+        bytesOut   = (t and t.stats and t.stats.bytesOut) or 0,
+        -- how many DISTINCT transport objects this worker has connected through
+        -- (main.lua builds a fresh one per login/relogin): 0 until the first
+        -- connect, then one less than the transports seen so far.
+        reconnects = net and math.max(0, net.connects - 1) or 0,
+        lastDesyncOrError = t and t.lastError or nil,
+    }
+end
+
+local function botModulesDebug(ctx, rec)
+    local b = ctx.LC.bot
+    local out = {}
+    if not b then return out end
+    local now = sys.nowMs()
+
+    local cb = b.modules and b.modules.cavebot
+    if cb then
+        local ok, cst = pcall(cb.status, cb)
+        if ok then
+            local idx = cst.waypointIndex
+            local stuckSince = nil
+            if rec then
+                if rec.cavebot.lastIndex == nil or rec.cavebot.lastIndex ~= idx then
+                    rec.cavebot.lastIndex, rec.cavebot.lastAdvanceMs = idx, now
+                    rec.cavebot.reportedStuck = false
+                end
+                stuckSince = rec.cavebot.lastAdvanceMs and (now - rec.cavebot.lastAdvanceMs) or nil
+                if stuckSince and stuckSince >= STUCK_THRESHOLD_MS and not rec.cavebot.reportedStuck then
+                    rec.cavebot.reportedStuck = true
+                    pushDebugEvent(ctx, 'stuck', { waypointIndex = idx, stuckForMs = stuckSince })
+                end
+            end
+            out.cavebot = {
+                on = cst.on, config = cst.config,
+                waypointIndex = idx, waypointCount = cst.waypointCount,
+                currentAction = cst.currentAction, lastActionResult = cst.status,
+                stuckSince = stuckSince, stuckThresholdMs = STUCK_THRESHOLD_MS,
+            }
+        end
+    end
+
+    local tb = b.modules and b.modules.targetbot
+    if tb then
+        local ok, tst = pcall(tb.status, tb)
+        if ok then
+            local reason = nil
+            local lp = tb.lastParams
+            if lp and lp.config then
+                reason = ('matched %q (priority=%s danger=%s)'):format(
+                    tostring(lp.config.name or lp.config.creature or '?'),
+                    tostring(lp.priority), tostring(lp.danger))
+            end
+            out.targetbot = {
+                on = tst.on, config = tst.config, target = tst.target,
+                candidateCount = tb.targets or 0,
+                lastSelectionReason = reason,
+                looting = { state = tst.looting and tst.looting.status,
+                            queueLength = tst.looting and tst.looting.queued },
+            }
+        end
+    end
+
+    local hb = b.modules and b.modules.healbot
+    if hb then
+        local la = hb.lastAction
+        out.healbot = {
+            on = hb:isOn(),
+            lastRuleFired = la and (tostring(la.kind) .. ':' .. tostring(la.what)) or nil,
+            lastCastMs = la and la.at or nil,
+        }
+    end
+
+    local ab = b.modules and b.modules.attackbot
+    if ab then
+        local ls = ab.lastSpell
+        out.attackbot = {
+            on = ab:isOn(), lastSpell = ls and (ls.spell or ls.rune) or nil,
+            lastFiredMs = ls and ls.at or nil,
+        }
+    end
+
+    local stm = b.modules and b.modules.stances
+    if stm then
+        local ok, sst = pcall(stm.status, stm)
+        if ok then
+            out.stances = { on = sst.on, activeStanceIds = sst.active or {}, lastCastMs = sst.lastCastAt }
+        end
+    end
+
+    -- resync / walk-cancel events: diffed off the ONE shared walker every time
+    -- a snapshot is built (the periodic control/server.lua push, or an
+    -- on-demand `debug.snapshot`) -- no separate poller needed.
+    local wk = b.walker
+    if wk and rec then
+        local lr = wk.lastResync
+        if lr and lr.at and rec.walker.lastResyncSeenAt ~= lr.at then
+            rec.walker.lastResyncSeenAt = lr.at
+            pushDebugEvent(ctx, 'resync', { why = lr.why, pos = lr.pos })
+        end
+        local cancels = (wk.stats and wk.stats.cancels) or 0
+        if cancels > rec.walker.lastCancels then
+            pushDebugEvent(ctx, 'walk_cancel', { cancels = cancels })
+            rec.walker.lastCancels = cancels
+        end
+    end
+
+    return out
+end
+
+local function pathDebug(rec)
+    if not rec then return {} end
+    return { lastFindMs = rec.path.lastFindMs, lastFindDurationMs = rec.path.lastFindDurationMs,
+             lastFindResult = rec.path.lastFindResult, lastFindTileCount = rec.path.lastFindTileCount }
+end
+
+function M.debugSnapshot(ctx)
+    local rec = botRecorder(ctx)
+    local srv = ctx.server
+    return {
+        tMs     = sys.nowMs(),
+        tick    = tickDebug(ctx.LC.bot, rec),
+        network = networkDebug(ctx),
+        bot     = botModulesDebug(ctx, rec),
+        path    = pathDebug(rec),
+        events  = (srv and srv._debugEvents) or {},
+    }
+end
+
+cmds['debug.snapshot'] = function(ctx) return M.debugSnapshot(ctx) end
 
 -- ------------------------------------------------------------ shutdown ------
 cmds['shutdown'] = function(ctx, args)

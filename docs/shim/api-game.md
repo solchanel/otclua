@@ -207,7 +207,7 @@ Counts are raw T1 hits for the name; the receiver column disambiguates game obje
 | `isWalking()` | `creature.h:147` | 8, all on `player` | | bool | walker state | IMPLEMENT |
 | `isDead()` | `creature.h:153` = `healthPercent <= 0` | 2 | | bool | derived | IMPLEMENT |
 | `isTimedSquareVisible()` | render-only | 1 | `spec` | bool | — | INERT STUB → `false` |
-| `getManaPercent()` | `creature.h` | 1 | `spec` | 0..100 | only for party members (opcode 0x8B) | STATEFUL STUB → 100 (gap G7) |
+| `getManaPercent()` | `creature.h` | 1 | `spec` | 0..100 | opcode 0x8B has no genuine separate party-mana byte at 1530 (gap G7, retitled by R1) | STUB → 100 (verified: no such field exists on this wire) |
 | `setOutfit`, `setDirection`, `showStaticSquare`, `setText`, `setMarked`, `attachEffect`, … | render/UI | 0 on creatures in T1 | | | INERT STUB |
 
 ### 4.2 `LocalPlayer` — everything in `Creature`, plus:
@@ -227,7 +227,7 @@ Counts are raw T1 hits for the name; the receiver column disambiguates game obje
 | `getInventoryCount(itemId, tier)` | `localplayer.cpp` | 4 | total **count** across the 11 equipped slots **and every open container**; tier must match; `itemId == 0` ⇒ 0 | inventory + containers | IMPLEMENT — port the accumulator verbatim |
 | `hasEquippedItemId(itemId, tier)` | `localplayer.cpp` | 0 | bool, equipped slots only | yes | IMPLEMENT (cheap) |
 | `isPreWalking()` | `localplayer.h:140` | 4 | `#preWalks > 0` | `player.preWalks` | IMPLEMENT |
-| `isSupplyStashAvailable()` | `localplayer.h:142` | 1 | bool | `proto/parser.lua:909` reads the byte and **discards** it | STATEFUL STUB — one-line parser change (gap G4) |
+| `isSupplyStashAvailable()` | `localplayer.h:142` | 1 | bool | `S[0x2A]` stores it on `state.player.supplyStashAvailable` | IMPLEMENTED (gap G4 closed, work item R1) |
 | `getResourceBalance(type)` | `localplayer.h:124` | 1 | uint64 for an `Otc::ResourceTypes_t` | `state.resources[t]` (`proto/parser.lua:2737-2741`) — **on `state`, not on `state.player`** | IMPLEMENT |
 | `getStance()` / `getSecondaryStance()` | `localplayer.h:95-96` | 2 / 1 | uint16 spell ids | **not stored** — but `player.virtues` is (opcode 0xC1 sub 2) | IMPLEMENT — derive with the exact C++ rule (`protocolgameparse.cpp:5385-5404`): scan `virtues`; ids 311/312 ⇒ secondary; else the first id is primary and the next is secondary |
 | `getHarmony()` | `localplayer.h:90` | 1 | uint8 | `player.harmony` (0xC1 sub 0) | IMPLEMENT |
@@ -328,13 +328,13 @@ which already match the `g_map` contracts.
 | G1 | `getAttackingCreature`/`getFollowingCreature`/`isAttacking` (12 T1 sites) | no attack/follow target tracked | keep the id in the shim; clear on `attackCancel` |
 | G2 | `g_game.getPing()` (10 T1 sites) | no RTT measurement | time `ping`/`pingBack` in `proto/transport.lua` |
 | ~~G3~~ **CLOSED** | `g_game.getUnjustifiedPoints()` (3 sites) | ~~opcode 0xB7 not parsed~~ | **DONE** — `proto/parser.lua` `S[0xB7]` parses all seven bytes into `state.unjustified` and emits `unjustifiedPoints`; `g_game.getUnjustifiedPoints()` reads it. **Before the packet arrives** the three `*Remaining` fields answer **255**, not 0: `vBot/vlib.lua:223-227` `killsToRs()` is their minimum, and 0 is conservative for the AttackBot PvP gate (`AttackBot.lua:1573,2949,3001,3036,3046,3065,3083`, `killsToRs() > KillsAmount`) but INVERTS `vBot/antiRs.lua:21` (`killsToRs() < 6`), which would latch on for the whole session. 255 is the only value that is safe in both directions. |
-| G4 | `player:isSupplyStashAvailable()` (1 site) | `proto/parser.lua:909` reads and discards the byte | store it |
+| ~~G4~~ **CLOSED** | `player:isSupplyStashAvailable()` (1 site) | ~~`proto/parser.lua:909` reads and discards the byte~~ | **DONE** (work item R1) — `S[0x2A]` stores it on `state.player.supplyStashAvailable`; the accessor reads it |
 | ~~G5~~ **CLOSED** | `onAddThing`/`onRemoveThing` (`vBot/BotServer.lua:221`) | ~~no per-thing event~~ | **DONE** — `shim/object.lua` `Reg:_hookState` wraps `state:addThing` and `state:_removeAt` (the single removal funnel: `state:removeThing` AND the 11-thing trim both go through it, which is the C++ ordering) and fans out to `reg.onTileThing`, which `shim/callbacks.lua` turns into `onAddThing(tile, thing)` / `onRemoveThing(tile, thing)`. **Gated** on `reg.tileThingCallback`, flipped by `g_game.enableTileThingLuaCallback` — the same gate as `tile.cpp:374-376,420-422` — so with the callback off it costs one boolean per thing and allocates nothing. |
 | G6 | `Creature:getVocation()` on **remote** creatures (1 site) | only the local player's vocation is stored | store per creature, or return 0 |
-| G7 | `Creature:getManaPercent()` (1 site) | opcode 0x8B (party mana) not stored | store, or return 100 |
+| G7 | `Creature:getManaPercent()` (1 site) | opcode 0x8B never carries a genuine separate party-mana byte at 1530 (verified R1: types 11/12/13 all funnel into `setCreatureVocation`; `Creature::setManaPercent` has zero C++ call sites) | remains 100 — vBot's own reading comes from its BotServer relay, not this wire |
 | ~~G8~~ **CLOSED** | imbuement window (`cavebot/imbuing.lua`, 8 sites) | ~~neither senders nor parser exist~~ | **DONE** — see B2 below |
-| G9 | party invite/join (2+2 sites) | no party builders in `proto/sender.lua` | add them |
-| G10 | `g_game.stashStowItem` (2 sites) | no builder | add opcode 0x28 |
+| ~~G9~~ **CLOSED** | party invite/join (2+2 sites) | ~~no party builders in `proto/sender.lua`~~ | **DONE** (work item R1) — `sender:partyInvite`/`sender:partyJoin` added, opcodes 0xA3/0xA4 |
+| ~~G10~~ **CLOSED** | `g_game.stashStowItem` (2 sites) | ~~no builder~~ | **DONE** (work item R1) — `sender:stashStowItem` added, opcode 0x28 |
 
 ---
 

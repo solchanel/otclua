@@ -207,6 +207,11 @@ local function newSender(clock)
     s.closeContainer= rec('close',  { 'cid' })
     s.ping          = rec('ping',   {})
     s.pingBack      = rec('pingBack', {})
+    -- work item R1: forge / stowdeposit / party builders.
+    s.forgeRequest    = rec('forgeRequest',    { 'actionType' })
+    s.stashStowItem   = rec('stashStowItem',   { 'pos', 'id', 'count', 'stack', 'action' })
+    s.partyInvite     = rec('partyInvite',     { 'id' })
+    s.partyJoin       = rec('partyJoin',       { 'id' })
     -- work item Q1: the withdraw family only needed move/open/close (already above); the
     -- imbuing action needs its own four builders.
     s.applyImbuement       = rec('applyImbuement',       { 'slot', 'imbuementId', 'protection' })
@@ -3797,6 +3802,265 @@ do
         eq(posStr(st.player.pos), '100,102,8',
            'on the map, the creature record the wire wrote wins')
     end
+end
+
+-- ============================================================================
+-- WORK ITEM R1 -- close the remaining wire-level gaps: forge / stowdeposit /
+-- party builders, the three new parser state fields, and S:sayAt's dedup bookkeeping.
+-- ============================================================================
+S('R1: proto.sender -- forgeRequest / stashStowItem / partyInvite / partyJoin byte layouts')
+do
+    local sendermod = require('proto.sender')
+    local function tohex(s) return (s:gsub('.', function(c) return ('%02x'):format(c:byte()) end)) end
+    local sent = {}
+    local fake = { send = function(_, b) sent[#sent + 1] = b; return true end }
+    local snd = sendermod.new(fake, {})
+
+    -- forgeRequest: 0xBF, u8 actionType.  DUST2SLIVER(2)/INCREASELIMIT(4) -- the only two
+    -- values the real forge waypoint ever sends -- carry NO extra fields.
+    snd:forgeRequest(2)
+    eq(tohex(sent[#sent]), 'bf02', 'forgeRequest(DUST2SLIVER) is just [0xBF][0x02]')
+    snd:forgeRequest(4)
+    eq(tohex(sent[#sent]), 'bf04', 'forgeRequest(INCREASELIMIT) is just [0xBF][0x04]')
+    -- FUSION(0)/TRANSFER(1) grow the body (protocolgamesend.cpp:1670-1684): u8 convergence,
+    -- u16 firstItemId, u8 firstItemTier, u16 secondItemId, u8 improveChance, u8 tierLoss.
+    snd:forgeRequest(0, true, 100, 1, 200, true, false)
+    eq(tohex(sent[#sent]), 'bf00' .. '01' .. '6400' .. '01' .. 'c800' .. '01' .. '00',
+       'forgeRequest(FUSION) writes the full convergence/items/tier/improve/tierLoss body')
+
+    -- stashStowItem: 0x28, u8 action, Position(5), u16 itemId, u8 stackpos, then a u32
+    -- count ONLY when action == STOW_ITEM(0) (protocolgamesend.cpp:1815-1828).
+    snd:stashStowItem({ x = 1000, y = 1000, z = 7 }, 3031, 0, 5, 2)
+    eq(tohex(sent[#sent]), '28' .. '02' .. 'e803' .. 'e803' .. '07' .. 'd70b' .. '05',
+       'stashStowItem action=2 (STOW_STACK) omits the trailing u32 count')
+    snd:stashStowItem({ x = 1000, y = 1000, z = 7 }, 3031, 7, 5, 0)
+    eq(tohex(sent[#sent]), '28' .. '00' .. 'e803' .. 'e803' .. '07' .. 'd70b' .. '05' .. '07000000',
+       'stashStowItem action=0 (STOW_ITEM) appends the u32 count')
+
+    -- partyInvite / partyJoin: 0xA3 / 0xA4, u32 creatureId (protocolgamesend.cpp:843-857).
+    snd:partyInvite(0x11223344)
+    eq(tohex(sent[#sent]), 'a344332211', 'partyInvite writes [0xA3][u32 creatureId]')
+    snd:partyJoin(0x11223344)
+    eq(tohex(sent[#sent]), 'a444332211', 'partyJoin writes [0xA4][u32 creatureId]')
+end
+
+S('R1: proto.parser -- 0x2A stores supplyStashAvailable on state.player')
+do
+    local parsermod = require('proto.parser')
+    local st = state.new()
+    local p = parsermod.new(st, function() end)
+    eq(st.player.supplyStashAvailable, false,
+       'defaults to false, matching LocalPlayer::m_isSupplyStashAvailable')
+    -- SpecialContainer (0x2A): u8 available, then (>=1220) u8 isMarketAvailable.
+    p:parse(string.char(0x2A) .. string.char(1) .. string.char(0))
+    eq(st.player.supplyStashAvailable, true, 'a non-zero byte flips it true')
+    p:parse(string.char(0x2A) .. string.char(0) .. string.char(1))
+    eq(st.player.supplyStashAvailable, false, 'a later zero byte flips it back to false')
+end
+
+S('R1: proto.parser -- 0x8B type 11/12/13 all write the SAME per-creature vocation field')
+do
+    -- protocolgameparse.cpp:2434-2456's parseCreatureData funnels type 11 ("creature mana
+    -- percent"), 12 ("creature show status") and 13 ("player vocation") into the IDENTICAL
+    -- setCreatureVocation(msg, creatureId) call -- one u8 read, one field written.  There is
+    -- no genuine separate party-mana byte on the wire at 1530 to store (Creature::
+    -- setManaPercent has zero C++ call sites; real vBot's party mana comes from the
+    -- self-hosted BotServer relay instead), so all three sub-types share one field.
+    local parsermod = require('proto.parser')
+    local function u32le(v)
+        return string.char(v % 256, math.floor(v / 256) % 256,
+                           math.floor(v / 65536) % 256, math.floor(v / 16777216) % 256)
+    end
+    local st = state.new()
+    local p = parsermod.new(st, function() end)
+    st:addCreature({ id = 0x5000, name = 'Buddy' })
+
+    p:parse(string.char(0x8B) .. u32le(0x5000) .. string.char(13) .. string.char(4))
+    eq(st.creatures[0x5000].vocation, 4, 'type 13 (player vocation) stores the byte as .vocation')
+
+    p:parse(string.char(0x8B) .. u32le(0x5000) .. string.char(11) .. string.char(9))
+    eq(st.creatures[0x5000].vocation, 9,
+       'type 11 ("mana percent") funnels into the SAME .vocation field, per the real source')
+    eq(st.creatures[0x5000].manaPercent, nil, 'no separate manaPercent field is invented')
+
+    p:parse(string.char(0x8B) .. u32le(0x5000) .. string.char(12) .. string.char(3))
+    eq(st.creatures[0x5000].vocation, 3, 'type 12 ("show status") writes the same field too')
+    eq(st.creatures[0x5000].showStatus, nil, 'no separate showStatus field is invented')
+end
+
+S('R1: CaveBot forge waypoint -- sends forgeRequest, retries until count, then stops')
+do
+    local F = newWorld({ '@..' })
+    local H = newHost(F)
+    local cb = H.cb
+
+    eq(cb:_actionForge('bogus', 0), false, 'an unrecognised mode warns and fails')
+
+    H.sender:clear()
+    eq(cb:_actionForge('convert,3', 0), 'retry', 'retries=0 of 3: sends and retries')
+    eq(cb:_actionForge('convert,3', 1), 'retry', 'retries=1 of 3: sends and retries')
+    eq(cb:_actionForge('convert,3', 2), 'retry', 'retries=2 of 3: sends and retries (3rd send)')
+    eq(cb:_actionForge('convert,3', 3), true, 'retries=3 of 3: all requested actions sent, done')
+    local sent = H.sender:byKind('forgeRequest')
+    eq(#sent, 3, 'exactly 3 forgeRequest packets went out, one per retry below the count')
+    eq(sent[1].actionType, 2, 'mode "convert" sends Otc::ForgeAction_t::DUST2SLIVER (2)')
+
+    H.sender:clear()
+    eq(cb:_actionForge('limit,2', 0), 'retry', 'mode "limit" retries too (1/2)')
+    eq(cb:_actionForge('limit,2', 1), 'retry', 'mode "limit" retries too (2/2)')
+    eq(cb:_actionForge('limit,2', 2), true, 'retries=2 of a smaller count 2: done sooner')
+    local sent2 = H.sender:byKind('forgeRequest')
+    eq(#sent2, 2, 'exactly 2 packets went out this run')
+    eq(sent2[1].actionType, 4, 'mode "limit" sends Otc::ForgeAction_t::INCREASELIMIT (4)')
+
+    H.sender:clear()
+    eq(cb:_actionForge('convert', 0), 'retry', 'no count defaults to 1')
+    eq(cb:_actionForge('convert', 1), true, 'retries=1 of default count 1: done after one send')
+    eq(H.sender:count('forgeRequest'), 1, 'the default count sends exactly once')
+end
+
+S('R1: CaveBot stowdeposit -- stash pass (3-try fallback cache), then depot pass')
+do
+    local F = newWorld({ '@.' })
+    F.st:addThing(F.at(1, 0), -2, { kind = 'item', id = 3497 })   -- a locker, adjacent
+    F.st.containers = {
+        [0] = { id = 0, name = 'backpack', capacity = 20, firstIndex = 0,
+                items = { { id = ID_GOLD, count = 10 }, { id = ID_WALL, count = 1 } } },
+        [1] = { id = 1, name = 'Depot chest', capacity = 20, firstIndex = 0, items = {} },
+    }
+    local H = newHost(F)
+    local cb = H.cb
+    cb._lootList, cb._lootContainers = { [ID_GOLD] = true, [ID_WALL] = true }, {}
+
+    -- no supply stash advertised: EVERY item is non-stowable, straight to the depot.
+    F.st.player.supplyStashAvailable = false
+    H.sender:clear()
+    eq(cb:_actionStowDeposit('no', 1), 'retry', 'no stash available: still retries')
+    eq(H.sender:count('stashStowItem'), 0, 'no stashStowItem was sent at all')
+    local mv0 = H.sender:byKind('move')[1]
+    ok(mv0 ~= nil, 'goes straight to a depot move instead')
+    eq(mv0 and mv0.id, ID_GOLD, 'the first loot item, moved via the plain depot path')
+    cb:_resetStowCache()          -- undo the fallback marks that scenario made
+
+    -- now advertise the stash: ID_GOLD is pickupable/tier-0 and stows; ID_WALL is not
+    -- pickupable and is marked fallback on first sight, never even attempted.
+    F.st.player.supplyStashAvailable = true
+    H.sender:clear()
+    eq(cb:_actionStowDeposit('no', 1), 'retry', 'attempt 1: stows the gold')
+    eq(cb:_actionStowDeposit('no', 1), 'retry', 'attempt 2: stows the gold again')
+    eq(cb:_actionStowDeposit('no', 1), 'retry', 'attempt 3: stows the gold a third time')
+    local stows = H.sender:byKind('stashStowItem')
+    eq(#stows, 3, 'exactly 3 stashStowItem packets for the gold (the 3-try cache)')
+    for i = 1, 3 do
+        eq(stows[i].id, ID_GOLD, ('stow #%d is the gold'):format(i))
+        eq(stows[i].action, 2, ('stow #%d uses action 2 (STOW_STACK)'):format(i))
+    end
+
+    -- the 4th evaluation: the cache gives up on the gold (fallback) -- PASS 1 sends
+    -- nothing, PASS 2 deposits the gold (the wall was never stowable either way).
+    H.sender:clear()
+    eq(cb:_actionStowDeposit('no', 1), 'retry', 'attempt 4: falls back to the depot')
+    eq(H.sender:count('stashStowItem'), 0, 'the 4th attempt does not retry the stash')
+    local mv1 = H.sender:byKind('move')[1]
+    ok(mv1 ~= nil, 'a depot move was sent instead')
+    eq(mv1 and mv1.id, ID_GOLD, 'the gold (now fallback), first in container order')
+
+    -- simulate the server having applied that move: the gold leaves the backpack.
+    F.st.containers[0].items = { { id = ID_WALL, count = 1 } }
+    H.sender:clear()
+    eq(cb:_actionStowDeposit('no', 1), 'retry', 'the wall was never stowable -- straight to depot')
+    eq(H.sender:count('stashStowItem'), 0, 'never retried the stash for the wall')
+    local mv2 = H.sender:byKind('move')[1]
+    ok(mv2 ~= nil, 'and the wall goes to the depot too')
+    eq(mv2 and mv2.id, ID_WALL, 'the wall item')
+
+    -- and once the backpack is empty, the waypoint completes and resets its own caches.
+    F.st.containers[0].items = {}
+    H.sender:clear()
+    eq(cb:_actionStowDeposit('no', 1), true, 'nothing left to stash or deposit -> done')
+    eq(cb._stowAttempts, nil, 'the stow-attempt cache is reset')
+    eq(cb._stowFallback, nil, 'the stow-fallback cache is reset')
+end
+
+S('R1: CaveBot stowdeposit "yes" -- reopens loot containers, then the nested-bag scan')
+do
+    local F = newWorld({ '@.' })
+    F.st:addThing(F.at(1, 0), -2, { kind = 'item', id = 3497 })
+    F.st.containers = {
+        [1] = { id = 1, name = 'Depot chest', capacity = 20, firstIndex = 0, items = {} },
+        [5] = { id = 5, name = 'a loot bag', capacity = 20, firstIndex = 0, items = {},
+                item = { kind = 'item', id = ID_BACKPACK } },
+    }
+    local H = newHost(F)
+    local cb = H.cb
+    cb._lootList, cb._lootContainers = { [ID_GOLD] = true }, { [ID_BACKPACK] = true }
+
+    H.sender:clear()
+    eq(cb:_actionStowDeposit('yes', 1), 'retry', '"yes" first closes the loot containers')
+    local cl = H.sender:byKind('close')[1]
+    ok(cl ~= nil, 'a closeContainer was sent')
+    eq(cl and cl.cid, 5, 'closing the loot-container bag (id 5)')
+    eq(cb._stowReopened, true, 'reopenedContainers latches so this only happens once')
+
+    H.sender:clear()
+    eq(cb:_actionStowDeposit('yes', 1), true,
+       'no loot items anywhere and no nested spare bag to open -> proceeds')
+    eq(#H.sender:byKind('open'), 0, 'nothing left to open')
+    eq(cb._stowReopened, nil, 'the reopened latch is reset along with the rest of the cache')
+end
+
+S('R1: bot/shared.lua S:sayAt -- castAtPos dedup bookkeeping mirrors S:cast exactly')
+do
+    local F = newWorld({ '@..' })
+    local H = newHost(F)
+    local sh = sharedmod.attach(H.bot)
+    local pos = F.st.player.pos
+
+    -- the pre-existing call shape (no third argument at all) keeps working unchanged --
+    -- this is bot/attackbot.lua:1032's own call site, untouched by this work item.
+    H.sender:clear()
+    sh:sayAt('exori flam', pos)
+    eq(#talkSpells(H), 1, 'no delay argument at all still sends exactly like before')
+
+    -- delay < 100 (ServerCooldown's executeCooldown = 30): always a plain, un-deduped send.
+    H.sender:clear()
+    sh:sayAt('exori mas', pos, 30)
+    sh:sayAt('exori mas', pos, 30)
+    eq(#talkSpells(H), 2, 'delay < 100 never dedups')
+
+    -- delay >= 100 (CustomCooldown): the first cast seeds the SpellCastTable; an
+    -- immediate, un-echoed repeat at the SAME delay is suppressed -- AB:1556-1569.
+    H.sender:clear()
+    local first  = sh:sayAt('exori gran mas', pos, 1000)
+    local second = sh:sayAt('exori gran mas', pos, 1000)
+    ok(first ~= nil, 'the first aimed cast goes out')
+    eq(second, nil, 'an un-echoed repeat at the same cooldown is suppressed')
+    eq(#talkSpells(H), 1, 'only one talkSpell packet actually reached the wire')
+
+    -- the parity claim itself: an equivalent plain cast() through the SAME castTable
+    -- bookkeeping behaves identically, not just each function being internally consistent.
+    H.sender:clear()
+    local firstSay  = sh:cast('exevo gran mas flam', 1000)
+    local secondSay = sh:cast('exevo gran mas flam', 1000)
+    ok(firstSay ~= nil, 'cast(): the first send goes out')
+    eq(secondSay, nil, 'cast(): an un-echoed repeat at the same cooldown is ALSO suppressed')
+
+    -- the server echo (own talk) refreshes the timestamp exactly like cast()'s does, so a
+    -- repeat past the cooldown window fires again.
+    H.sender:clear()
+    sh:sayAt('exori min', pos, 500)
+    H.bus:emit('talk', { name = F.st.player.name, text = 'exori min' })
+    H:advance(600)
+    H.bot.now = H.bot.clock()      -- S:now() reads the per-tick snapshot; refresh it
+    local third = sh:sayAt('exori min', pos, 500)
+    ok(third ~= nil, 'past the cooldown window (the echo refreshed t), it fires again')
+    eq(#talkSpells(H), 2, 'two packets total: the seed and the post-cooldown repeat')
+
+    -- and the wire text is lowercased too, exactly like castAtPos/cast() already do.
+    H.sender:clear()
+    sh:sayAt('EXORI MIN', pos)
+    eq(talkSpells(H)[1] and talkSpells(H)[1].text, 'exori min',
+       'sayAt lowercases the wire text, matching AB:1556 and S:cast')
 end
 
 -- ============================================================================

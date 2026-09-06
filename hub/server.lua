@@ -670,6 +670,15 @@ function S:wsOptions(panelProtocol)
         if self_.tel then self_.tel:setSubs(ws, frame.logs, frame.chat) end
         return
       end
+      if ft == 'subscribeDebug' then
+        -- work item R2/R3 wire-up: panel/rpc.js's WsClient#subscribeDebug sends
+        -- this independently of {type:'subscribe'} (see hub/telemetry.lua's
+        -- setDebugSub doc comment) so the Debug tab's live push can reach a
+        -- panel viewer at all -- until this handler existed, only the
+        -- on-demand GET /api/instances/:id/debug route worked.
+        if self_.tel then self_.tel:setDebugSub(ws, frame.id) end
+        return
+      end
       if ft == 'ping' then
         if self_.tel then
           self_.tel:sendTo(ws, 'pong', { t = frame.t or (os.time() * 1000) })

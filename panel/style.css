@@ -277,6 +277,7 @@ label.check input { width: auto; accent-color: var(--accent); cursor: pointer; }
   color: var(--fg-dim);
   font-weight: 600;
 }
+.card.warn { border-color: #6a4f13; background: #1a1710; }
 .grid { display: grid; gap: 14px; }
 .grid.c2 { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
 .grid.c3 { grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
@@ -353,7 +354,13 @@ table.grid-table td {
 }
 table.grid-table tbody tr:hover { background: var(--bg-2); }
 table.grid-table tbody tr.sel { background: #16283c; }
+table.grid-table tbody tr.errrow { background: #23121466; }
 table.grid-table td.num { font-family: var(--mono); text-align: right; }
+
+/* ---------- Debug tab (R3): event-kind badges ---------- */
+.tag.evk-info  { color: var(--fg-dim); }
+.tag.evk-warn  { color: var(--warn); border-color: #6a4f13; background: #23190a; }
+.tag.evk-error { color: var(--err);  border-color: #7d3038; background: #2a1114; }
 .linkish {
   background: none; border: none; padding: 0;
   color: var(--accent); cursor: pointer; font: inherit; font-weight: 600;

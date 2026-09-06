@@ -1029,7 +1029,7 @@ function A:_optTile(entry, def, executeCooldown)
     if not best or not self:countGate(entry, best.counted) then return true, false end
     if not self:guardsPass() then return true, false end
 
-    local sent = self.sh:sayAt(entry.spell, best.pos)
+    local sent = self.sh:sayAt(entry.spell, best.pos, executeCooldown)
     if not sent then
         -- AB:1605-1614: castAtPos's own delay gate refused -- de-escalate to
         -- the legacy face-the-target pattern-15 path IN THE SAME TICK.

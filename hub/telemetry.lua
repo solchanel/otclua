@@ -14,10 +14,13 @@ hub/telemetry.lua -- per-instance live state, rolling history, and the fan-out t
   -- panel sockets
   tel:addSocket(ws)          -- ws.user = { userId=, role=, visible=function(id) }
   tel:removeSocket(ws)
+  tel:setSubs(ws, logsId, chatId)     -- panel/rpc.js's {type:'subscribe'} frame
+  tel:setDebugSub(ws, id)             -- {type:'subscribeDebug'} (R3) -- see hub/server.lua note
   tel:publish('instance', { id = ..., instance = ... }, { instanceId = ... })
 
   -- reads for the RPC layer
   tel:live(id)   tel:history(id, since)   tel:flush()
+  tel:debugSnapshot(id)   tel:debugHistory(id)          -- work item R2
 
 --------------------------------------------------------------------------------
 WHY THE FAN-OUT IS QUEUED AND NOT A DIRECT ws:send()
@@ -67,8 +70,13 @@ local floor = math.floor
 local function nowMs() return sys.nowMs() end
 local function wallMs() return os.time() * 1000 end
 
--- Events whose newest value supersedes the pending one.
-local COALESCE = { status = true, stats = true, instance = true, supplies = true }
+-- Events whose newest value supersedes the pending one.  `debug` (work item R2's
+-- debug console) belongs here for exactly the reason status/stats do: a worker
+-- that pushes faster than a slow browser drains must never queue up a backlog of
+-- stale snapshots -- the panel only ever wants the LATEST one, and a coalesced
+-- key means a burst of N debug pushes between two drain ticks costs one frame,
+-- not N.  That is the whole rate cap; nothing on the worker side needs to throttle.
+local COALESCE = { status = true, stats = true, instance = true, supplies = true, debug = true }
 
 local DEFAULTS = {
   historyEveryMs = 30000,
@@ -78,6 +86,7 @@ local DEFAULTS = {
   maxQueue       = 200,
   maxPerFlush    = 60,
   maxOutbox      = 256 * 1024,
+  debugHistMax   = 20,
 }
 
 -- ================================================================== the ring =
@@ -106,6 +115,20 @@ function M.new(opts)
   t.hist     = {}            -- instanceId -> array of points
   t.dirty    = {}            -- instanceId -> true
   t.lastPoint= {}            -- instanceId -> ms of the last history point
+  -- work item R2: the last debug.snapshot per instance, plus a SHORT rolling
+  -- history of them.  Deliberately separate from `t.snap`/`t.hist` above: a
+  -- debug snapshot is heavy (a whole macro table, a whole event tail) and
+  -- short-lived-useful, so it gets its own much smaller ring (debugHistMax,
+  -- default 20) rather than sharing the 400-point/60s-flush machinery built
+  -- for the small numeric points on the Overview charts.  Neither is
+  -- persisted to disk -- a debug console does not need to survive a hub
+  -- restart the way the exp/h chart does.
+  t.debugSnap = {}           -- instanceId -> last debug.snapshot
+  t.debugHist = {}           -- instanceId -> array of recent debug.snapshots
+  -- WORK ITEM FIX: instanceId -> count of sockets currently subscribed to that
+  -- instance's live `debug` stream (rec.subs.debug), so a worker is told
+  -- `debug.subscribe`/`debug.unsubscribe` only on a real 0<->1+ transition.
+  t.debugSubCount = {}
   t.timers   = {}
   t.installed = false
   t.maxPerUser = tonumber(opts.maxPerUser) or T.MAX_PER_USER
@@ -137,9 +160,27 @@ function T:forget(id)
   self.hist[id] = nil
   self.dirty[id] = nil
   self.lastPoint[id] = nil
+  self.debugSnap[id] = nil
+  self.debugHist[id] = nil
+  if self.debugSubCount then self.debugSubCount[id] = nil end
   if self.storage and self.storage.deleteFile then
     pcall(function() self.storage:deleteFile('history/' .. id .. '.json') end)
   end
+end
+
+-- --------------------------------------------------------------- debug (R2)
+--- The last `debug.snapshot` this instance's worker pushed (or nil, before the
+--- first one arrives).  hub/api.lua's on-demand GET route pulls a FRESH one
+--- straight from the worker instead of this cache -- this is what the `debug`
+--- WebSocket event is built from, and what a stopped/never-polled instance has.
+function T:debugSnapshot(id)
+  return self.debugSnap[tostring(id)]
+end
+
+--- The short rolling history of recent snapshots, oldest first, capped at
+--- `debugHistMax` (default 20).
+function T:debugHistory(id)
+  return self.debugHist[tostring(id)] or {}
 end
 
 -- ------------------------------------------------------------------- history
@@ -266,7 +307,10 @@ function T:addSocket(ws)
     dropped = 0, sent = 0,
     -- panel/rpc.js's {type:'subscribe'} frame.  nil = not subscribed, so a socket
     -- that never subscribes never receives a log or chat line for ANY instance.
-    subs = { logs = nil, chat = nil },
+    -- `debug` is the R3-assumed {type:'subscribeDebug',id} frame (panel/rpc.js's
+    -- WsClient#subscribeDebug) -- see setDebugSub below and this work item's
+    -- crossFileRequests for the one piece still missing outside this file.
+    subs = { logs = nil, chat = nil, debug = nil },
   }
   self.byWs[ws] = rec
   self.sockets[#self.sockets + 1] = rec
@@ -280,6 +324,12 @@ function T:removeSocket(ws)
   for i = 1, #self.sockets do
     if self.sockets[i] == rec then table.remove(self.sockets, i); break end
   end
+  -- WORK ITEM FIX: a socket that dies (tab closed, browser gone, reconnect in
+  -- progress) while its Debug tab was open must count as an unsubscribe too --
+  -- otherwise a worker whose one and only debug viewer vanished without a clean
+  -- {type:'subscribeDebug', id:null} keeps being told (once) that it is wanted
+  -- forever.  See _debugSubChanged below.
+  if rec.subs and rec.subs.debug then self:_debugSubChanged(rec.subs.debug, nil) end
   return true
 end
 
@@ -291,9 +341,87 @@ function T:socketCount() return #self.sockets end
 function T:setSubs(ws, logsId, chatId)
   local rec = self.byWs[ws]
   if not rec then return false end
+  -- setSubs replaces logs/chat but must not clobber a debug subscription set by
+  -- a separate {type:'subscribeDebug'} frame -- panel/rpc.js sends the two
+  -- independently (WsClient's own doc comment: "a separate frame ... rather
+  -- than a third field on it"), and re-sends `subscribe` on every reconnect
+  -- whether or not the Debug tab happens to be open.
+  local prevDebug = rec.subs and rec.subs.debug or nil
   rec.subs = { logs = logsId ~= nil and tostring(logsId) or nil,
-               chat = chatId ~= nil and tostring(chatId) or nil }
+               chat = chatId ~= nil and tostring(chatId) or nil,
+               debug = prevDebug }
   return true
+end
+
+--- Set (or clear, with id=nil) a socket's debug-snapshot subscription: R3's
+--- {type:'subscribeDebug', id} frame, kept independent of logs/chat above so
+--- it survives whatever `subscribe` frame the panel sends alongside it.
+--- hub/server.lua DOES parse that frame type (hub/server.lua's onMessage,
+--- `if ft == 'subscribeDebug' then self_.tel:setDebugSub(ws, frame.id) end`,
+--- mirroring the `subscribe` handler right above it there) -- that half of
+--- the wire-up is done. The gap this work item's WORK ITEM FIX closes is on
+--- the OTHER hop, worker-side: control/server.lua's `_debugTimer` used to
+--- push a `debug` event to every running worker every `debugIntervalMs`
+--- forever regardless of whether any socket here actually held a debug
+--- subscription, because it gated on `clientCount > 0` -- always true under
+--- hub supervision, since the worker's only /ws client is hub/supervisor
+--- .lua's own permanent status-poll control link. See _debugSubChanged below
+--- for the fix: this function now tells the worker, over that same control
+--- link, exactly when a real subscriber shows up or the last one leaves.
+function T:setDebugSub(ws, id)
+  local rec = self.byWs[ws]
+  if not rec then return false end
+  rec.subs = rec.subs or { logs = nil, chat = nil, debug = nil }
+  local newId = id ~= nil and tostring(id) or nil
+  local oldId = rec.subs.debug
+  if oldId == newId then return true end
+  rec.subs.debug = newId
+  self:_debugSubChanged(oldId, newId)
+  return true
+end
+
+--- WORK ITEM FIX: how many sockets currently hold a `subs.debug` subscription
+--- naming each instance, and the ONE place that tells the worker (over its
+--- control link) when that count crosses 0<->1+ -- the explicit "someone
+--- actually wants debug" signal control/server.lua's `_debugTimer` gates on
+--- instead of `clientCount`. Two sockets subscribed to the same instance's
+--- Debug tab collapse to a single `debug.subscribe`; the worker only hears
+--- `debug.unsubscribe` once the LAST one leaves.
+function T:_debugSubChanged(oldId, newId)
+  if oldId == newId then return end
+  self.debugSubCount = self.debugSubCount or {}
+  if oldId then
+    local n = (self.debugSubCount[oldId] or 1) - 1
+    if n <= 0 then
+      self.debugSubCount[oldId] = nil
+      self:_sendDebugWant(oldId, false)
+    else
+      self.debugSubCount[oldId] = n
+    end
+  end
+  if newId then
+    local n = (self.debugSubCount[newId] or 0) + 1
+    self.debugSubCount[newId] = n
+    if n == 1 then self:_sendDebugWant(newId, true) end
+  end
+end
+
+--- Forward the want/don't-want signal to the worker as a plain control-link
+--- command (control/server.lua answers it directly, without ever reaching
+--- control/commands.lua's dispatch table -- it is not a bot or config
+--- operation). `Sup:command` already fails soft ({code='offline'}) when the
+--- worker is not running, exactly like every other forwarded command, so a
+--- subscribe that arrives while the instance is stopped is simply a no-op:
+--- see the `running`-transition resync in T:onState below for how a worker
+--- that starts (or restarts) AFTER a subscription was already set catches up.
+function T:_sendDebugWant(id, on)
+  if not self.sup or not self.sup.command then return end
+  local ok, err = pcall(self.sup.command, self.sup, id,
+                         on and 'debug.subscribe' or 'debug.unsubscribe', {})
+  if not ok then
+    self.log.warn('hub: telemetry could not %s instance %s\'s debug stream: %s',
+                   on and 'subscribe to' or 'unsubscribe from', tostring(id), tostring(err))
+  end
 end
 
 function T:subsOf(ws)
@@ -444,6 +572,32 @@ function T:onWorkerEvent(instanceId, event, data)
     self:publish(event, payload, { instanceId = id })
     return
   end
+  if event == 'debug' then
+    data = type(data) == 'table' and data or {}
+    if data.id == nil then data.id = id end
+    -- The hub's own `reconnects` bookkeeping (loginState transitions the
+    -- supervisor has actually observed) is a better answer than the worker's
+    -- own count of how many transport objects it has built, so it overlays
+    -- here -- the ONE place every pushed `debug` event passes through -- the
+    -- same way hub/api.lua's on-demand route overlays it for a fresh pull.
+    if self.sup then
+      local ok, info = pcall(self.sup.info, self.sup, id)
+      if ok and type(info) == 'table' and type(data) == 'table' then
+        data.network = data.network or {}
+        data.network.reconnects = info.reconnects or data.network.reconnects
+      end
+    end
+    self.debugSnap[id] = data
+    local h = self.debugHist[id]
+    if not h then h = {}; self.debugHist[id] = h end
+    ringPush(h, data, self.debugHistMax)
+    -- R3's design (panel/rpc.js's WsClient#subscribeDebug doc comment): a
+    -- separate, opt-in stream so debug traffic only flows while an instance's
+    -- Debug tab is actually open -- gated exactly like log/chat, on `subs.debug`
+    -- rather than mere visibility.
+    self:publish('debug', data, { instanceId = id, subscription = 'debug' })
+    return
+  end
   if event == 'chat' then
     self:publish('chat', data, { instanceId = id, key = '', subscription = 'chat' })
     return
@@ -464,6 +618,17 @@ end
 
 function T:onState(instanceId, state, detail)
   local id = tostring(instanceId)
+  -- WORK ITEM FIX: a fresh (or restarted) worker's control link comes up with
+  -- its own `debugWanted` flag reset to false (control/server.lua's
+  -- Server:start), with no memory of a subscription this hub already holds
+  -- for it -- hub/supervisor.lua's own `_afterHandshake` re-pushes bot config
+  -- on every 'running' the same idempotent way for the same reason. 'running'
+  -- fires (among other times) exactly when _connectControl's onOpen sets it,
+  -- i.e. whenever a control link newly comes up, so this is where a
+  -- still-open Debug tab's subscription gets re-armed on the new link.
+  if state == 'running' and (self.debugSubCount and self.debugSubCount[id]) then
+    self:_sendDebugWant(id, true)
+  end
   local l = self:merge(id, {})
   l.state = state
   local info = self.sup and self.sup:info(id) or {}

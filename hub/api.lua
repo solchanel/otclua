@@ -77,6 +77,7 @@ local sha2   = require('lib.sha2')
 local proxylib = require('lib.proxy')
 local model  = require('hub.model')      -- for model.NIL, the clear-a-field sentinel
 local botconfig = require('hub.botconfig')  -- work item N3 -- CONFIGAPI.md's config.* routes
+local supervisor = require('hub.supervisor')  -- work item R2 -- Sup.flattenDebug only
 
 local M = {}
 M.PENDING = { '<pending>' }          -- a handler that will call done() itself
@@ -186,7 +187,7 @@ local function isMutating(cmd)
   if not verb then return false end
   local readOnly = { list = true, get = true, configs = true, history = true,
                      logs = true, chat = true, users = true, sessions = true, audit = true,
-                     configGet = true, configList = true }
+                     configGet = true, configList = true, debug = true }
   return not readOnly[verb]
 end
 M.isMutating = isMutating
@@ -1209,6 +1210,42 @@ H['instance.chat'] = function(self, args, ctx)
   return { messages = self.sup and self.sup:chat(inst.id, lim) or {} }
 end
 
+-- work item R2: GET /api/instances/:id/debug -- an ON-DEMAND structured
+-- diagnostic snapshot for the panel's Console tab, alongside the `debug`
+-- WebSocket event hub/telemetry.lua already fans out every debugIntervalMs.
+-- "On-demand" means a FRESH pull straight from the worker's control socket
+-- (control/commands.lua's `debug.snapshot`), not the telemetry cache -- an
+-- operator who just clicked "diagnose" wants this tick's numbers, not
+-- whatever last happened to arrive on the push timer.  A STOPPED instance has
+-- no worker to ask, so it falls back to the last snapshot telemetry cached
+-- (honestly marked `cached = true`), or an empty, honestly-labelled result
+-- when there has never been one.
+H['instance.debug'] = function(self, args, ctx, done)
+  local inst = self:ownedInstance(ctx, args.id)
+  if self.sup and self.sup:isRunning(inst.id) then
+    self.sup:debugSnapshot(inst.id, function(ok, res)
+      if not ok then return done(false, res) end
+      -- hub/supervisor.lua's flattenDebug reshapes control/commands.lua's raw
+      -- answer into the shape panel/app.js's Debug tab (R3) already assumes --
+      -- the same translation hub/supervisor.lua's onWorkerEvent 'debug' branch
+      -- applies to the PUSHED copy, so a GET and a WS frame never disagree.
+      local flat = supervisor.Sup.flattenDebug(res, inst.id)
+      -- The hub's own reconnect bookkeeping (loginState transitions actually
+      -- observed) is a better answer than the worker's own transport-object
+      -- count -- see the identical overlay in hub/telemetry.lua's `debug`
+      -- branch, which this mirrors for the on-demand path.
+      local info = self.sup:info(inst.id)
+      flat.network.reconnects = info.reconnects or flat.network.reconnects
+      done(true, { data = flat, cached = false })
+    end)
+    return M.PENDING
+  end
+  local cached = self.tel and self.tel:debugSnapshot(inst.id)
+  if cached then return { data = cached, cached = true } end
+  return { data = nil, cached = false,
+           note = 'the instance is not running and no debug snapshot has ever arrived for it' }
+end
+
 H['instance.say'] = function(self, args, ctx, done)
   local inst = self:ownedInstance(ctx, args.id)
   local ch = self.model.characters:get(inst.characterId)
@@ -1995,6 +2032,7 @@ local ROUTES = {
   { 'GET',    '/api/instances/:id/logs',     'instance.logs',       idBody },
   { 'GET',    '/api/instances/:id/chat',     'instance.chat',       idBody },
   { 'POST',   '/api/instances/:id/chat',     'instance.say',        idBody },
+  { 'GET',    '/api/instances/:id/debug',    'instance.debug',      idBody },
 
   -- game accounts
   { 'GET',    '/api/accounts',               'account.list' },

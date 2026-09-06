@@ -1464,7 +1464,7 @@ function CB:_registerActions()
     A('buysupplies', function(cb, v, retries) return cb:_actionBuySupplies(v, retries) end)
     A('sellall',     function(cb, v, retries) return cb:_actionSellAll(v, retries) end)
     A('depositor',   function(cb, v, retries) return cb:_actionDepositor(v, retries, false) end)
-    A('stowdeposit', function(cb, v, retries) return cb:_actionDepositor(v, retries, true) end)
+    A('stowdeposit', function(cb, v, retries) return cb:_actionStowDeposit(v, retries) end)
     A('bank',        function(cb, v, retries) return cb:_actionBank(v, retries) end)
     A('travel',      function(cb, v, retries) return cb:_actionTravel(v, retries) end)
 
@@ -1482,8 +1482,8 @@ function CB:_registerActions()
     -- ---- tasker (tasker.lua) ----------------------------------------------
     A('tasker', function(cb, v, retries) return cb:_actionTasker(v, retries) end)
 
-    -- ---- known but blocked on protocol builders luaclient does not have --
-    self:_unimplemented('forge', 'g_game.forgeRequest has no proto/sender.lua builder')
+    -- ---- forge (route_tools.lua) -------------------------------------------
+    A('forge', function(cb, v, retries) return cb:_actionForge(v, retries) end)
 end
 
 -- ---------------------------------------------------------------------------
@@ -1831,6 +1831,40 @@ function CB:_actionFunction(src, retries, prev)
         return false
     end
     return r                                     -- the return value IS the action's result
+end
+
+-- ---------------------------------------------------------------------------
+-- forge (route_tools.lua:59-90) -- Exaltation Forge: convert dust to slivers, or
+-- increase the dust limit.  value is "convert[,times]" or "limit[,times]"; times
+-- clamps to 1..50 and defaults to 1.  Each retry sends exactly one forgeRequest and
+-- waits 800 ms, exactly like the real waypoint, until `count` requests have gone out.
+-- ---------------------------------------------------------------------------
+function CB:_actionForge(value, retries)
+    local d = split(value)
+    local mode = tostring(d[1] or ''):lower()
+    local count = max(1, min(50, tonumber(d[2]) or 1))
+
+    local actionType, label
+    if mode == 'convert' then
+        actionType, label = 2, 'converting dust to slivers'      -- Otc::ForgeAction_t::DUST2SLIVER
+    elseif mode == 'limit' then
+        actionType, label = 4, 'increasing dust limit'           -- Otc::ForgeAction_t::INCREASELIMIT
+    else
+        self.log.warn('[CaveBot] forge: invalid value %s, use: convert[,times] or limit[,times]',
+                      tostring(value))
+        return false
+    end
+
+    if retries >= count then return true end   -- all requested forge actions were sent
+
+    -- 70 = ResourceTypes.FORGE_DUST (route_tools.lua:81 -- the constant table is not
+    -- exposed to the bot sandbox); informational only, the server validates the actual
+    -- cost and rejects an impossible request itself.
+    local dust = (self.state.resources and self.state.resources[70]) or 0
+    self.log.info('[CaveBot] forge: %s (%d/%d), dust: %s', label, retries + 1, count, tostring(dust))
+    if self.sender then self.sender:forgeRequest(actionType) end
+    self:setDelay(800)             -- route_tools.lua:86, a PLAIN delay() (OVERWRITE)
+    return 'retry'
 end
 
 -- ---------------------------------------------------------------------------
@@ -2320,6 +2354,159 @@ function CB:_stashingIndex(id)
         if tonumber(e.id) == id then return (tonumber(e.index) or 1) - 1 end
     end
     return nil
+end
+
+-- ---------------------------------------------------------------------------
+-- stowdeposit (depositor.lua:139-227): stash first, depot second.  "Stow all items of
+-- this type" (g_game.stashStowItem, action STOW_STACK=2) empties every stack of that
+-- item id from all open containers in one packet; anything the stash refuses (tiered
+-- items, or ids the server just won't take) falls back to the normal depot move.  A
+-- per-item 3-try cache (stowAttempts/stowFallback) matches the real script exactly: an
+-- item tried 3 times and never accepted by the stash is marked fallback for good and
+-- never re-offered to the stash again this run.
+-- ---------------------------------------------------------------------------
+function CB:_resetStowCache()
+    self._stowAttempts, self._stowFallback, self._stowReopened = nil, nil, nil
+end
+
+--- canStow(item) (depositor.lua:151-157): the server must have advertised a supply
+--- stash, the item must be pickupable, and it must carry no tier (a forged/upgraded
+--- item is refused by the real stash too).
+function CB:_canStow(it)
+    if not (self.state.player and self.state.player.supplyStashAvailable) then return false end
+    if not self:_itemFlag('isPickupable', it.id, false) then return false end
+    return (tonumber(it.tier) or 0) <= 0
+end
+
+function CB:_actionStowDeposit(value, retries)
+    value = tostring(value or 'no')
+    local loot = self:lootList()
+    if next(loot) == nil then
+        self.log.info('[CaveBot] stow: no items in loot list. Wrong TargetBot Config? Proceeding')
+        self:_resetStowCache()
+        self:resetLootCache()
+        return true
+    end
+    self:setDelay(70)                                    -- depositor.lua:151 (OVERWRITE)
+
+    -- "yes": reopen the loot containers first so items sitting in nested backpacks
+    -- become reachable, exactly like the plain Depositor's own "yes" mode.
+    if value:lower() == 'yes' then
+        if not self._stowReopened then
+            for _, c in pairs(self.state.containers or {}) do
+                local cid = type(c.item) == 'table' and c.item.id
+                if cid and self._lootContainers and self._lootContainers[cid] and self.sender then
+                    self.sender:closeContainer(c.id)
+                end
+            end
+            self._stowReopened = true
+            self:setDelay(3000)
+            return 'retry'
+        end
+        if not self:_hasLootItems(loot) then
+            -- nested-spare-bag scan: an open loot-container backpack may hold another
+            -- backpack of the SAME item id one level down -- open the first one found.
+            for _, c in pairs(self.state.containers or {}) do
+                local cid = type(c.item) == 'table' and c.item.id
+                if cid and self._lootContainers and self._lootContainers[cid] then
+                    for idx, it in ipairs(c.items or {}) do
+                        if it.id == cid then
+                            local slot = (c.firstIndex or 0) + idx - 1
+                            if self.sender then
+                                self.sender:openContainer(CB.slotPosition(c, slot), it.id, slot, 0)
+                            end
+                            self:setDelay(100)
+                            return 'retry'
+                        end
+                    end
+                end
+            end
+            self.log.info('[CaveBot] stow: all items handled, no backpack to open next, proceeding')
+            self:_resetStowCache()
+            self:resetLootCache()
+            self:setDelay(3000)
+            return true
+        end
+    end
+
+    if retries == 0 and not self:_hasLootItems(loot) then
+        self.log.info('[CaveBot] stow: no items to stash, proceeding')
+        self:_resetStowCache()
+        self:resetLootCache()
+        return true
+    end
+    if retries > 400 then
+        self.log.warn('[CaveBot] stow: action limit reached, proceeding')
+        self:_resetStowCache()
+        self:resetLootCache()
+        return true
+    end
+
+    -- stash and depot are both at the locker, so reach it either way
+    if not self:reachAndOpenDepot() then return 'retry' end
+    self:pingDelay(2)
+
+    self._stowAttempts = self._stowAttempts or {}
+    self._stowFallback = self._stowFallback or {}
+
+    -- PASS 1: stow every loot item the supply stash will accept.
+    for _, c in pairs(self.state.containers or {}) do
+        local n = tostring(c.name or ''):lower()
+        if not (n:find('depot') or n:find('your inbox')) then
+            for idx, it in ipairs(c.items or {}) do
+                local id = it.id
+                if id and loot[id] and not self._stowFallback[id] then
+                    if self:_canStow(it) then
+                        self._stowAttempts[id] = (self._stowAttempts[id] or 0) + 1
+                        -- still here after a few tries? the stash won't take it
+                        if self._stowAttempts[id] > 3 then
+                            self._stowFallback[id] = true
+                            self.log.info('[CaveBot] stow: %d not stowable, will use depot', id)
+                        else
+                            self.log.info('[CaveBot] stow: stowing all of item: %d', id)
+                            local slot = (c.firstIndex or 0) + idx - 1
+                            if self.sender then
+                                -- action 2 == Otc::Supply_Stash_Actions_t::SUPPLY_STASH_ACTION_STOW_STACK
+                                self.sender:stashStowItem(CB.slotPosition(c, slot), id, 0, slot, 2)
+                            end
+                            self:setDelay(200)
+                            return 'retry'
+                        end
+                    else
+                        self._stowFallback[id] = true
+                    end
+                end
+            end
+        end
+    end
+
+    -- PASS 2: whatever the stash refused goes into the depot boxes.
+    local destination = self:getContainerByName('Depot chest')
+    if not destination then return 'retry' end
+
+    for _, c in pairs(self.state.containers or {}) do
+        local n = tostring(c.name or ''):lower()
+        if not (n:find('depot') or n:find('your inbox')) then
+            for idx, it in ipairs(c.items or {}) do
+                if it.id and loot[it.id] then
+                    local index = self:_stashingIndex(it.id)
+                    if index == nil then
+                        index = self:_itemFlag('isStackable', it.id, false) and 1 or 0
+                    end
+                    local slot = (c.firstIndex or 0) + idx - 1
+                    if self.sender then
+                        self.sender:move(CB.slotPosition(c, slot), it.id, slot,
+                                         CB.slotPosition(destination, index), it.count or 1)
+                    end
+                    return 'retry'
+                end
+            end
+        end
+    end
+
+    self:_resetStowCache()
+    self:resetLootCache()
+    return true
 end
 
 -- ---------------------------------------------------------------------------

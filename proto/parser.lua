@@ -983,8 +983,14 @@ S[0x29] = function(self, R)                       -- SupplyStash
   self.state.supplyStash = items
 end
 
+-- protocolgameparse.cpp:5542-5548 (parseSpecialContainer): u8 supplyStashAvailable ->
+-- LocalPlayer::setSupplyStashAvailable, then (>=1220 only) a u8 isMarketAvailable that
+-- the real client also throws away (never stored anywhere).  Stored on state.player so a
+-- shim/bot query (`player:isSupplyStashAvailable()`) can answer truthfully instead of a
+-- hardcoded false -- was previously read and discarded here.
 S[0x2A] = function(self, R)                       -- SpecialContainer
-  R:u8()                                          -- supplyStashAvailable
+  local avail = R:u8()
+  self:player().supplyStashAvailable = (avail ~= 0)
   if self.protocolVersion >= 1220 then R:u8() end -- isMarketAvailable
 end
 
@@ -1733,6 +1739,23 @@ S[0x8A] = function(self, R)                       -- ForgeResult
 end
 
 -- --- creatures -------------------------------------------------------------
+-- CreatureData sub-type 11/12/13: protocolgameparse.cpp:2434-2456's parseCreatureData
+-- switches on the type byte, but cases 11 ("creature mana percent"), 12 ("creature show
+-- status") and 13 ("player vocation") all fall through to the SAME call --
+-- setCreatureVocation(msg, creatureId) (:2346-2355), which reads exactly ONE u8 and does
+-- nothing but `creature->setVocation(vocationId)`.  Creature::setManaPercent exists
+-- (creature.h:61, m_manaPercent defaults to 101) but is bound to Lua only -- there is no
+-- C++ call site for it anywhere in the parse path, confirmed by an exhaustive grep of
+-- src/client/*.cpp.  So at 1530 there is no genuine, separate "party mana" or "show
+-- status" byte on the wire: whatever a type-11/12 packet carries just overwrites the same
+-- vocation field a type-13 packet would, and inventing a distinct manaPercent/showStatus
+-- field here would be storing a value this wire never actually carries.  (The real vBot
+-- "party mana" feature vBot scripts read via `creature:setManaPercent(...)` comes from an
+-- entirely different source -- the user's own self-hosted BotServer relay,
+-- mods/game_bot/default_configs/vBot_4.8/vBot/BotServer.lua:145 -- a Lua-level socket
+-- broadcast between the user's own bot instances, already a stated non-goal for luaclient:
+-- docs/vbot/parity.md §3 "isFriend / BotServer roster".)  All three types therefore write
+-- the one real field: a per-remote-creature vocation, which IS on the wire (G6).
 S[0x8B] = function(self, R)                       -- CreatureData
   local id = R:u32()
   local t  = R:u8()
@@ -1741,11 +1764,7 @@ S[0x8B] = function(self, R)                       -- CreatureData
   elseif t == 11 or t == 12 or t == 13 then
     local v = R:u8()
     local c = self:creature(id)
-    if c then
-      if t == 11 then c.manaPercent = v
-      elseif t == 12 then c.showStatus = v
-      else c.vocation = v end
-    end
+    if c then c.vocation = v end                  -- all three sub-types share this field
   elseif t == 14 then
     local icons = self:readIconList(R)
     local c = self:creature(id)

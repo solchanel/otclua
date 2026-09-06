@@ -135,6 +135,9 @@ local function newPlayer()
         direction = 0,
         outfit = nil, vocation = 0, blessings = 0,
         isDead = false,
+        -- proto/parser.lua S[0x2A] (SpecialContainer) -- LocalPlayer::isSupplyStashAvailable's
+        -- C++ default is false (localplayer.h:199) until the server sends the byte.
+        supplyStashAvailable = false,
         -- walk model (docs/state-events.md §17); the walker owns these, we just hold them
         serverPos = nil, preWalks = {}, walkLockUntil = 0,
         waitingForServerWalk = false, lastWalkTime = 0,

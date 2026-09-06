@@ -312,8 +312,11 @@ it always was.
    at 1530: `ThingFlagAttrFloorChange` is only ever set from the legacy `.dat`
    path, so the live client also returns false. vBot itself says so at
    `cavebot/walking.lua:62`. It reports loudly on the first call.
-3. **`Creature:getManaPercent()` returns 100** for other party members — the 0x8B
-   party mana byte is discarded by the parser (gap G7).
+3. **`Creature:getManaPercent()` returns 100** for other party members — verified (work item
+   R1) that opcode 0x8B never carries a genuine separate party-mana byte at 1530 in the first
+   place (types 11/12/13 all funnel into the same `setCreatureVocation()` call in the real
+   client); vBot's own party-mana reading comes from its self-hosted BotServer relay instead
+   (gap G7, retitled — not a discarded byte).
 4. **`g_game.getUnjustifiedPoints()` is real** (gap G3 closed): opcode 0xB7 is parsed
    into `state.unjustified` and the accessor reads it. **Until the packet arrives** the
    three `*Remaining` fields answer **255**, not 0. That choice is deliberate:
@@ -627,7 +630,7 @@ shim.pressHotkey('Ctrl+F1')            -- true = something was bound, false = no
 `--vbot-strict` turns every "not implemented headless" report into an `error()`,
 which is the way to find out whether a script is quietly relying on a stub. Three
 documented deviations still sit on live vBot paths and *will* raise under
-`--vbot-strict`: `isSupplyStashAvailable` (gap G4), `getManaPercent` (gap G7) and
+`--vbot-strict`: `getManaPercent` (gap G7, no genuine wire byte exists) and
 `Tile:hasFloorChange` (which is the C++-exact answer). `getUnjustifiedPoints` raises only
 **before** opcode 0xB7 has arrived and goes quiet once it has. So `--vbot-strict` is still
 a diagnostic mode rather than a production one, but the list is three items shorter than

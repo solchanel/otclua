@@ -393,6 +393,7 @@ GET/PATCH/DELETE/api/instances/:id    GET  /api/instances/:id/configs|history|lo
 PUT  /api/instances/:id/macros/:name  POST /api/instances/:id/reload|exec|chat
 GET/PUT         /api/instances/:id/config/:kind        (CONFIGAPI.md -- BUILT, see below)
 GET             /api/instances/:id/config/:kind/list
+GET             /api/instances/:id/debug               (the Debug tab -- see below)
 GET/POST        /api/accounts         PATCH/DELETE /api/accounts/:id
 GET/POST        /api/characters       DELETE /api/characters/:id
 GET/POST        /api/proxies          PATCH/DELETE /api/proxies/:id   POST /api/proxies/:id/test
@@ -409,10 +410,41 @@ Errors are a non-2xx status with `{"error":{"code","message"}}`; codes are `bad-
 `internal`.
 
 `GET /ws` speaks the panel's dialect: the client sends `{type:'auth', csrf}` first and the hub
-answers `{event:'ready'}`; then `{type:'subscribe', logs, chat}` and `{type:'ping'}`. A wrong CSRF
-token closes the socket with **4401**, which is what tells the panel to stop retrying. Log and chat
-frames go **only** to sockets subscribed to that instance. `POST /api/rpc` and `GET /api/events`
-remain as an older command-envelope surface for non-browser clients and the hub's own tests.
+answers `{event:'ready'}`; then `{type:'subscribe', logs, chat}`, `{type:'subscribeDebug', id}`
+(the Debug tab, below -- a separate frame from `subscribe` on purpose, so the log/chat wire shape
+and every test asserting its exact JSON stay untouched) and `{type:'ping'}`. A wrong CSRF token
+closes the socket with **4401**, which is what tells the panel to stop retrying. Log, chat and
+`debug` frames go **only** to sockets subscribed to that instance (and, for `debug`, only while a
+Debug tab is actually open -- `subscribeDebug(null)` on tab close/switch). `POST /api/rpc` and
+`GET /api/events` remain as an older command-envelope surface for non-browser clients and the
+hub's own tests.
+
+## Debug console (the Debug tab) — BUILT
+
+A fourth instance-view tab, next to Console/Chat: tick health (a sparkline of the last 30 tick
+durations, slow-tick counter, a per-macro table sortable by error count), network health (a
+staleness warning once `lastPacketAgeMs` exceeds a threshold), a status card per bot module
+(CaveBot/TargetBot/HealBot/AttackBot/Stances) with a "stuck" warning once a waypoint stalls past
+`stuckThresholdMs`, and a structured, filterable event log (`resync`, `macro_error`, `slow_tick`,
+`stuck`, `path_blocked`, `reconnect`, …).
+
+Data comes from `control/commands.lua`'s `debug.snapshot` command (BOT.md §17), reshaped for the
+panel by `hub/supervisor.lua`'s `flattenDebug()` — the same translation role `flattenLive()` plays
+for the Overview tab's stats: the worker answers in its own natural shape, one function reshapes
+it once, in the hub, into what `panel/app.js`'s `TabDebug` reads. That reshaping is also where a
+genuine clock-domain fix lives: the worker's "moment" fields (a macro's last-ran time, a stuck
+waypoint's start, an event's timestamp) are `sys.nowMs()` values — **monotonic since that worker
+process started**, not Unix epoch (see BOT.md §17) — and `flattenDebug()` converts each one to an
+epoch-comparable value (`wallNow - workerMonotonicNow` computed fresh per snapshot) before the
+panel ever does `Date.now() - x` arithmetic on it. Two surfaces: `GET
+/api/instances/:id/debug` (on-demand — a fresh pull from the worker while running, the last cached
+push while stopped) and the `debug` WebSocket event pushed by `control/server.lua` every
+`debugIntervalMs` (2000 ms) to sockets that sent `{type:'subscribeDebug', id}`.
+
+Proven against the real hub HTTP API, not just the fake-worker test suites: a real
+`luajit main.lua --dry-run` worker spawned under a real hub, a broken macro registered live over
+`POST /api/instances/:id/exec`, its `errorCount`/`lastError` and a `macro_error` event both
+visible moments later over `GET /api/instances/:id/debug` — on both Windows and Debian/WSL.
 
 ## Bot configuration API (CONFIGAPI.md) — BUILT
 
@@ -449,7 +481,8 @@ Single page, vanilla JS, served by the hub, dark theme, no build step and no CDN
   (CONFIGAPI.md, BUILT — six lazily-loaded cards: Healing, Conditions, Attack, Stances, Targeting,
   CaveBot; add/duplicate/remove/reorder rows, per-card Save/Revert, a CaveBot `function` waypoint
   gated on the same `canExec` check the Console tab already uses), Console (log stream, Lua exec),
-  Chat.
+  Chat, **Debug** (tick/network/per-module health + a structured event log — see "Debug console"
+  above).
 * **Characters & accounts**: add/remove game accounts and characters, assign proxies (with a Test
   button).
 * **Scripts**: upload, view, assign to instances, delete.

@@ -829,9 +829,14 @@ function M.new(LC, reg, opts)
         return s:imbuementDurations(isOpen and true or false)
     end
 
-    function g.forgeRequest()
-        reg:report('g_game.forgeRequest', 'no forge sender (1 decorative call site)')
-        return nil
+    -- Otc::ForgeAction_t (const.h) -- proto/sender.lua:forgeRequest, opcode 0xBF
+    -- (work item R1 added the builder; this call site was missed at the time --
+    -- see docs/vbot/parity.md sec.4 / that work item's crossFileRequests).
+    function g.forgeRequest(actionType, convergence, firstItemId, firstItemTier,
+                             secondItemId, improveChance, tierLoss)
+        local s = sender(); if not canAct() or not s then return end
+        return s:forgeRequest(actionType, convergence, firstItemId, firstItemTier,
+                               secondItemId, improveChance, tierLoss)
     end
 
     -- Render / map-view surface (blocker B4): callable, inert, never consulted for a

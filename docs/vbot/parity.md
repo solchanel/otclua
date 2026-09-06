@@ -2,12 +2,12 @@
 
 Consolidated by the integration work item on 2026-09-06, reconciling four parallel work items
 (Q1 = `bot/cavebot.lua`, Q2 = `bot/attackbot.lua`, Q3 = `bot/targetbot.lua`+`bot/loot.lua`,
-Q4 = `shim/` compat-layer behaviour tests) after all four landed. This is the honest answer to
+Q4 = `shim/` compat-layer behaviour tests) after all four landed, and updated by work item R1
+(2026-09-06) which closed the three wire-level gaps §4 used to list. This is the honest answer to
 "is it a mirror copy now": **every documented action type, spell category, targeting field and
 looting rule is implemented or explicitly, deliberately not implemented for a stated reason** —
-there is no undocumented gap left in the three engines. Two narrow wire-level gaps remain and are
-listed in full at the bottom (§4); both require a proto/parser.lua or proto/sender.lua builder
-that is outside every current work item's file ownership.
+there is no undocumented gap left in the three engines, wire-level or otherwise. §4 (now closed)
+keeps the record of what those three gaps were and where the fix landed.
 
 Legend: **✅ implemented** (behaviour-tested against the real vBot source) · **◐ partial**
 (works, with a stated simplification) · **✖ not implemented** (stated reason + blocker).
@@ -30,7 +30,7 @@ grammar). Test: `test/botsuite.lua` M2 section (220 assertions).
 | `delay` | ✅ | `cavebot.lua` | |
 | `walkdelay` | ✅ | `route_tools.lua` | |
 | `exanihur` / `turn` | ✅ | `route_tools.lua` | |
-| `forge` | ✖ not implemented | `route_tools.lua` | needs `g_game.forgeRequest` (`Otc::ForgeAction_t`); no `proto/sender.lua` builder exists. **§4.1** |
+| `forge` | ✅ implemented | `route_tools.lua` | `sender:forgeRequest(actionType)` (`proto/sender.lua`, opcode 0xBF) plus `CB:_actionForge` (`bot/cavebot.lua`): parses `convert[,times]`/`limit[,times]`, sends one request per retry with an 800 ms delay, and completes once `retries >= count`. **§4.1 (closed)** |
 | `doors` / `opendoors` | ✅ | `doors.lua` | |
 | `cleartile` | ✅ | `clear_tile.lua` | |
 | `poscheck` | ✅ | `pos_check.lua` | |
@@ -39,7 +39,7 @@ grammar). Test: `test/botsuite.lua` M2 section (220 assertions).
 | `buysupplies` | ✅ | `buy_supplies.lua` | |
 | `sellall` | ✅ | `sell_all.lua` | |
 | `depositor` (plain) | ✅ | `depositor.lua` | |
-| `depositor` (`stow=true` / `stowdeposit`) | ◐ partial | `depositor.lua` | real algorithm is a two-pass stash-then-depot with a per-item 3-try `stowAttempts`/`stowFallback` cache and a "yes" reopen-loot-containers mode, driven by `g_game.stashStowItem`. That sender builder does not exist, so this action currently falls back to a plain depositor pass instead. **§4.2** |
+| `depositor` (`stow=true` / `stowdeposit`) | ✅ implemented | `depositor.lua` | `sender:stashStowItem(pos, itemId, count, stackpos, action)` (`proto/sender.lua`, opcode 0x28) plus `CB:_actionStowDeposit` (`bot/cavebot.lua`): the real two-pass stash-then-depot algorithm, a per-item 3-try `_stowAttempts`/`_stowFallback` cache, and the `"yes"` reopen-loot-containers/nested-spare-bag mode. **§4.2 (closed)** |
 | `withdraw` | ✅ | `withdraw.lua` | depot-box-index or inbox (non-numeric source ⇒ inbox, matching upstream's `tonumber()` nil quirk) |
 | `dpwithdraw` | ✅ | `d_withdraw.lua` | cap-limit bailout, sub-container-when-full, stash-empty detection; the real script's second, unreachable `containerIsFull` branch (dead code — references an undefined local) is deliberately not reproduced |
 | `inwithdraw` | ✅ | `inbox_withdraw.lua` | |
@@ -47,9 +47,8 @@ grammar). Test: `test/botsuite.lua` M2 section (220 assertions).
 | `rushlure` | ✅ | `stand_lure.lua` | distance/hasEnough gates, blocking-monster clear+chase, `enable` flag applied same-tick instead of deferred to a GUI `onChildFocusChange` event (net effect identical one tick earlier) |
 | `tasker` | ✅ | `tasker.lua` | markers 1/2/3, NPC-in-range gates, `Loot of …` kill counter; deliberately reproduces the real script's own bug where an invalid marker's `dataValidationFailed()` does not actually stop execution |
 
-**CaveBot total: 22/23 action types implemented (1 partial, 1 blocked).** The blocked one
-(`forge`) and the partial one (`stowdeposit`'s stash half) both need a new `proto/sender.lua`
-builder — see §4.
+**CaveBot total: 23/23 action types fully implemented.** `forge` and `stowdeposit`'s stash half
+were the last two gaps, both closed by work item R1 — see §4.
 
 Config-executing non-action files (`minimap.lua`, `recorder.lua`, `editor.lua`,
 `extension_template.lua`) carry **zero waypoint-execution logic** — they are GUI-only (right-click
@@ -86,7 +85,7 @@ Source: `vBot/AttackBot.lua`. Spec: `docs/vbot/attackbot.md` + `docs/vbot/attack
 | PvP mode short-circuit + PvpSafe grid veto | ✅ | AB:2896-2907 | |
 | mana%/harmony/cooldown gates | ✅ | A7 test section | |
 | Auto Turn + `autoTurnAndFire` | ✅ | | |
-| TFB `castAtPos` SpellCastTable dedup bookkeeping | ◐ partial | AB:1556-1569 | real `castAtPos` mirrors `cast()`'s dedup/delay bookkeeping; `bot/shared.lua`'s `S:sayAt` (which the TFB path calls) is a plain passthrough with none. Only observably different in CustomCooldown mode with `entry.cooldown >= 100` on a TFB entry — ServerCooldown (the common case, `executeCooldown=30`) never reaches the affected branch. **§4.3** |
+| TFB `castAtPos` SpellCastTable dedup bookkeeping | ◐ partial | AB:1556-1569 | `bot/shared.lua`'s `S:sayAt` now takes the same optional `delayMs` and does the identical `castTable` dedup/delay bookkeeping `S:cast` already had (work item R1, test-proven directly against `S:cast`'s own behaviour). Still partial: `bot/attackbot.lua:1032`'s `_optTile` call site (`self.sh:sayAt(entry.spell, best.pos)`) does not pass `executeCooldown` as the third argument, so the new bookkeeping is not yet wired up end to end — `bot/attackbot.lua` is outside R1's file ownership. **§4.3 (sender half closed; one-line caller fix outstanding, see crossFileRequests)** |
 
 **AttackBot total: 17/18 rows fully implemented, 1 narrow partial** (a bookkeeping edge case
 confined to one uncommon cooldown-mode combination).
@@ -135,30 +134,39 @@ exact mechanism (a raised Lua error, a BotServer socket) that produces it upstre
 
 ---
 
-## 4. Remaining wire-level gaps (blocked on files outside every current work item)
+## 4. Wire-level gaps — CLOSED by work item R1 (2026-09-06)
 
-These three items are the only genuine behavioural gaps left across all three engines, and every
-one is blocked on the same kind of thing: a `proto/sender.lua` (or `proto/parser.lua`) builder
-that does not exist yet, needed by a file none of Q1–Q4 owns.
+These three items were the only genuine behavioural gaps left across all three engines, each
+blocked on a `proto/sender.lua` builder that did not exist yet. R1 added the builders (plus two
+`proto/parser.lua` field fixes noted below) and wired them into the two CaveBot actions and
+`bot/shared.lua`. Kept here as the record of what the gaps were and where the fix landed.
 
-1. **`forge` waypoint action** (§1) — needs a `sender:forgeRequest(actionType)` builder for
-   `g_game.forgeRequest` / `Otc::ForgeAction_t`. The waypoint logic itself is trivial (send
-   actionType 2 convert-dust or 4 increase-limit, 800 ms delay, retry until a configured send
-   count) once the builder exists.
-2. **`stowdeposit`'s stash half** (§1) — needs a `sender:stashStowItem(pos, itemId, subType,
-   stackpos, action)` builder for `g_game.stashStowItem` (opcode 0x28 per `docs/shim/api-game.md`
-   gap G10). Until then the action takes a plain depositor pass instead of the real two-pass
-   stash-then-depot algorithm.
-3. **TFB `castAtPos` dedup bookkeeping** (§2) — needs `bot/shared.lua`'s `S:sayAt` to gain the
-   same `SpellCastTable`-style dedup/delay bookkeeping `S:cast` already has. Only observable in
-   CustomCooldown mode with a ≥100 ms cooldown on a Thousand Fist Blows entry specifically.
+1. **`forge` waypoint action** (§1) — **closed.** `sender:forgeRequest(actionType)`
+   (`proto/sender.lua`, opcode 0xBF `Otc::ForgeAction_t`) plus `CB:_actionForge`
+   (`bot/cavebot.lua`): send actionType 2 (convert dust) or 4 (increase limit), 800 ms delay,
+   retry until the configured send count. Byte-exact and retry-until-count assertions:
+   `test/botsuite.lua` "R1: proto.sender..." and "R1: CaveBot forge waypoint...".
+2. **`stowdeposit`'s stash half** (§1) — **closed.** `sender:stashStowItem(pos, itemId, count,
+   stackpos, action)` (`proto/sender.lua`, opcode 0x28, `docs/shim/api-game.md` gap G10) plus
+   `CB:_actionStowDeposit` (`bot/cavebot.lua`): the real two-pass stash-then-depot algorithm, a
+   per-item 3-try `_stowAttempts`/`_stowFallback` cache, and the `"yes"` reopen/nested-bag mode.
+   Assertions: `test/botsuite.lua` "R1: CaveBot stowdeposit...".
+3. **TFB `castAtPos` dedup bookkeeping** (§2) — **sender half closed, caller fix outstanding.**
+   `bot/shared.lua`'s `S:sayAt` now takes an optional `delayMs` and does the identical
+   `SpellCastTable` dedup/delay bookkeeping `S:cast` already has (assertions: `test/botsuite.lua`
+   "R1: bot/shared.lua S:sayAt..."). `bot/attackbot.lua:1032`'s `_optTile` call site still needs
+   to pass `executeCooldown` as that third argument for the fix to be observable in a live tick —
+   outside R1's file ownership, routed to `crossFileRequests`.
 
-None of these three are reachable from inside `bot/cavebot.lua`, `bot/attackbot.lua`,
-`bot/targetbot.lua` or `bot/loot.lua` alone — they need a change to `proto/sender.lua` or
-`bot/shared.lua`, which is why they were routed to `crossFileRequests` rather than fixed in
-place. They do not block "mirror copy" status for any waypoint/spell/rule a typical profile
-actually uses; `forge` and `stowdeposit`'s stash mode are both off by default and absent from the
-user's own real cavebot routes checked by `tools/vbot_compat_check.lua`.
+Two other `proto/parser.lua` gaps closed in the same pass, per the earlier crossFileRequest
+(neither has its own row above — they back `docs/shim/api-game.md` gaps G4/G6/G7):
+`state.player.supplyStashAvailable` (opcode 0x2A, previously read and discarded) and opcode
+0x8B's per-remote-creature `vocation` field (types 11/12/13 all write it — see that opcode's
+parser comment for why there turned out to be no separate "party mana" byte to store at 1530).
+
+`forge` and `stowdeposit`'s stash mode are both off by default and absent from the user's own
+real cavebot routes checked by `tools/vbot_compat_check.lua`, so this closure does not change
+anything about the user's live profile — it closes the gap for any profile that does use them.
 
 ---
 

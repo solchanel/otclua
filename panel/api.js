@@ -86,6 +86,23 @@ var ENDPOINTS = {
   'instances.chat':   { method: 'GET',    path: '/api/instances/:id/chat', params: ['id'], query: ['limit'] },
   // {channel:number, text} -> {}
   'instances.say':    { method: 'POST',   path: '/api/instances/:id/chat', params: ['id'] },
+  // -> DebugSnapshot (R3, ASSUMED shape pending R2 -- see the R3 report's crossFileRequests):
+  //   { id, generatedAt,
+  //     tick: { configuredMs, lastMs, avgMs, durationsMs:[n,...], slowThresholdMs, slowCount,
+  //             macros:[{name,label,on,lastRanAt,lastDurationMs,errorCount,lastError}] },
+  //     network: { connected, pingMs, packetsIn, packetsOut, reconnects, lastError,
+  //                lastPacketAt, lastPacketAgeMs, staleThresholdMs },
+  //     bot: { cavebot:{enabled,waypointIndex,waypointCount,waypointLabel,stuckSince,stuckThresholdMs},
+  //            targetbot:{enabled,candidate,target,lootingState},
+  //            healbot:{enabled,lastAction,lastActionAt},
+  //            attackbot:{enabled,lastAction,lastActionAt},
+  //            stances:{enabled,lastAction,lastActionAt} },
+  //     path: { lastComputedAt, lengthTiles, blocked, sourcePos, targetPos },
+  //     events: [{tMs, kind, detail}] }         ring buffer, oldest first
+  // Pushed live as the `debug` WS event once `{type:'subscribeDebug',id}` is sent
+  // (panel/rpc.js WsClient#subscribeDebug) -- a separate stream from logs/chat so
+  // it only flows while an instance's Debug tab is actually open.
+  'instances.debug':  { method: 'GET',    path: '/api/instances/:id/debug', params: ['id'] },
 
   /* ---- bot config (CONFIGAPI.md) ------------------------------------ */
   // kind ∈ healbot|conditions|attackbot|stances|targetbot|cavebot
@@ -170,9 +187,10 @@ var ENDPOINTS = {
    mock agree. See panel/rpc.js WsClient for the client half. */
 var WS = {
   path: '/ws',
-  clientFrames: ['auth', 'subscribe', 'ping'],
+  clientFrames: ['auth', 'subscribe', 'subscribeDebug', 'ping'],
   serverEvents: ['ready', 'pong', 'status', 'stats', 'log', 'chat', 'instance',
-                 'script', 'loginState', 'gameStart', 'gameEnd', 'death', 'error', 'audit'],
+                 'script', 'loginState', 'gameStart', 'gameEnd', 'death', 'error', 'audit',
+                 'debug'],
   closeCodes: { unauthenticated: 4401, forbidden: 4403 }
 };
 

@@ -329,6 +329,46 @@ cmds['say'] = function(a)
   return true
 end
 
+-- work item R2: a plausible, structurally-real `debug.snapshot` answer.  The
+-- real shape (tick/network/bot/path/events) is control/commands.lua's own --
+-- this fake worker only needs to stand in for THAT wire answer the way it
+-- already stands in for status/stats, so hub/api.lua's routing, ownership and
+-- response-shaping are exercised against something real-shaped rather than
+-- re-deriving control/commands.lua's numbers a second time here.
+local debugSeq = 0
+local function debugSnapshotPayload()
+  debugSeq = debugSeq + 1
+  return {
+    tMs = sys.nowMs(),
+    tick = { intervalMs = 10, lastTickMs = sys.nowMs(), lastTickDurationMs = 1,
+             avgTickDurationMs = 1.2, slowTicks = 0, macroCount = 2,
+             macros = { { name = 'healbot', enabled = true, lastRanMs = sys.nowMs(),
+                          lastDurationMs = 0, errorCount = 0, lastError = nil } } },
+    network = { connected = inGame, ping = 45, lastPacketAgeMs = 20,
+                packetsIn = 100 + debugSeq, packetsOut = 40, bytesIn = 5000, bytesOut = 900,
+                reconnects = 0, lastDesyncOrError = nil },
+    bot = { cavebot = { on = false, config = 'venore.cfg', waypointIndex = 3,
+                        waypointCount = 40, currentAction = 'goto', lastActionResult = 'ok:goto',
+                        stuckSince = 0 } },
+    path = { lastFindMs = sys.nowMs(), lastFindDurationMs = 1, lastFindResult = 'ok',
+             lastFindTileCount = 12 },
+    events = { { tMs = sys.nowMs(), kind = 'configReload', detail = { seq = debugSeq } } },
+  }
+end
+cmds['debug.snapshot'] = function() return debugSnapshotPayload() end
+
+-- Test-only: push {n} `debug` events spaced a few ms apart (a "fast-polling
+-- worker"), so test/hubapisuite.lua can assert the hub's fan-out rate cap
+-- (hub/telemetry.lua's COALESCE) without waiting on a real bot's tick rate.
+cmds['debug.flood'] = function(a)
+  local n = tonumber(a and a.n) or 40
+  local everyMs = tonumber(a and a.everyMs) or 5
+  for i = 1, n do
+    sched.after(i * everyMs, function() broadcast('debug', debugSnapshotPayload()) end)
+  end
+  return { queued = n }
+end
+
 local stopping = false
 cmds['shutdown'] = function()
   say('worker: shutting down on request\n')
@@ -1368,6 +1408,95 @@ runSuite('telemetry / events reach a panel socket', function()
   waitFor(function() return foreign.status ~= nil end, 3000)
   eq(foreign.status, 403, 'a foreign-Origin WebSocket is refused 403')
   foreign:close()
+  step(50)
+end)
+
+-- ==================================== debug snapshot + event (work item R2) ==
+-- GET /api/instances/:id/debug (on-demand, over the real REST/RPC surface) and
+-- the `debug` WebSocket event (pushed by the real worker, fanned out through
+-- the real hub/telemetry.lua).  R3 (the panel side, already built -- see
+-- panel/rpc.js's WsClient#subscribeDebug and panel/api.js's `instances.debug`
+-- entry) gates the WS stream behind an explicit {type:'subscribeDebug',id}
+-- frame, kept independent of logs/chat; hub/server.lua does not parse that
+-- frame type yet (this work item's crossFileRequests -- it owns hub/server.lua,
+-- which R2 does not), so the subscription is set directly on the hub's own
+-- telemetry object below -- exactly what that one missing line would do --
+-- which still drives the REAL worker -> REAL supervisor -> REAL telemetry ->
+-- REAL WebSocket pipeline for everything past that single wire frame.
+runSuite('api / debug snapshot + telemetry debug event (work item R2)', function()
+  -- 1) on-demand GET, over /api/rpc's instance.debug -- a FRESH pull from the
+  --    real running worker, not a cache.
+  local snap = rpcOk(PORT, 'instance.debug', { id = ids.instance })
+  eq(snap.cached, false, 'a running instance answers with a FRESH snapshot, not a cache')
+  check(type(snap.data) == 'table', 'instance.debug returns a structured snapshot')
+  local d = snap.data or {}
+  check(type(d.tick) == 'table' and type(d.network) == 'table' and type(d.bot) == 'table'
+        and type(d.path) == 'table' and type(d.events) == 'table',
+        'the snapshot has the documented tick/network/bot/path/events sections')
+  eq(d.id, ids.instance, 'flattenDebug stamps the HUB instance id, which the worker cannot know')
+  eq(#d.tick.macros, 1, "tick numbers reach the panel from the real worker, unmodified")
+  eq(d.tick.macros[1].label, 'healbot', "flattenDebug's macro shape: label/on/lastRanAt")
+  eq(d.network.reconnects, hub.sup:info(ids.instance).reconnects,
+     "network.reconnects is overlaid from the hub's own supervisor bookkeeping, not the worker's")
+
+  -- a stopped/never-polled instance is answered honestly, not with an error
+  local badRun, badErr = rpc(PORT, 'instance.debug', { id = 'no-such-instance' })
+  eq(badRun.status, 404, 'a foreign/unknown instance id is a 404, not a 500')
+
+  -- 2) the WebSocket `debug` event: gated by subscription, and rate-capped.
+  local before = {}
+  for i = 1, #hub.tel.sockets do before[hub.tel.sockets[i]] = true end
+  local dbgWs = wsConnect(PORT)
+  waitFor(function() return dbgWs.handshook or dbgWs.dead end, 4000)
+  eq(dbgWs.status, 101, 'a second panel WebSocket upgrades for the debug-event check')
+  waitFor(function() return dbgWs:countEvents('hello') > 0 end, 3000)
+  check(dbgWs:countEvents('hello') > 0, '   and receives the hello frame')
+
+  local rec
+  waitFor(function()
+    for i = 1, #hub.tel.sockets do
+      if not before[hub.tel.sockets[i]] then rec = hub.tel.sockets[i] end
+    end
+    return rec ~= nil
+  end, 3000)
+  check(rec ~= nil, "found this test's own new socket record inside hub.tel")
+
+  -- unsubscribed: the worker can push all it likes, nothing reaches this socket
+  hub.sup:command(ids.instance, 'debug.flood', { n = 5, everyMs = 5 }, function() end)
+  step(400)
+  eq(dbgWs:countEvents('debug'), 0,
+     'an UNSUBSCRIBED socket receives no debug events at all (R3\'s opt-in design)')
+
+  -- subscribe (T:setDebugSub -- what the missing subscribeDebug frame handler
+  -- would call), THEN flood: 40 pushes 5ms apart (a 200ms-wide burst) must NOT
+  -- arrive as 40 frames -- hub/telemetry.lua's COALESCE (event+instance key,
+  -- newest wins) caps this socket at roughly one `debug` frame per drain tick
+  -- (sendEveryMs, 200ms) no matter how fast the worker pushes.
+  local okSub = hub.tel:setDebugSub(rec.ws, ids.instance)
+  check(okSub, 'setDebugSub accepts the real socket record')
+  local before2 = dbgWs:countEvents('debug')
+  hub.sup:command(ids.instance, 'debug.flood', { n = 40, everyMs = 5 }, function() end)
+  waitFor(function() return dbgWs:countEvents('debug') > before2 end, 2000)
+  step(1200)   -- the 200ms flood plus several more drain ticks
+  local got = dbgWs:countEvents('debug') - before2
+  check(got >= 1, 'the SUBSCRIBED socket did receive at least one debug event (' .. got .. ')')
+  check(got <= 12,
+        'and nowhere near the 40 the worker pushed -- rate-capped by coalescing, not lost (' ..
+        got .. ' received)')
+  local last = dbgWs:lastEvent('debug')
+  check(last and last.data and last.data.id == ids.instance,
+        'the debug frame carries the right instance id')
+  check(last and last.data and type(last.data.tick) == 'table',
+        '   and the real structured snapshot shape, not a stub')
+
+  -- unsubscribing (id=nil) stops it again
+  hub.tel:setDebugSub(rec.ws, nil)
+  local before3 = dbgWs:countEvents('debug')
+  hub.sup:command(ids.instance, 'debug.flood', { n = 5, everyMs = 5 }, function() end)
+  step(400)
+  eq(dbgWs:countEvents('debug'), before3, 'unsubscribing (id=nil) really stops the stream')
+
+  dbgWs:close()
   step(50)
 end)
 
