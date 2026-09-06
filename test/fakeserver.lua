@@ -63,6 +63,11 @@ local CHARACTER = 'Fake Tester'
 local SESSIONKEY = 'FAKE-SESSION-KEY'
 local MESSAGE   = 'hello from the fake server'
 local IO_TIMEOUT_MS = 15000
+-- --hold-ms=N keeps the session OPEN for N ms after the pong and before
+-- SessionEnd.  test/hube2esuite.lua uses it so a hub-spawned worker is really
+-- in-game, and the panel really reports `online`, for long enough to be observed.
+-- Zero (the default) is the original behaviour: end the session at once.
+local HOLD_MS = 0
 
 -- ------------------------------------------------------------- assertions
 local checks, failures = 0, {}
@@ -295,6 +300,19 @@ local function serve(listener)
     eq(payload:byte(5), 0x1C, 'pong opcode (ClientPingBackGunz)')
     eq(#payload, 5, 'pong payload length')
 
+    -- 5b. optional hold: stay in-game, draining whatever the client sends, so an
+    --     external observer (the hub's panel) can see a real online session.
+    if HOLD_MS > 0 then
+        io.write(('  --   holding the session open for %d ms\n'):format(HOLD_MS))
+        io.stdout:flush()
+        local until_ = sys.nowMs() + HOLD_MS
+        while sys.nowMs() < until_ do
+            local d = sock:recv(65536)
+            if d == nil then break end          -- the client hung up
+            socket.select({ sock }, nil, 50)
+        end
+    end
+
     -- 6. SessionEnd -> the client shuts down with status 0 -------------------
     ok, err = c:write(buildFrame(string.char(0x18) .. string.char(0), XTEA_KEY))
     if not ok then return fail('sending SessionEnd: ' .. err) end
@@ -342,6 +360,7 @@ local function main(argv)
     local servePort = nil
     for _, a in ipairs(argv) do
         if a:match('^%-%-serve=%d+$') then servePort = tonumber(a:match('(%d+)$'))
+        elseif a:match('^%-%-hold%-ms=%d+$') then HOLD_MS = tonumber(a:match('(%d+)$'))
         elseif a == '-h' or a == '--help' then
             io.write('usage: luajit test/fakeserver.lua [--serve=PORT]\n')
             return 0
@@ -356,6 +375,7 @@ local function main(argv)
     if not listener then io.write('fakeserver: listen failed: ', tostring(lerr), '\n'); return 1 end
     local port = listener:port()
     io.write(('  --   listening on 127.0.0.1:%d\n'):format(port))
+    io.stdout:flush()          -- a parent watching this pipe waits for THIS line
 
     local child, clientOut
     if servePort then

@@ -81,9 +81,35 @@ Bot layer (vBot 4.8 behaviour: HealBot, AttackBot, CaveBot, TargetBot)
                            client's profiles/minimap.otmm when that file exists.
                            Read-only, never written.  --minimap=off disables it.
 
+Proxy (PANEL.md "Proxy support")
+  --proxy=HOST:PORT        tunnel the game socket through this HTTP CONNECT proxy
+                           and send the HTTPS login POST through it as well
+  --proxy-auth             read "user:pass" for the proxy from STDIN (one line)
+  --proxy-auth=@PATH       ... from a file (first line)
+  --proxy-auth=fd:N        ... from file descriptor N (0 = stdin)
+                           An inline --proxy-auth=user:pass is REFUSED: argv is
+                           world-readable in /proc and visible to `ps`.
+
+Control endpoint (the hub talks to the worker over this; PANEL.md)
+  --control-port=N         start the JSON control endpoint on this port.  0 =
+                           ephemeral, which is the default once a token is given;
+                           the port it settled on is announced on stdout as
+                           "control-endpoint <bind> <port> <instance>"
+  --control-bind=ADDR      address to bind (default 127.0.0.1).  A non-loopback
+                           address additionally needs --control-allow-remote.
+  --control-allow-remote   permit a non-loopback bind.  Say this out loud.
+  --control-token-file=P   read the endpoint's auth token from this file
+  --control-token-fd=N     read it from file descriptor N.  0 = stdin, which is
+                           the portable choice; N > 0 needs /dev/fd (POSIX only).
+                           Several stdin-fed flags consume lines in the order the
+                           flags appear on the command line.
+  --instance-name=NAME     the name the panel shows for this worker
+
 Modes
   --dry-run                offline: no sockets, no HTTPS; exercises the whole
-                           wiring (items, login packet, framing, parser, events)
+                           wiring (items, login packet, framing, parser, events).
+                           With --control-port it stays up and serves the control
+                           endpoint, which is how test/controlsuite.lua drives it.
   --selftest               run test/selftest.lua and exit with its status
   --replay=FILE            run test/replay.lua over FILE and exit
   -h, --help               this text
@@ -92,10 +118,34 @@ Exit codes: 0 ok, 1 usage/config error, 2 login refused by the server,
             3 protocol/runtime failure.
 ]]
 
+-- Secrets never travel in argv (lib/process.lua "SECRETS IN argv"): a flag that names
+-- one records a READER here, and the readers are drained after parsing, in the order
+-- the flags appeared, so two stdin-fed secrets cannot race for the same first line.
+local function readFirstLine(path)
+    local f, err = io.open(path, 'r')
+    if not f then return nil, ('cannot open %s: %s'):format(tostring(path), tostring(err)) end
+    local line = f:read('*l')
+    f:close()
+    if not line then return nil, ('%s is empty'):format(tostring(path)) end
+    return (line:gsub('%s+$', ''))
+end
+
+local function readFd(n)
+    n = tonumber(n)
+    if n == 0 then
+        local line = io.stdin:read('*l')
+        if not line then return nil, 'stdin closed before the secret arrived' end
+        return (line:gsub('%s+$', ''))
+    end
+    -- POSIX exposes every inherited descriptor here; Windows does not.
+    return readFirstLine('/dev/fd/' .. tostring(n))
+end
+
 local function parseArgs(argv)
     local cfg = {
         logLevel = 'info',
         pingMs   = 10000,
+        secretReaders = {},          -- { {field=, read=function() -> value, err} }
     }
     local i = 1
     local function valueOf(name, inlineValue)
@@ -127,9 +177,14 @@ local function parseArgs(argv)
         or name == 'content-revision' or name == 'replay' or name == 'login-url'
         or name == 'bot-profile' or name == 'bot-vprofile' or name == 'cavebot'
         or name == 'targetbot' or name == 'bot-status-interval' or name == 'minimap'
-        or name == 'session-key' then
+        or name == 'session-key'
+        or name == 'proxy' or name == 'control-port' or name == 'control-bind'
+        or name == 'control-token-file' or name == 'control-token-fd'
+        or name == 'instance-name' then
             v, err = valueOf(name, inline)
             if not v then return nil, err end
+        elseif name == 'proxy-auth' then
+            v = inline                    -- OPTIONAL: bare means "read stdin"
         elseif inline ~= nil and inline ~= '' then
             return nil, ('--%s takes no value'):format(name)
         end
@@ -155,17 +210,105 @@ local function parseArgs(argv)
         elseif name == 'replay'    then cfg.replay = v
         elseif name == 'dry-run'   then cfg.dryRun = true
         elseif name == 'bot'       then cfg.bot = true
-        elseif name == 'bot-profile' then cfg.botProfile = v
+        elseif name == 'bot-profile' then
+            -- The value becomes the bot's profile ROOT verbatim, and every
+            -- profile read and every script.put write is resolved under it.  A
+            -- '..' component would therefore point those reads and writes
+            -- outside the tree; the hub also pins the field to a single path
+            -- segment (hub/model.lua's PROFILE_PAT), and this is the same rule
+            -- enforced for a hand-typed command line.
+            for seg in tostring(v):gmatch('[^/\\]+') do
+                if seg == '..' then
+                    return nil, '--bot-profile must not contain a ".." path component'
+                end
+            end
+            cfg.botProfile = v
         elseif name == 'bot-vprofile' then cfg.botVProfile = tonumber(v)
         elseif name == 'cavebot'   then cfg.cavebot = v; cfg.bot = true
         elseif name == 'targetbot' then cfg.targetbot = v; cfg.bot = true
         elseif name == 'bot-status-interval' then cfg.botStatusMs = tonumber(v)
         elseif name == 'minimap'   then cfg.minimap = v
+        elseif name == 'proxy'     then
+            local h, p = v:match('^%[?([^%]]-)%]?:(%d+)$')
+            if not h or h == '' then
+                return nil, '--proxy needs HOST:PORT'
+            end
+            cfg.proxyHost, cfg.proxyPort = h, tonumber(p)
+        elseif name == 'proxy-auth' then
+            -- NEVER from argv.  An inline value that is not @PATH / fd:N is a
+            -- credential on the command line, which is exactly what this flag exists
+            -- to avoid, so it is refused rather than quietly accepted.
+            local reader
+            if v == nil or v == '' or v == '-' or v == 'stdin' then
+                reader = function() return readFd(0) end
+            elseif v:sub(1, 1) == '@' then
+                local path = v:sub(2)
+                reader = function() return readFirstLine(path) end
+            elseif v:match('^fd:%d+$') then
+                local n = tonumber(v:match('^fd:(%d+)$'))
+                reader = function() return readFd(n) end
+            else
+                return nil, '--proxy-auth must be bare (stdin), @PATH or fd:N -- a ' ..
+                            'credential must never appear in argv'
+            end
+            cfg.secretReaders[#cfg.secretReaders + 1] = { field = 'proxyAuth', read = reader }
+        elseif name == 'control-port' then
+            cfg.controlPort = tonumber(v)
+            if not cfg.controlPort or cfg.controlPort < 0 or cfg.controlPort > 65535 then
+                return nil, '--control-port must be 0..65535'
+            end
+        elseif name == 'control-bind' then cfg.controlBind = v
+        elseif name == 'control-allow-remote' then cfg.controlAllowRemote = true
+        elseif name == 'control-token-file' then
+            local path = v
+            cfg.secretReaders[#cfg.secretReaders + 1] =
+                { field = 'controlToken', read = function() return readFirstLine(path) end }
+        elseif name == 'control-token-fd' then
+            local n = tonumber(v)
+            if not n or n < 0 then return nil, '--control-token-fd must be a descriptor number' end
+            cfg.secretReaders[#cfg.secretReaders + 1] =
+                { field = 'controlToken', read = function() return readFd(n) end }
+        elseif name == 'instance-name' then cfg.instanceName = v
         elseif name == 'selftest'  then cfg.selftest = true
         elseif name == 'help'      then cfg.help = true
         else return nil, ('unknown flag --%s (try --help)'):format(name)
         end
         i = i + 1
+    end
+    return cfg
+end
+
+--- Drain the secret readers, in the order their flags appeared, and check the flag
+--- combinations that only make sense together.  Kept out of parseArgs so that
+--- --help never reads a descriptor and never blocks on an empty stdin.
+local function resolveSecrets(cfg)
+    for _, r in ipairs(cfg.secretReaders or {}) do
+        local v, err = r.read()
+        if not v then return nil, ('--%s: %s'):format(r.field, tostring(err)) end
+        if v == '' then return nil, ('--%s: the value is empty'):format(r.field) end
+        cfg[r.field] = v
+    end
+    cfg.secretReaders = nil
+
+    if cfg.proxyAuth and not cfg.proxyHost then
+        return nil, '--proxy-auth without --proxy=HOST:PORT'
+    end
+    if cfg.proxyAuth then
+        local u, p = cfg.proxyAuth:match('^([^:]*):(.*)$')
+        if not u then return nil, '--proxy-auth must be "user:pass"' end
+        cfg.proxyUser, cfg.proxyPass = u, p
+        cfg.proxyAuth = nil                       -- never keep the pair around whole
+    end
+
+    if cfg.controlPort and not cfg.controlToken then
+        return nil, '--control-port needs --control-token-file=PATH or --control-token-fd=N ' ..
+                    '(the token must not travel in argv)'
+    end
+    if cfg.controlToken and not cfg.controlPort then
+        cfg.controlPort = 0                       -- a token alone means "ephemeral port"
+    end
+    if cfg.controlToken and #cfg.controlToken < 8 then
+        return nil, '--control-token: at least 8 characters, please'
     end
     return cfg
 end
@@ -205,6 +348,9 @@ local function shutdown(code)
     if shuttingDown then return end
     shuttingDown = true
     LC.exitCode = code or LC.exitCode or 0
+    -- The control endpoint goes first: it must stop pushing status into a half-torn-down
+    -- client, and its listener has to be closed before the reactor stops.
+    if LC.control then pcall(function() LC.control:stop() end); LC.control = nil end
     if LC.stopBot then pcall(LC.stopBot) end   -- saves the bot storage
     if LC.pingTimer then pcall(sched.cancel, LC.pingTimer); LC.pingTimer = nil end
     -- Ask the server to end the session (0x14 LeaveGame) before dropping the socket.  A bare
@@ -219,6 +365,8 @@ local function shutdown(code)
     if LC.captureFile then pcall(function() LC.captureFile:close() end); LC.captureFile = nil end
     pcall(sched.stop)
 end
+
+LC.shutdown = shutdown          -- control/commands.lua's `shutdown` command
 
 -- fatal(msg) -- one clean line, no stack trace, then unwind the loop.
 local function fatal(code, fmt, ...)
@@ -419,6 +567,15 @@ end
 LC.loadMinimap = function() return loadMinimap(LC.config or {}) end
 LC.stopBot  = stopBot
 LC.startBot = function() return startBot(LC.config or {}) end
+-- The control endpoint's `bot.listConfigs` has to work before the bot is running (the
+-- panel populates its pickers while the worker is still logging in), so the profile
+-- directory is resolved once here rather than only inside startBot.
+LC.botProfileDir = nil
+LC.resolveBotProfileDir = function()
+    local cfg = LC.config or {}
+    LC.botProfileDir = cfg.botProfile or defaultBotProfile()
+    return LC.botProfileDir
+end
 
 -- =============================================================== capture
 local function openCapture(path)
@@ -461,8 +618,19 @@ local function buildGame(cfg, t)
     local s = sender.new(t)
     LC.sender = s
 
+    -- A relogin builds a fresh game and calls this again; without dropping the previous
+    -- registrations every event would be handled twice (two login packets, two pongs)
+    -- and the FIRST, dead transport would be the one written to.  The control endpoint's
+    -- own subscriptions live on the same bus, so this drops exactly ours and nothing else.
+    if LC._gameHandles then
+        for i = 1, #LC._gameHandles do pcall(events.off, LC._gameHandles[i]) end
+    end
+    local handles = {}
+    LC._gameHandles = handles
+    local function on(name, fn) handles[#handles + 1] = events.on(name, fn) end
+
     -- every event may have moved hp/mana/level/pos
-    events.onAny(function() statusLine(false) end)
+    handles[#handles + 1] = events.onAny(function() statusLine(false) end)
 
     -- TEST HOOK, never for production use: LUACLIENT_TEST_XTEA=<32 hex chars>
     -- pins the session key so an offline fake server (which has no RSA private
@@ -476,7 +644,7 @@ local function buildGame(cfg, t)
         return k
     end
 
-    events.on('challenge', function(d)
+    on('challenge', function(d)
         log.info('challenge: ts=%d random=%d -- sending login packet', d.timestamp, d.random)
         local body, key = handshake.buildLoginPacket{
             xteaKey         = fixedXteaKey(),
@@ -495,7 +663,7 @@ local function buildGame(cfg, t)
         log.info('login packet sent (%d body bytes); XTEA enabled', #body)
     end)
 
-    events.on('pending', function()
+    on('pending', function()
         log.info('server accepted the login (pending) -- entering game')
         local frames = handshake.buildEnterGameFrames(cfg.account or '')
         for _, body in ipairs(frames) do
@@ -520,8 +688,8 @@ local function buildGame(cfg, t)
         -- BOT.md: the bot starts once the server says we are in the game.
         if LC.startBot then LC.startBot() end
     end
-    events.on('gameStart', function() armPing('game started') end)
-    events.on('login', function(d)
+    on('gameStart', function() armPing('game started') end)
+    on('login', function(d)
         -- 0x17 LoginSuccess carries serverBeat + the GameNewSpeedLaw constants.  The parser
         -- keeps them on itself; the walker's step timing needs them on the STATE, because
         -- Creature::getStepDuration divides by m_calculatedStepSpeed (derived from A/B/C)
@@ -536,10 +704,10 @@ local function buildGame(cfg, t)
     end)
 
     -- 0x1D: the server asks US to answer -> pong immediately (opcode 28).
-    events.on('ping', function()
+    on('ping', function()
         if LC.transport and not LC.transport.dead then LC.sender:pingBack() end
     end)
-    events.on('pingBack', function()
+    on('pingBack', function()
         -- 0x1E is the PONG for our keepalive: turn it into the RTT the bot layer's
         -- step timing, smooth-walk pacer and cooldown ping compensation all read.
         if LC.pingSentAt then
@@ -550,20 +718,65 @@ local function buildGame(cfg, t)
         log.debug('pong from server (latency %s ms)', tostring(LC.state and LC.state.ping))
     end)
 
-    events.on('loginError', function(d) fatal(2, 'login refused: %s', tostring(d.message)) end)
-    events.on('loginWait',  function(d) log.warn('login wait: %s (%s s)', tostring(d.message), tostring(d.time)) end)
-    events.on('loginAdvice', function(d) log.info('server: %s', tostring(d.message)) end)
-    events.on('sessionEnd', function(d) fatal(0, 'session ended by the server (reason %s)', tostring(d.reason)) end)
-    events.on('death', function() log.warn('the character has died') end)
-    events.on('talk', function(d)
+    on('loginError', function(d) fatal(2, 'login refused: %s', tostring(d.message)) end)
+    on('loginWait',  function(d) log.warn('login wait: %s (%s s)', tostring(d.message), tostring(d.time)) end)
+    on('loginAdvice', function(d) log.info('server: %s', tostring(d.message)) end)
+    on('sessionEnd', function(d) fatal(0, 'session ended by the server (reason %s)', tostring(d.reason)) end)
+    on('death', function() log.warn('the character has died') end)
+    on('talk', function(d)
         log.info('talk [%s] %s: %s', tostring(d.mode), tostring(d.name), tostring(d.text))
     end)
-    events.on('textMessage', function(d)
+    on('textMessage', function(d)
         log.info('message [%s] %s', tostring(d.mode), tostring(d.text))
     end)
 
     return st, p, s
 end
+
+-- ======================================================= control endpoint
+-- PANEL.md: "a local control endpoint bound to 127.0.0.1 on an ephemeral port,
+-- speaking the same JSON command/event protocol".  Started after boot so that a
+-- `status` served on the first millisecond already has the items table, the state
+-- object and the event bus behind it; stopped from shutdown().
+local function startControl(cfg)
+    if not cfg.controlToken then return end
+    local okmod, control = pcall(require, 'control.server')
+    if not okmod then
+        log.error('control: cannot load control/server.lua: %s', tostring(control))
+        return nil, tostring(control)
+    end
+    -- The loot/waste value model reads vBot's own price table out of the profile.
+    local profileDir = LC.botProfileDir or LC.resolveBotProfileDir()
+    local srv, err = control.new{
+        LC = LC,
+        host = cfg.controlBind or '127.0.0.1',
+        port = cfg.controlPort or 0,
+        token = cfg.controlToken,
+        allowRemote = cfg.controlAllowRemote,
+        instanceName = cfg.instanceName or (cfg.character or 'worker'),
+        pricesPath = profileDir and (profileDir .. '/vBot/items.lua') or nil,
+    }
+    if not srv then
+        log.error('control: %s', tostring(err))
+        return nil, tostring(err)
+    end
+    local port, serr = srv:start()
+    if not port then
+        log.error('control: cannot listen on %s:%s: %s',
+                  tostring(cfg.controlBind or '127.0.0.1'), tostring(cfg.controlPort), tostring(serr))
+        return nil, tostring(serr)
+    end
+    LC.control = srv
+    -- One machine-readable line so the hub can learn an ephemeral port from stdout.
+    io.stdout:write(('control-endpoint %s %d %s\n'):format(
+        cfg.controlBind or '127.0.0.1', port, srv.instanceName))
+    io.stdout:flush()
+    return srv
+end
+
+-- The credentials the hub gave us are kept so that `relogin` can use them again; the
+-- password is held ONLY while a login is in flight (see LC.login below).
+local sessionCfg = nil
 
 -- =============================================================== dry run
 -- Everything except sockets and HTTPS: items table, login-packet construction,
@@ -663,10 +876,40 @@ local function runDryRun(cfg)
                  macros, b.stats.ticks, b.stats.macroErrors,
                  tostring(b.world and b.world.itemDataLevel))
         if b.stats.macroErrors > 0 then error('dry-run: a bot macro raised') end
-        stopBot()
+        -- With a control endpoint the worker stays up, so the bot layer stays up with
+        -- it: the panel must be able to drive bot.enable / script.put against a real
+        -- running bot.  Without one, --dry-run is a one-shot check and the bot is
+        -- stopped here exactly as before.
+        if not cfg.controlToken then stopBot() end
     end
 
     log.info('--dry-run OK: items, login packet, framing, parser, events and the ping rules all wired')
+
+    if cfg.controlToken then
+        -- The wiring check passed; now serve the control endpoint until someone says
+        -- `shutdown` (or --exit-after elapses).  This is the mode test/controlsuite.lua
+        -- drives: a real process, a real socket, no network of any kind.
+        -- A bot started later through `bot.enable` needs a position the same way the
+        -- --bot branch above does, and in a dry run nothing on the wire supplies one.
+        LC.state.player.pos = LC.state.player.pos or { x = 32369, y = 32241, z = 7 }
+        local srv, cerr = startControl(cfg)
+        if not srv then
+            log.error('control: %s', tostring(cerr))
+            return 1
+        end
+        -- The dry run has no game session, but the bot ticks and the stats engine
+        -- samples exactly as they do live, so the panel sees a real 1 Hz status.
+        LC.inGame = false
+        LC.loginState = 'offline'
+        if cfg.exitAfter and cfg.exitAfter > 0 then
+            sched.after(math.floor(cfg.exitAfter * 1000), function()
+                log.info('--exit-after elapsed -- shutting the control endpoint down')
+                shutdown(0)
+            end)
+        end
+        sched.run()
+        return LC.exitCode or 0
+    end
     return 0
 end
 
@@ -686,7 +929,19 @@ local function pickCharacter(cfg, login)
     return nil, ('no character matched (available: %s)'):format(table.concat(names, ', '))
 end
 
-local function runLive(cfg)
+--- openSession(cfg) -> nil | code, err
+---
+--- Everything between "we have credentials" and "the socket is connecting": the HTTPS
+--- account login, the character choice, the transport and the event wiring.  Split out
+--- of runLive so that the control endpoint's `login` / `relogin` commands can run the
+--- very same path at any time instead of only at boot.
+---
+--- NOTE for the panel: the HTTPS POST inside lib/http.lua is BLOCKING.  Calling this
+--- from a control command stalls the reactor for the length of that one request
+--- (bounded by http.DEFAULT_TIMEOUT_MS).  That is the same stall the boot path has
+--- always had; making it non-blocking means a non-blocking TLS client, which this
+--- checkout does not have.
+local function openSession(cfg)
     local login
 
     if cfg.sessionKey then
@@ -748,11 +1003,23 @@ local function runLive(cfg)
 
     -- 3. transport -----------------------------------------------------------
     local t
+    -- PANEL.md "Proxy support": with --proxy the TCP connection goes to the proxy and
+    -- lib/proxy.lua's CONNECT handshake runs before the world-name preamble.
+    local proxyOpt = nil
+    if cfg.proxyHost then
+        proxyOpt = { host = cfg.proxyHost, port = cfg.proxyPort,
+                     user = cfg.proxyUser, pass = cfg.proxyPass }
+        log.info('proxy: tunnelling the game socket through %s:%d%s',
+                 cfg.proxyHost, cfg.proxyPort,
+                 (cfg.proxyUser and cfg.proxyUser ~= '') and ' (with credentials)' or '')
+    end
     t = transport.new{
         host = host, port = port,
         worldName = worldName,                         -- set BEFORE connect()
+        proxy = proxyOpt,
         onConnect = function()
-            log.info('connected to %s:%d, world preamble sent', host, port)
+            log.info('connected to %s:%d, world preamble sent%s', host, port,
+                     proxyOpt and ' (through the proxy tunnel)' or '')
         end,
         onMessage = function(payload)
             captureIn(payload)
@@ -782,10 +1049,124 @@ local function runLive(cfg)
         assetsRoot      = cfg.assetsRoot,
         pingMs          = cfg.pingMs,
     }, t)
+    -- Keep what a relogin needs and NOT the password: the session key the login reply
+    -- gave us is exactly what --session-key takes, so a reconnect needs no second HTTPS
+    -- round trip and no credential kept in memory.  (A session key does expire; when it
+    -- has, `relogin` fails and the hub calls `login {account, password}` again.)
+    LC._resume = { sessionKey = login.sessionKey, character = ch.name,
+                   world = worldName, host = host, port = port }
     login.sessionKey = nil
+
+    LC.characterName = ch.name
+    LC.worldName     = worldName
+    LC.loginState    = 'connecting'
 
     local ok, cerr = t:connect()
     if not ok then return 3, ('connect failed: %s'):format(tostring(cerr)) end
+    return nil
+end
+
+-- ---------------------------------------------------------- runtime session
+-- The three entry points control/commands.lua calls.  They are installed here rather
+-- than in the control module because only main.lua knows the boot configuration.
+LC.logout = function()
+    local wasIn = LC.inGame and true or false
+    if LC.inGame and LC.sender and LC.transport and not LC.transport.dead then
+        pcall(function() LC.sender:logout() end)
+    end
+    if LC.stopBot then pcall(LC.stopBot) end
+    if LC.pingTimer then pcall(sched.cancel, LC.pingTimer); LC.pingTimer = nil end
+    if LC.transport then pcall(function() LC.transport:close() end) end
+    LC.inGame = false
+    LC.loginState = 'offline'
+    if LC.control then LC.control:broadcast('gameEnd', { reason = 'logout' }) end
+    return { wasOnline = wasIn, state = 'offline' }
+end
+
+LC.login = function(args)
+    args = args or {}
+    local cfg = LC.config or {}
+    if cfg.dryRun then
+        return nil, 'this worker runs with --dry-run: there is no network to log in over'
+    end
+    if LC.inGame or (LC.transport and not LC.transport.dead) then
+        return nil, 'already connected -- logout or relogin first'
+    end
+    -- Per-call overrides let the hub hand the credential over at login time instead of
+    -- at spawn time.  The password is used and dropped inside openSession.
+    local one = {}
+    for k, v in pairs(cfg) do one[k] = v end
+    for _, k in ipairs({ 'account', 'password', 'token', 'character', 'world',
+                         'sessionKey', 'loginUrl' }) do
+        if args[k] ~= nil then one[k] = args[k] end
+    end
+    if args.host ~= nil then one.host = args.host end
+    if args.port ~= nil then one.port = tonumber(args.port) end
+    args.password = nil
+    local code, err = openSession(one)
+    one.password = nil
+    if code then return nil, tostring(err) end
+    -- keep everything except the password for a later relogin
+    one.password = nil
+    LC.config = one
+    return { state = LC.loginState, character = LC.characterName, world = LC.worldName,
+             host = LC.transport and LC.transport.host, port = LC.transport and LC.transport.port }
+end
+
+LC.relogin = function(delayMs)
+    local cfg = LC.config or {}
+    if cfg.dryRun then
+        return nil, 'this worker runs with --dry-run: there is no network to log in over'
+    end
+    local resume = LC._resume
+    if not (resume and resume.sessionKey) and not cfg.sessionKey then
+        return nil, 'no session key is held for a relogin: call login {account, password} instead'
+    end
+    LC.logout()
+    sched.after(math.max(0, tonumber(delayMs) or 1500), function()
+        local ok, err = LC.login(resume and {
+            sessionKey = resume.sessionKey, character = resume.character,
+            world = resume.world, host = resume.host, port = resume.port,
+        } or {})
+        if not ok then
+            log.error('relogin failed: %s', tostring(err))
+            if LC.control then
+                LC.control:broadcast('error', { kind = 'relogin', message = tostring(err) })
+            end
+        end
+    end)
+    return { reloginIn = math.max(0, tonumber(delayMs) or 1500) }
+end
+
+local function runLive(cfg)
+    -- ---- hub-managed boot ---------------------------------------------------
+    -- A worker the panel spawned gets NO credentials in argv: hub/process.lua
+    -- refuses a secret there, so the hub hands over the control token on stdin
+    -- and then sends the account, password, character and world inside the
+    -- authenticated `login` command over the loopback control socket (see
+    -- hub/supervisor.lua's _afterHandshake).  openSession would refuse such a
+    -- start with "--account is required" and the worker would exit 1 into the
+    -- supervisor's restart-backoff loop, which is exactly what used to happen:
+    -- every hub-managed instance was stuck unless it also carried --dry-run.
+    --
+    -- So when a control token is present and no credential was given, bring the
+    -- control endpoint up FIRST and wait in the reactor for the hub to log us in.
+    local deferred = cfg.controlToken and not cfg.account and not cfg.sessionKey
+    if not deferred then
+        local code, err = openSession(cfg)
+        if code then return code, err end
+    end
+
+    -- The control endpoint comes up once the session is on its way, so a `status` the
+    -- hub asks for immediately already reports a real transport.
+    if cfg.controlToken then
+        local srv, cerr = startControl(cfg)
+        if not srv then return 1, cerr end
+        if deferred then
+            LC.loginState = 'offline'
+            log.info('control: no account was given -- waiting for the hub to send `login`')
+        end
+    end
 
     -- Bounded live run: shut down the same way a Ctrl-C would, so the bot storage is saved
     -- and the game socket is closed instead of being killed from outside.
@@ -816,6 +1197,14 @@ local function main(argv)
         return 0
     end
 
+    -- Secrets (the control token, the proxy credential) are read from stdin or a file
+    -- HERE, after --help and before anything else touches them.
+    local rcfg, serr = resolveSecrets(cfg)
+    if not rcfg then
+        io.stderr:write('luaclient: ', tostring(serr), '\n')
+        return 1
+    end
+
     log.setLevel(cfg.logLevel)
     if cfg.logFile then
         local ok, ferr = log.setFile(cfg.logFile)
@@ -839,6 +1228,22 @@ local function main(argv)
     end
 
     openCapture(cfg.capture)
+    LC.resolveBotProfileDir()
+
+    -- The HTTPS login POST leaves through the same proxy as the game socket, or an
+    -- IP-restricted account sees two different source addresses (PANEL.md, and
+    -- docs/live-login-notes.md).
+    if cfg.proxyHost then
+        local http = require('lib.http')
+        local okp, perr2 = http.setProxy{ host = cfg.proxyHost, port = cfg.proxyPort,
+                                          user = cfg.proxyUser, pass = cfg.proxyPass }
+        if not okp then
+            io.stderr:write('luaclient: --proxy: ', tostring(perr2), '\n')
+            return 1
+        end
+        log.info('proxy: the HTTPS login will go through %s:%d as well',
+                 cfg.proxyHost, cfg.proxyPort)
+    end
 
     if cfg.dryRun then
         return runDryRun(cfg) or 0

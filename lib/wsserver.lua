@@ -522,11 +522,26 @@ function wsserver.originAllowed(req, opts)
     if hhost ~= ohost then
         return false, 'cross-origin handshake from ' .. raw .. ' (Host is ' .. hostHdr .. ')'
     end
-    -- The scheme is deliberately not compared and a port is only compared when both
-    -- sides state one: a TLS terminator in front of the hub legitimately shows the
-    -- browser :443 while the hub itself is addressed on another port.
-    if hport ~= '' and oport ~= '' and hport ~= oport then
-        return false, 'cross-origin handshake from ' .. raw .. ' (Host is ' .. hostHdr .. ')'
+    -- PORTS ARE COMPARED, ALWAYS.  Skipping the comparison when either side omits
+    -- a port -- which normOrigin makes common, because it removes a scheme's
+    -- default -- made `http://localhost` (port 80) and `https://localhost`
+    -- (port 443) same-origin with `Host: localhost:8877`.  Cookies are not
+    -- port-scoped, so ANY other service on 80 or 443 (or an XSS in one) could
+    -- then open an authenticated socket here.  Both sides are resolved to an
+    -- explicit port instead: the Origin's from its scheme, the Host's from the
+    -- listener (opts.defaultPort) or, failing that, from the Origin's scheme.
+    -- The lenient behaviour a TLS terminator needs stays available, but only
+    -- through an explicit allowedOrigins list above.
+    local oscheme = raw:match('^(%a[%w+.%-]*)://')
+    local odef = oscheme and DEFAULT_PORT[slower(oscheme)] or nil
+    if oport == '' then oport = odef or '' end
+    if hport == '' then
+        hport = (opts.defaultPort and tostring(opts.defaultPort)) or odef or ''
+    end
+    if hport ~= oport then
+        return false, 'cross-origin handshake from ' .. raw ..
+                      ' (Host is ' .. hostHdr .. ': port ' .. tostring(hport) ..
+                      ' vs ' .. tostring(oport) .. ')'
     end
     return true
 end

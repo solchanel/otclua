@@ -120,6 +120,14 @@ if IS_WINDOWS then
   cdef [[ void   freeaddrinfo(struct lc_addrinfo*); ]]
 
   local ws2 = ffi.load('ws2_32')
+  -- kernel32 for the handle-inheritance flags; ffi.C already resolves them in a
+  -- LuaJIT built against msvcrt, but loading the DLL explicitly is what makes
+  -- this work under every toolchain.
+  cdef [[ int SetHandleInformation(void*, unsigned long, unsigned long); ]]
+  cdef [[ int GetHandleInformation(void*, unsigned long*); ]]
+  local k32 = ffi.load('kernel32')
+  local k32NoInherit          = k32.SetHandleInformation
+  local k32GetHandleInformation = k32.GetHandleInformation
 
   local FIONBIO = -2147195266     -- 0x8004667E as a signed long
   local SD_SEND = 1
@@ -150,7 +158,44 @@ if IS_WINDOWS then
 
   function P.cleanup() ws2.WSACleanup() end
 
-  function P.socket() return ws2.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) end
+  -- A Winsock SOCKET is a kernel handle and is INHERITABLE by default, and
+  -- lib/process.lua calls CreateProcess with bInheritHandles = TRUE (it has to,
+  -- to hand the child its three std pipes).  Every socket this process holds
+  -- would therefore be duplicated into every worker: the hub's listener (so an
+  -- orphan keeps the port bound) and every accepted panel connection -- and a
+  -- browser waiting for `Connection: close` then sees no EOF until the WORKER
+  -- exits, because the child still holds a copy of the socket.  Clearing
+  -- HANDLE_FLAG_INHERIT is the Windows counterpart of SOCK_CLOEXEC.
+  local HANDLE_FLAG_INHERIT = 0x1
+  local function noInherit(fd)
+    if fd == nil then return fd end
+    pcall(function()
+      k32NoInherit(ffi.cast('void*', fd), HANDLE_FLAG_INHERIT, 0)
+    end)
+    return fd
+  end
+
+  --- Is this socket handle marked inheritable?  Exported so a test can assert
+  --- the invariant instead of trusting that the flag was cleared.
+  function P.isCloexec(fd)
+    if fd == nil then return nil end
+    local out = ffi.new('unsigned long[1]')
+    local ok = pcall(function()
+      return k32GetHandleInformation(ffi.cast('void*', fd), out)
+    end)
+    if not ok then return nil end
+    return bit.band(tonumber(out[0]), HANDLE_FLAG_INHERIT) == 0
+  end
+
+  -- NOTE on error codes: WSAGetLastError() IS GetLastError(), so a
+  -- SetHandleInformation call on a failed accept would overwrite WSAEWOULDBLOCK
+  -- with ERROR_INVALID_HANDLE and the accept loop would treat "nothing pending"
+  -- as a fatal error.  Only ever touch the flag on a handle we really got.
+  function P.socket()
+    local s = ws2.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+    if s ~= P.INVALID then noInherit(s) end
+    return s
+  end
   function P.close(fd) return ws2.closesocket(fd) end
   function P.connect(fd, sa, len) return ws2.connect(fd, ffi.cast('struct lc_sockaddr*', sa), len) end
   function P.bind(fd, sa, len) return ws2.bind(fd, ffi.cast('struct lc_sockaddr*', sa), len) end
@@ -161,7 +206,11 @@ if IS_WINDOWS then
 
   function P.accept(fd, sa)
     local l = ffi.new('int[1]', ffi.sizeof('struct lc_sockaddr_in'))
-    return ws2.accept(fd, ffi.cast('struct lc_sockaddr*', sa), l)
+    -- accept() does not inherit the listener's flag: clear it on the child too,
+    -- but ONLY when there really is one (see the error-code note above).
+    local c = ws2.accept(fd, ffi.cast('struct lc_sockaddr*', sa), l)
+    if c ~= P.INVALID then noInherit(c) end
+    return c
   end
 
   function P.getsockname(fd, sa)
@@ -290,6 +339,14 @@ else
   local C = ffi.C
 
   local F_GETFL, F_SETFL, O_NONBLOCK = 3, 4, 0x800   -- O_NONBLOCK == 04000 octal
+  -- CLOEXEC: a descriptor this module hands out must NOT survive into a child
+  -- the process forks later.  A hub that spawns workers would otherwise give
+  -- every worker its listening socket (an orphan then holds the port and the
+  -- next hub start fails with EADDRINUSE) and every accepted client socket.
+  -- lib/process.lua also sweeps fds > 2 in the child; this is the half that
+  -- works even when the fork happens somewhere else entirely.
+  local F_GETFD, F_SETFD, FD_CLOEXEC = 1, 2, 1
+  local SOCK_CLOEXEC = 0x80000        -- 02000000 octal, Linux socket()/accept4()
   local MSG_NOSIGNAL = 0x4000
   local SHUT_WR      = 1
   local SIGPIPE, SIG_IGN = 13, ffi.cast('void*', 1)
@@ -324,7 +381,43 @@ else
 
   function P.cleanup() end
 
-  function P.socket() return C.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) end
+  --- Set FD_CLOEXEC on an already-open descriptor.  Used as the fallback when
+  --- SOCK_CLOEXEC is not honoured (a pre-2.6.27 kernel answers EINVAL) and after
+  --- accept(), whose portable form has no flags argument.  Best effort: a failure
+  --- here is not worth losing the connection over, and lib/process.lua's own
+  --- post-fork sweep still closes it.
+  local function setCloexec(fd)
+    if fd == nil or fd < 0 then return fd end
+    local fl = C.fcntl(fd, F_GETFD, ffi.cast('long', 0))
+    if fl < 0 then fl = 0 end
+    C.fcntl(fd, F_SETFD, ffi.cast('long', bit.bor(fl, FD_CLOEXEC)))
+    return fd
+  end
+  P._setCloexec = setCloexec
+
+  --- Is FD_CLOEXEC set?  Exported so a test can assert the invariant rather than
+  --- trusting that the flag was requested.
+  function P.isCloexec(fd)
+    if fd == nil or fd < 0 then return nil end
+    local fl = tonumber(C.fcntl(fd, F_GETFD, ffi.cast('long', 0)))
+    if not fl or fl < 0 then return nil end
+    return bit.band(fl, FD_CLOEXEC) ~= 0
+  end
+
+  function P.socket()
+    -- SOCK_CLOEXEC closes the race a separate fcntl() leaves open (a fork in
+    -- another thread between the two calls inherits the descriptor).  Older
+    -- kernels reject the flag with EINVAL; fall back and set it explicitly.
+    local fd = C.socket(AF_INET, bit.bor(SOCK_STREAM, SOCK_CLOEXEC), IPPROTO_TCP)
+    if fd < 0 then
+      fd = C.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+      if fd >= 0 then setCloexec(fd) end
+      return fd
+    end
+    -- A kernel that ignored the flag rather than failing still has to be covered.
+    if P.isCloexec(fd) == false then setCloexec(fd) end
+    return fd
+  end
   function P.close(fd) return C.close(fd) end
   function P.connect(fd, sa, len) return C.connect(fd, ffi.cast('struct lc_sockaddr*', sa), len) end
   function P.bind(fd, sa, len) return C.bind(fd, ffi.cast('struct lc_sockaddr*', sa), len) end
@@ -339,6 +432,9 @@ else
     repeat
       c = C.accept(fd, ffi.cast('struct lc_sockaddr*', sa), l)
     until c >= 0 or ffi.errno() ~= E.INTR
+    -- accept() does NOT inherit the listener's FD_CLOEXEC, so an accepted panel
+    -- or control connection would otherwise land in the next worker we spawn.
+    if c >= 0 then setCloexec(c) end
     return c
   end
 
@@ -527,6 +623,16 @@ local function fdnum(x)
   return tonumber(f)
 end
 socket.fdnum = fdnum
+
+--- Is this socket's descriptor marked close-on-exec?  POSIX only; nil elsewhere
+--- (Windows handles are not inherited unless a spawn explicitly asks, which
+--- lib/process.lua's Windows backend does only for the three std pipes).
+function socket.isCloexec(x)
+  if not P.isCloexec then return nil end
+  local f = fdnum(x)
+  if f == nil then return nil end
+  return P.isCloexec(f)
+end
 
 local function sockaddrOf(netaddr, port)
   local sa = ffi.new('struct lc_sockaddr_in')

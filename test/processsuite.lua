@@ -46,6 +46,7 @@ require('lib.socket')
 local process = require('lib.process')
 local sys     = require('lib.sys')
 local json    = require('lib.json')
+local bit     = require('bit')
 
 -- The interpreter running this suite: the lowest negative index of `arg`.
 local LUAJIT
@@ -118,6 +119,38 @@ local t, i = {}, 0
 while arg[i] ~= nil do t[#t + 1] = arg[i]; i = i + 1 end
 io.write(json.encode(t), '\n')
 io.stdout:flush()
+os.exit(0)
+]==]
+
+-- Prints exactly what the post-fork hygiene has to guarantee: which descriptors
+-- it was handed, and the signal mask and dispositions it starts life with.
+-- fcntl(F_GETFD) rather than a directory listing, because io.popen would itself
+-- open descriptors and change the answer.
+local C_HYGIENE = [==[
+local ffi = require('ffi')
+ffi.cdef[[ int fcntl(int, int, ...); ]]
+local open = {}
+for fd = 0, 63 do
+  if tonumber(ffi.C.fcntl(fd, 1, ffi.cast('long', 0))) >= 0 then
+    open[#open + 1] = tostring(fd)
+  end
+end
+local h = io.open('/proc/self/status', 'rb')
+local st = h:read('*a'); h:close()
+print('FDS=' .. table.concat(open, ','))
+print('SIGBLK=' .. (st:match('SigBlk:%s*(%x+)') or '?'))
+print('SIGIGN=' .. (st:match('SigIgn:%s*(%x+)') or '?'))
+io.stdout:flush()
+os.exit(0)
+]==]
+
+-- Ignores nothing and reads nothing: it can only be stopped by a signal that is
+-- actually DELIVERABLE, which is the point of the mask reset.
+local C_IDLER = [==[
+package.path = os.getenv('LCP_ROOT') .. '/?.lua;' .. package.path
+local sys = require('lib.sys')
+print('READY') io.stdout:flush()
+sys.sleepMs(30000)
 os.exit(0)
 ]==]
 
@@ -991,6 +1024,89 @@ do
     check(not table.concat(r2, ' '):find('hunter2', 1, true),
           'a value listed in secretArgs is masked wherever it is embedded',
           table.concat(r2, ' '))
+end
+
+--=============================================================================
+-- The hub forks workers that run operator-supplied Lua.  Two things therefore
+-- have to be true of every child the instant it execs, and neither is true by
+-- default on Linux:
+--   * it holds ONLY 0, 1 and 2.  Every other descriptor the parent had open --
+--     the hub's listening socket, its audit-log append handle, its data files --
+--     is closed between fork and exec.  (An inherited listener also keeps the
+--     port bound after the hub dies, so the next start fails EADDRINUSE.)
+--   * it starts with an EMPTY signal mask.  A mask survives fork AND execve, and
+--     the hub blocks SIGHUP/SIGINT/SIGTERM for its polled signal gate, so an
+--     inherited mask makes PR_SET_PDEATHSIG and the supervisor's graceful stop
+--     both silently inert -- the SIGTERM is queued and never delivered.
+head('S19 post-fork hygiene: no inherited descriptors, a clean signal mask')
+if not process.isLinux then
+    note('POSIX-only: Windows handles are not inherited unless the spawn asks')
+else
+    local ffi = require('ffi')
+    local socket = require('lib.socket')
+
+    -- Give the parent exactly the descriptors the hub has: a data file open for
+    -- append and a listening socket.
+    local tmpPath = (os.getenv('TMPDIR') or '/tmp') .. '/lcp-hygiene-' .. tostring(os.time()) .. '.log'
+    local dataFile = assert(io.open(tmpPath, 'ab'))
+    dataFile:write('x'); dataFile:flush()
+    local listener = assert(socket.listen('127.0.0.1', 0))
+    check(socket.isCloexec(listener) == true,
+          'a listening socket is created close-on-exec', tostring(socket.isCloexec(listener)))
+
+    -- ...and the hub's blocked signal mask.
+    ffi.cdef[[ int sigprocmask(int, const void*, void*); ]]
+    local BLOCK, SETMASK = 0, 2
+    local wordBits = ffi.sizeof('unsigned long') * 8
+    local blocked = ffi.new('unsigned long[16]')
+    for _, sig in ipairs{ 1, 2, 15 } do                   -- SIGHUP, SIGINT, SIGTERM
+        local n = sig - 1
+        blocked[math.floor(n / wordBits)] =
+            bit.bor(tonumber(blocked[math.floor(n / wordBits)]),
+                    bit.lshift(1, n % wordBits))
+    end
+    local saved = ffi.new('unsigned long[16]')
+    local mask = ffi.cast('int (*)(int, const void*, void*)', ffi.C.sigprocmask)
+    mask(BLOCK, blocked, saved)
+
+    local ok, res = pcall(function()
+        local lines = {}
+        local h = assert(process.spawn{
+            cmd = { LUAJIT, '-e', C_HYGIENE },
+            captureOutput = true, deathSignal = 15,
+            onLine = function(t) lines[#lines + 1] = t end,
+        })
+        pumpUntil(function() return not h:isRunning() end, 15000)
+        local text = table.concat(lines, '\n')
+        local fds = text:match('FDS=([%d,]*)')
+        eq(fds, '0,1,2', 'the child holds only stdin, stdout and stderr')
+        local blk = text:match('SIGBLK=(%x+)')
+        check(blk ~= nil and tonumber(blk, 16) == 0,
+              'the child starts with an empty signal mask', tostring(blk))
+        local ign = text:match('SIGIGN=(%x+)')
+        check(ign ~= nil and bit.band(tonumber(ign:sub(-8), 16), bit.lshift(1, 12)) == 0,
+              'SIGPIPE is back at its default disposition in the child', tostring(ign))
+
+        -- ...and the behaviour that follows from it: a graceful stop really is
+        -- graceful.  With an inherited mask the SIGTERM is queued, the child
+        -- runs on, and stop() has to escalate to SIGKILL (signal 9).
+        local h2 = assert(process.spawn{
+            cmd = { LUAJIT, '-e', C_IDLER },
+            captureOutput = true, env = { LCP_ROOT = ROOT },
+            onLine = function() end,
+        })
+        pumpUntil(function() return h2:pid() ~= nil end, 5000)
+        h2:stop(4000)
+        pumpUntil(function() return not h2:isRunning() end, 15000)
+        eq(h2:exitSignal(), 15, 'stop() ends the child with SIGTERM, not an escalation to SIGKILL')
+        return true
+    end)
+
+    mask(SETMASK, saved, nil)                  -- put the suite's own mask back
+    listener:close()
+    dataFile:close()
+    os.remove(tmpPath)
+    if not ok then check(false, 'S19 raised', tostring(res)) end
 end
 
 --=============================================================================

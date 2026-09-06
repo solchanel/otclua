@@ -54,9 +54,17 @@ s:recv(max) -> str|nil,err          -- '' when no data available (EWOULDBLOCK), 
 s:close()
 s:fd()                              -- raw SOCKET for select
 socket.select(readFds, writeFds, timeoutMs) -> readySet
+socket.isCloexec(s) -> bool|nil     -- POSIX: FD_CLOEXEC set?  Windows: HANDLE_FLAG_INHERIT clear?
 ```
 The client only needs an outbound TCP connection; a listening socket (`socket.listen(host,port)` →
 `:accept()`) is required later by the control plane, so implement both.
+
+Every socket is created so that it does **not** survive into a child process: `SOCK_CLOEXEC` (with
+an `fcntl(F_SETFD)` fallback) on POSIX, `SetHandleInformation(…, HANDLE_FLAG_INHERIT, 0)` on
+Windows, and the same on each accepted socket, which does not inherit the listener's flag. A hub
+that spawns workers would otherwise hand each one its listening socket and every live panel
+connection — an orphaned worker then keeps the port bound, and a browser waiting for
+`Connection: close` sees no EOF until that worker exits.
 
 ## lib/sched.lua
 ```lua

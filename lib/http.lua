@@ -68,6 +68,59 @@ http.preferBackend = 'auto'    -- 'auto' | 'winhttp' | 'curl-ffi' | 'curl-cli'
 http.curlPath = IS_WINDOWS and 'C:\\Windows\\System32\\curl.exe' or 'curl'
 http.userAgent = 'Mozilla/5.0' -- only used when the caller supplies no User-Agent
 
+---------------------------------------------------------------------- proxy ---
+-- PANEL.md "Proxy support": the HTTPS login POST must leave through the SAME HTTP
+-- proxy the game socket is tunnelled through, or an IP-restricted account sees two
+-- different source addresses and the login is refused.
+--
+--   http.setProxy{ host=, port=, user=, pass= }    -- process-wide, set once at boot
+--   http.setProxy(nil)                             -- clear
+--   http.getProxy() -> {host=,port=,user=,hasAuth=}  (NEVER the password)
+--
+-- A per-call `opts.proxy` overrides it.  proto/handshake.lua does not thread options
+-- through, which is why this is a module-level setting rather than a parameter.
+--
+-- CREDENTIALS: the proxy password never reaches a command line.  The libcurl and
+-- WinHTTP paths set it in-process; the curl CLI path writes it into a 0600 curl
+-- config file (`--config FILE`) and deletes the file afterwards.
+local proxyCfg = nil
+
+function http.setProxy(p)
+  if p == nil or p == false then proxyCfg = nil; return true end
+  if type(p) ~= 'table' then return nil, 'http.setProxy: expected a table or nil' end
+  local host, port = p.host, tonumber(p.port)
+  if type(host) ~= 'string' or host == '' then return nil, 'http.setProxy: host is required' end
+  if not port or port < 1 or port > 65535 then return nil, 'http.setProxy: bad port' end
+  -- A CR/LF/NUL in a credential would splice a header into curl's config file or into
+  -- WinHTTP's option blob.  Refuse rather than sanitise.
+  for _, k in ipairs({ 'host', 'user', 'pass' }) do
+    local v = p[k]
+    if v ~= nil and (type(v) ~= 'string' or v:find('[\r\n]') or v:find('%z')) then
+      return nil, 'http.setProxy: ' .. k .. ' must be a string with no CR, LF or NUL'
+    end
+  end
+  proxyCfg = { host = host, port = port, user = p.user, pass = p.pass }
+  return true
+end
+
+function http.getProxy()
+  if not proxyCfg then return nil end
+  return { host = proxyCfg.host, port = proxyCfg.port, user = proxyCfg.user,
+           hasAuth = (proxyCfg.user ~= nil and proxyCfg.user ~= '') }
+end
+
+local function proxyFor(opts)
+  local p = opts and opts.proxy
+  if p == false then return nil end
+  if p == nil then return proxyCfg end
+  return p
+end
+
+local function proxyAuthPair(p)
+  if not p or type(p.user) ~= 'string' or p.user == '' then return nil end
+  return p.user .. ':' .. (p.pass or '')
+end
+
 --------------------------------------------------------------------------- util
 
 local function lower(s) return (s or ''):lower() end
@@ -210,6 +263,10 @@ local WINHTTP_OPTION_REDIRECT_POLICY = 88
 local WINHTTP_DISABLE_REDIRECTS      = 0x00000002
 local WINHTTP_REDIRECT_POLICY_NEVER  = 0
 local ERROR_INSUFFICIENT_BUFFER      = 122
+-- WinHttpOpen dwAccessType + the two proxy-credential options (winhttp.h).
+local WINHTTP_ACCESS_TYPE_NAMED_PROXY = 3
+local WINHTTP_OPTION_PROXY_USERNAME   = 4098
+local WINHTTP_OPTION_PROXY_PASSWORD   = 4099
 -- SECURITY_FLAG_IGNORE_UNKNOWN_CA|_CERT_DATE_INVALID|_CERT_CN_INVALID|_CERT_WRONG_USAGE
 local IGNORE_ALL_CERT_ERRORS         = 0x00003300
 
@@ -256,7 +313,17 @@ local function setDword(h, option, value)
   return wh.WinHttpSetOption(h, option, v, 4) ~= 0
 end
 
-function W.post(u, headers, body, timeoutMs)
+-- WINHTTP_OPTION_PROXY_USERNAME / _PASSWORD take an LPWSTR whose length is measured in
+-- CHARACTERS, not bytes, and not counting the terminating NUL (winhttp.h / MSDN).
+local function setWideOption(h, option, s)
+  -- MultiByteToWideChar's return counts the terminating NUL because we pass -1.
+  local nchars = k32.MultiByteToWideChar(65001, 0, s, -1, nil, 0) - 1
+  if nchars < 0 then nchars = 0 end
+  local w = W16(s)
+  return wh.WinHttpSetOption(h, option, w, nchars) ~= 0
+end
+
+function W.post(u, headers, body, timeoutMs, px)
   local S, Cn, R
   local function cleanup()
     if R then wh.WinHttpCloseHandle(R) end
@@ -269,7 +336,14 @@ function W.post(u, headers, body, timeoutMs)
     return nil, e
   end
 
-  S = wh.WinHttpOpen(W16(http.userAgent), 0, nil, nil, 0)  -- 0 = DEFAULT_PROXY
+  if px then
+    -- WINHTTP_ACCESS_TYPE_NAMED_PROXY + "host:port"; WinHTTP CONNECT-tunnels an https
+    -- request through it, which is what the reference client does for the login POST.
+    S = wh.WinHttpOpen(W16(http.userAgent), WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+                       W16(px.host .. ':' .. tostring(px.port)), W16(''), 0)
+  else
+    S = wh.WinHttpOpen(W16(http.userAgent), 0, nil, nil, 0)  -- 0 = DEFAULT_PROXY
+  end
   if S == nil then return fail('WinHttpOpen') end
   wh.WinHttpSetTimeouts(S, timeoutMs, timeoutMs, timeoutMs, timeoutMs)
 
@@ -279,6 +353,12 @@ function W.post(u, headers, body, timeoutMs)
   R = wh.WinHttpOpenRequest(Cn, W16('POST'), W16(u.path), nil, nil, nil,
                             u.scheme == 'https' and WINHTTP_FLAG_SECURE or 0)
   if R == nil then return fail('WinHttpOpenRequest') end
+
+  -- Proxy credentials go on the REQUEST handle, in-process: they never reach argv.
+  if px and type(px.user) == 'string' and px.user ~= '' then
+    setWideOption(R, WINHTTP_OPTION_PROXY_USERNAME, px.user)
+    setWideOption(R, WINHTTP_OPTION_PROXY_PASSWORD, px.pass or '')
+  end
 
   -- never follow redirects (reference client does not)
   setDword(R, WINHTTP_OPTION_REDIRECT_POLICY, WINHTTP_REDIRECT_POLICY_NEVER)
@@ -388,6 +468,14 @@ local CURLOPT_HEADERFUNCTION  = 20079
 local CURLOPT_HEADERDATA      = 10029
 local CURLOPT_TIMEOUT_MS      = 155
 local CURLOPT_CONNECTTIMEOUT_MS = 156
+-- proxy (curl.h): PROXY is a string, PROXYPORT/PROXYTYPE/HTTPPROXYTUNNEL are longs,
+-- PROXYUSERPWD is a "user:password" string libcurl copies into the handle.
+local CURLOPT_PROXY           = 10004
+local CURLOPT_PROXYPORT       = 59
+local CURLOPT_PROXYUSERPWD    = 10175
+local CURLOPT_PROXYTYPE       = 101
+local CURLOPT_HTTPPROXYTUNNEL = 61
+local CURLPROXY_HTTP          = 0
 local CURLOPT_SSL_VERIFYPEER  = 64
 local CURLOPT_SSL_VERIFYHOST  = 81
 local CURLOPT_FOLLOWLOCATION  = 52
@@ -445,7 +533,7 @@ end)
 local function setoptL(h, opt, v) return curl.curl_easy_setopt(h, opt, ffi.cast('long', v)) end
 local function setoptP(h, opt, v) return curl.curl_easy_setopt(h, opt, v) end
 
-function L.post(u, headers, body, timeoutMs)
+function L.post(u, headers, body, timeoutMs, px)
   local ok, err = L.load()
   if not ok then return nil, 'libcurl not loadable: ' .. tostring(err) end
 
@@ -477,6 +565,18 @@ function L.post(u, headers, body, timeoutMs)
   setoptL(h, CURLOPT_SSL_VERIFYPEER, 0)
   setoptL(h, CURLOPT_SSL_VERIFYHOST, 0)
   warnInsecureOnce(u)
+
+  -- Proxy: an https URL through CURLPROXY_HTTP is CONNECT-tunnelled by libcurl, which is
+  -- the same tunnel proto/transport.lua opens for the game socket.  PROXYUSERPWD is copied
+  -- into the handle in-process, so the credential never appears in argv or in the log.
+  if px then
+    setoptP(h, CURLOPT_PROXY, ffi.cast('const char*', tostring(px.host)))
+    setoptL(h, CURLOPT_PROXYPORT, tonumber(px.port) or 8080)
+    setoptL(h, CURLOPT_PROXYTYPE, CURLPROXY_HTTP)
+    setoptL(h, CURLOPT_HTTPPROXYTUNNEL, 1)
+    local pair = proxyAuthPair(px)
+    if pair then setoptP(h, CURLOPT_PROXYUSERPWD, ffi.cast('const char*', pair)) end
+  end
 
   setoptP(h, CURLOPT_WRITEFUNCTION, writeCb)
   setoptP(h, CURLOPT_WRITEDATA, nil)
@@ -573,14 +673,28 @@ function C.probe()
   return false, http.curlPath .. ' not found on PATH'
 end
 
-function C.post(u, headers, body, timeoutMs)
+function C.post(u, headers, body, timeoutMs, px)
   local reqFile, hdrFile, respFile = tempName('req'), tempName('hdr'), tempName('resp')
+  local cfgFile = nil
   local function clean()
     os.remove(reqFile); os.remove(hdrFile); os.remove(respFile)
+    if cfgFile then os.remove(cfgFile) end
   end
 
   local ok, e = writeBody(reqFile, body or '')
   if not ok then clean(); return nil, 'cannot write temp request file: ' .. tostring(e) end
+
+  -- The proxy credential must not reach argv (see the header of this file and
+  -- lib/process.lua's SECRETS IN argv section).  curl reads `proxy-user` out of a
+  -- --config file, which is created 0600 on Linux and deleted in clean().
+  local proxyPair = proxyAuthPair(px)
+  if proxyPair then
+    cfgFile = tempName('pxy')
+    -- curl's config parser understands \\ and \" inside a double-quoted value.
+    local quoted = proxyPair:gsub('\\', '\\\\'):gsub('"', '\\"')
+    local okc, ec = writeBody(cfgFile, 'proxy-user = "' .. quoted .. '"\n')
+    if not okc then clean(); return nil, 'cannot write temp proxy config: ' .. tostring(ec) end
+  end
 
   -- -k: match the reference client, which disables cert+hostname verification.
   -- No -L: redirects are never followed.  The body NEVER goes on the command
@@ -593,6 +707,15 @@ function C.post(u, headers, body, timeoutMs)
     '-X', 'POST',
     '--data-binary', shq('@' .. reqFile),
   }
+  if px then
+    parts[#parts + 1] = '-x'
+    parts[#parts + 1] = shq('http://' .. px.host .. ':' .. tostring(px.port))
+    parts[#parts + 1] = '--proxytunnel'
+    if cfgFile then
+      parts[#parts + 1] = '--config'
+      parts[#parts + 1] = shq(cfgFile)
+    end
+  end
   local list = sortedHeaderList(headers)
   for i = 1, #list do
     parts[#parts + 1] = '-H'
@@ -670,7 +793,7 @@ function http.backend()
   return selectBackend()
 end
 
-local function oneShot(u, headers, body, timeoutMs, backend)
+local function oneShot(u, headers, body, timeoutMs, backend, px)
   if backend == nil or backend == 'auto' then
     local b, err = selectBackend()
     if not b then return nil, err end
@@ -678,14 +801,14 @@ local function oneShot(u, headers, body, timeoutMs, backend)
   end
   if backend == 'curl' then backend = IS_LINUX and 'curl-ffi' or 'curl-cli' end
 
-  if backend == 'curl-cli' then return C.post(u, headers, body, timeoutMs) end
+  if backend == 'curl-cli' then return C.post(u, headers, body, timeoutMs, px) end
 
   if backend == 'curl-ffi' then
     if not IS_LINUX then return nil, 'curl-ffi backend is Linux-only' end
-    local res, e = L.post(u, headers, body, timeoutMs)
+    local res, e = L.post(u, headers, body, timeoutMs, px)
     if res then return res end
     log.warn('http: libcurl request failed (%s) — retrying with the curl CLI', tostring(e))
-    local res2, e2 = C.post(u, headers, body, timeoutMs)
+    local res2, e2 = C.post(u, headers, body, timeoutMs, px)
     if res2 then return res2 end
     return nil, tostring(e) .. '; curl CLI fallback: ' .. tostring(e2)
   end
@@ -694,10 +817,10 @@ local function oneShot(u, headers, body, timeoutMs, backend)
     if not IS_WINDOWS then return nil, 'winhttp backend is Windows-only' end
     local ok, err = W.load()
     if not ok then return nil, 'winhttp.dll not loadable: ' .. tostring(err) end
-    local res, e = W.post(u, headers, body, timeoutMs)
+    local res, e = W.post(u, headers, body, timeoutMs, px)
     if res then return res end
     log.warn('http: WinHTTP request failed (%s) — retrying with curl.exe', tostring(e))
-    local res2, e2 = C.post(u, headers, body, timeoutMs)
+    local res2, e2 = C.post(u, headers, body, timeoutMs, px)
     if res2 then return res2 end
     return nil, tostring(e) .. '; curl fallback: ' .. tostring(e2)
   end
@@ -714,8 +837,9 @@ function http.post(url, headers, body, opts)
   local timeoutMs = opts.timeoutMs or http.DEFAULT_TIMEOUT_MS
   local backend = opts.backend or http.preferBackend or 'auto'
   local hdrs = copyHeaders(headers)
+  local px = proxyFor(opts)
 
-  local res, err = oneShot(u, hdrs, body, timeoutMs, backend)
+  local res, err = oneShot(u, hdrs, body, timeoutMs, backend, px)
   if not res then return nil, err end
 
   if undecodedBody(res) and not opts.noAcceptEncodingRetry then
@@ -723,7 +847,7 @@ function http.post(url, headers, body, opts)
     log.warn('http: response uses Content-Encoding %q which we cannot decode — retrying once without Accept-Encoding',
              tostring(ce))
     removeHeader(hdrs, 'Accept-Encoding')
-    local res2, err2 = oneShot(u, hdrs, body, timeoutMs, backend)
+    local res2, err2 = oneShot(u, hdrs, body, timeoutMs, backend, px)
     if res2 then return res2 end
     return nil, 'retry without Accept-Encoding failed: ' .. tostring(err2)
   end

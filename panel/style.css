@@ -296,6 +296,11 @@ label.check input { width: auto; accent-color: var(--accent); cursor: pointer; }
 .pill.connecting,
 .pill.starting   { color: #f0c674; border-color: #6a4f13; background: #29200a; }
 .pill.stopping   { color: #f0c674; border-color: #6a4f13; background: #29200a; }
+/* the supervisor's richer lifecycle: `running` = the worker is up and the control
+   link is established but the character is not in the game yet; `backoff` = it
+   exited and the supervisor is waiting before the next restart. */
+.pill.running    { color: #9ecbff; border-color: #1f4a72; background: #0e1c2a; }
+.pill.backoff    { color: #f0c674; border-color: #6a4f13; background: #29200a; }
 .pill.stopped    { color: var(--fg-faint); }
 .pill.error      { color: #ff9aa2; border-color: #7d3038; background: #2a1114; }
 .pill.on   { color: #7ee094; border-color: #205c2c; background: #102616; }

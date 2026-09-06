@@ -1322,11 +1322,26 @@ function M.static(opts)
   local extra = opts.headers
   local cache = {}                 -- abs -> { size=, etag= }
 
+  -- Lua patterns, matched against the request path (lower-cased, leading slash
+  -- included).  A directory of static assets normally also holds things that are
+  -- not part of the shipped surface -- development pages, mock backends, server
+  -- source -- and serving those to an unauthenticated visitor hands over exactly
+  -- the map of the application an attacker would otherwise have to guess.
+  local deny = opts.deny
   return function(req, res)
     if req.method ~= 'GET' and req.method ~= 'HEAD' then
       return res:send(405, 'method not allowed\n', { ['Allow'] = 'GET, HEAD' })
     end
     local urlPath = req.rawPath                 -- raw: encoded slashes stay refused
+    if deny then
+      local lower = tostring(urlPath):lower()
+      for i = 1, #deny do
+        if lower:find(deny[i]) then
+          if opts.notFound then return opts.notFound(req, res) end
+          return res:send(404, 'not found\n')   -- 404, not 403: no existence oracle
+        end
+      end
+    end
     if urlPath:sub(-1) == '/' then urlPath = urlPath .. index end
     local abs, why = M.safePath(root, urlPath)
     if not abs then

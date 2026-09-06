@@ -1,19 +1,21 @@
 /* ==================================================================
-   mock/api.js — a complete, self-contained fake of the hub API.
+   mock/api.js — a complete, self-contained fake of the hub.
    ------------------------------------------------------------------
    Loaded only when index.html is opened with ?mock=1. It installs
-   window.HubMock = { rpc(cmd, args) -> Promise<envelope>,
-                      subscribe(fn), unsubscribe() }
-   and drives a simulated worker fleet so the panel is fully clickable
-   with no hub, straight off the filesystem.
 
-   The envelope is exactly what the real hub must return over
-   POST /api/rpc:
-       { id, ok:true,  result: <object> }
-       { id, ok:false, error: { code, message } }
-   and the event frames are exactly what it must push over
-   WS /api/events:
-       { event: <name>, data: <object> }
+     window.HubMock = { fetch(url, init) -> Promise<Response-like>,
+                        WebSocket: <constructor>,
+                        latencyMs, _db, _tick, _routes() }
+
+   and the panel then builds its ordinary PanelRpc.HttpClient /
+   WsClient on top of those two, so mock mode runs the SAME rpc.js,
+   api.js and app.js code paths as a live hub: the same methods, the
+   same paths, the same CSRF header, the same WebSocket handshake.
+   The only thing swapped out is the network.
+
+   That is the point: if a call works here it works against the hub,
+   and panel/test/tests.js proves every endpoint in api.js's ENDPOINTS
+   table is answered by the router below.
 
    Every value here is invented. No real credential is present, and
    the mock never echoes a submitted password anywhere.
@@ -53,14 +55,14 @@ var DB = {
     { id: 'u_admin', name: 'arnold', role: 'admin', createdAt: T0 - 86400000 * 62,
       disabled: false, lastLoginAt: T0 - 3600000 * 3 },
     { id: 'u_sam',   name: 'sam',    role: 'user',  createdAt: T0 - 86400000 * 31,
-      disabled: false, lastLoginAt: T0 - 86400000 * 2 },
+      disabled: false, canExec: true,  lastLoginAt: T0 - 86400000 * 2 },
     { id: 'u_kim',   name: 'kim',    role: 'user',  createdAt: T0 - 86400000 * 9,
-      disabled: true,  lastLoginAt: null }
+      disabled: true,  canExec: false, lastLoginAt: null }
   ],
   accounts: [
-    { id: 'a_main', label: 'main-eu',  login: 'l4g-main',  ownerUserId: 'u_admin', has2fa: true,  token2fa: true },
-    { id: 'a_alt',  label: 'alt-farm', login: 'l4g-alt',   ownerUserId: 'u_admin', has2fa: false, token2fa: false },
-    { id: 'a_sam',  label: 'sam-01',   login: 'sam-primary', ownerUserId: 'u_sam', has2fa: false, token2fa: false }
+    { id: 'a_main', label: 'main-eu',  login: 'l4g-main',  ownerUserId: 'u_admin', has2fa: true },
+    { id: 'a_alt',  label: 'alt-farm', login: 'l4g-alt',   ownerUserId: 'u_admin', has2fa: false },
+    { id: 'a_sam',  label: 'sam-01',   login: 'sam-primary', ownerUserId: 'u_sam', has2fa: false }
   ],
   characters: [
     { id: 'c_1', accountId: 'a_main', name: 'Arnoldus',   world: 'Gunzodus', vocation: 'Knight',   lastLevel: 214 },
@@ -71,9 +73,9 @@ var DB = {
     { id: 'c_6', accountId: 'a_sam',  name: 'Spareparts', world: 'Gunzodus', vocation: null,       lastLevel: null }
   ],
   proxies: [
-    { id: 'p_de', label: 'de-frankfurt', kind: 'http-connect', host: '10.20.0.11', port: 8080, user: 'w1', hasPass: true },
-    { id: 'p_nl', label: 'nl-amsterdam', kind: 'http-connect', host: '10.20.0.12', port: 8080, user: 'w2', hasPass: true },
-    { id: 'p_pl', label: 'pl-warsaw',    kind: 'http-connect', host: '10.20.0.13', port: 3128, user: null, hasPass: false }
+    { id: 'p_de', label: 'de-frankfurt', kind: 'http-connect', host: '10.20.0.11', port: 8080, user: 'w1', hasPass: true,  ownerUserId: 'u_admin' },
+    { id: 'p_nl', label: 'nl-amsterdam', kind: 'http-connect', host: '10.20.0.12', port: 8080, user: 'w2', hasPass: true,  ownerUserId: 'u_admin' },
+    { id: 'p_pl', label: 'pl-warsaw',    kind: 'http-connect', host: '10.20.0.13', port: 3128, user: null, hasPass: false, ownerUserId: 'u_sam' }
   ],
   instances: [],
   scripts: [
@@ -175,6 +177,33 @@ DB.instances = [
 ];
 DB.instances[0].scripts = ['s_1'];
 DB.instances[2].scripts = ['s_1', 's_2'];
+
+/* A crowd, so the panel is exercised at the size PANEL.md cares about.
+   ?mock=1&fleet=40 makes it forty. */
+(function bigFleet() {
+  var want = 0;
+  try {
+    var m = /[?&]fleet=(\d+)/.exec(location.search);
+    want = m ? Math.min(200, parseInt(m[1], 10)) : 0;
+  } catch (e) { want = 0; }
+  if (!want || want <= DB.instances.length) return;
+  var FIRST = ['Grim', 'Ash', 'Bramble', 'Cinder', 'Dusk', 'Ember', 'Fen', 'Gale', 'Hollow', 'Iron',
+               'Jag', 'Kestrel', 'Lark', 'Moss', 'Nettle', 'Onyx', 'Pike', 'Quarry', 'Rook', 'Slate'];
+  var LAST = ['bane', 'wick', 'shade', 'thorn', 'ridge', 'fall', 'brand', 'mire', 'crest', 'vale'];
+  var states = ['online', 'online', 'online', 'online', 'connecting', 'stopped', 'error'];
+  while (DB.instances.length < want) {
+    var n = DB.instances.length;
+    var acc = DB.accounts[n % DB.accounts.length];
+    var ch = { id: 'c_g' + n, accountId: acc.id,
+               name: FIRST[n % FIRST.length] + LAST[(n / FIRST.length | 0) % LAST.length] + (n > 29 ? n : ''),
+               world: 'Gunzodus', vocation: pick(['Knight', 'Paladin', 'Druid', 'Sorcerer', 'Monk']),
+               lastLevel: ri(40, 300) };
+    DB.characters.push(ch);
+    var inst = mkInstance('i_g' + n, ch.id, pick(DB.proxies).id, states[n % states.length],
+                          ch.lastLevel, pick(CAVEBOTS), pick(TARGETBOT), acc.ownerUserId);
+    DB.instances.push(inst);
+  }
+})();
 
 /* macro state per instance */
 var macroState = {};
@@ -292,6 +321,10 @@ function audit(action, target, outcome, detail) {
 /* --------------------------- session ---------------------------- */
 
 var session = null;      // {id, name, role} of the signed-in mock user
+var csrf = '';           // handed out by GET /api/session, required on writes
+
+function newCsrf() { csrf = 'mock-csrf-' + Math.floor(rnd() * 0xffffffff).toString(16); return csrf; }
+newCsrf();
 
 function userByName(n) {
   return DB.users.filter(function (u) { return u.name.toLowerCase() === String(n).toLowerCase(); })[0];
@@ -301,12 +334,22 @@ function nameOf(id) { var u = userById(id); return u ? u.name : '?'; }
 
 /* --------------------------- events ----------------------------- */
 
-var listener = null, timer = null, ticks = 0;
+var sockets = [];        // live FakeWebSocket objects
+var timer = null, ticks = 0;
 
 function emit(ev, data, adminOnly) {
-  if (!listener) return;
-  if (adminOnly && (!session || session.role !== 'admin')) return;
-  try { listener(ev, data); } catch (e) { /* the panel logs its own handler errors */ }
+  for (var i = 0; i < sockets.length; i++) {
+    var s = sockets[i];
+    if (!s._ready) continue;
+    if (adminOnly && (!session || session.role !== 'admin')) continue;
+    s._push(ev, data);
+  }
+}
+function emitTo(streamKey, instId, ev, data) {
+  for (var i = 0; i < sockets.length; i++) {
+    var s = sockets[i];
+    if (s._ready && s._subs[streamKey] === instId) s._push(ev, data);
+  }
 }
 
 function visible(inst) {
@@ -407,7 +450,7 @@ function tick() {
       var m = mkChatLine(i, now());
       CHAT[i.id].push(m);
       if (CHAT[i.id].length > 500) CHAT[i.id].shift();
-      if (visible(i)) emit('chat', m);
+      if (visible(i)) emitTo('chat', i.id, 'chat', m);
     }
 
     /* the broken one flaps */
@@ -438,7 +481,7 @@ function pushLog(inst, level, text) {
                              : mkLogLine(inst, now());
   LOGS[inst.id].push(line);
   if (LOGS[inst.id].length > 800) LOGS[inst.id].shift();
-  if (visible(inst)) emit('log', line);
+  if (visible(inst)) emitTo('logs', inst.id, 'log', line);
 }
 
 /* -------------------------- projections ------------------------- */
@@ -481,34 +524,65 @@ function pubCharacter(c) {
            instanceId: inst ? inst.id : null };
 }
 function pubProxy(p) {
+  // The pool is shared to USE; only the owner or an admin may change an entry.
+  var mine = session && (session.role === 'admin' || p.ownerUserId === session.id);
+  var owner = DB.users.filter(function (u) { return u.id === p.ownerUserId; })[0];
   return { id: p.id, label: p.label, kind: p.kind, host: p.host, port: p.port,
            user: p.user, hasPass: !!p.hasPass,
+           ownerUserId: p.ownerUserId, ownerName: owner ? owner.name : null,
+           canEdit: !!mine,
            inUse: DB.instances.filter(function (i) { return i.proxyId === p.id; }).length };
 }
 function pubUser(u) {
+  // Remote Lua is admin-equivalent: an admin always has it, a user only when granted.
   return { id: u.id, name: u.name, role: u.role, createdAt: u.createdAt,
-           disabled: !!u.disabled, lastLoginAt: u.lastLoginAt };
+           disabled: !!u.disabled, canExec: u.role === 'admin' || !!u.canExec,
+           lastLoginAt: u.lastLoginAt };
+}
+function proxyOwnedOrAdmin(p) {
+  need(session && (session.role === 'admin' || p.ownerUserId === session.id),
+       'not-found', 'no such proxy');
 }
 
 /* --------------------------- errors ----------------------------- */
+
+var STATUS = { 'bad-request': 400, 'unauthorized': 401, 'forbidden': 403, 'csrf-invalid': 403,
+               'not-found': 404, 'conflict': 409, 'too-large': 413, 'rate-limited': 429,
+               'internal': 500 };
 
 function E(code, message) { var e = new Error(message); e.code = code; return e; }
 function need(cond, code, msg) { if (!cond) throw E(code, msg); }
 function needAuth() { need(session, 'unauthorized', 'not signed in'); }
 function needAdmin() { needAuth(); need(session.role === 'admin', 'forbidden', 'administrators only'); }
+/* Remote Lua is admin-equivalent -- the code runs unsandboxed under the hub's own
+   user account -- so it is administrator-only unless the account was granted the
+   canExec capability.  Mirrors hub/api.lua's EXEC_CAPABILITY gate. */
+function needExec() {
+  needAuth();
+  var u = DB.users.filter(function (x) { return x.id === session.id; })[0];
+  need(session.role === 'admin' || (u && u.canExec), 'forbidden',
+       'running Lua on a worker is administrator-only; an administrator can grant ' +
+       'this account the canExec capability');
+}
 
-/* -------------------------- the handlers ------------------------ */
+/* ---------------------- the route handlers ---------------------- */
+/* Keys are '<METHOD> <path template>' and match api.js's ENDPOINTS
+   one for one; a handler gets ({params, query, body}).             */
 
-var H = {
+var ROUTES = {
 
-/* ---- auth ---- */
+/* ---- session ---- */
 
-'auth.session': function () {
-  return { user: session ? { id: session.id, name: session.name, role: session.role } : null,
-           serverTime: now(), version: 'mock-1.0', bootstrap: false, insecure: location.protocol !== 'https:' };
+'GET /api/session': function () {
+  return { user: session ? { id: session.id, name: session.name, role: session.role,
+                             canExec: !!session.canExec } : null,
+           serverTime: now(), version: 'mock-2.0', bootstrap: false,
+           insecure: (typeof location !== 'undefined' && location.protocol !== 'https:'),
+           csrfToken: csrf };
 },
 
-'auth.login': function (a) {
+'POST /api/session': function (c) {
+  var a = c.body;
   var u = userByName(a.name);
   // the mock accepts any non-trivial password; it never stores or echoes it
   if (!u || !a.password || String(a.password).length < 3) {
@@ -516,49 +590,57 @@ var H = {
     throw E('unauthorized', 'wrong name or password');
   }
   need(!u.disabled, 'forbidden', 'this account is disabled');
-  session = { id: u.id, name: u.name, role: u.role };
+  session = { id: u.id, name: u.name, role: u.role,
+              canExec: u.role === 'admin' || !!u.canExec };
   u.lastLoginAt = now();
   DB.sessions[0].userId = u.id;
   DB.sessions[0].createdAt = now();
   audit('login.ok', u.name, 'ok', '');
-  return { user: { id: u.id, name: u.name, role: u.role } };
+  return { user: { id: u.id, name: u.name, role: u.role, canExec: !!session.canExec },
+           csrfToken: newCsrf() };
 },
 
-'auth.bootstrap': function (a) {
-  need(a.token && String(a.token).length >= 8, 'bad-request', 'bootstrap token looks wrong');
-  var u = { id: uid('u'), name: a.name, role: 'admin', createdAt: now(), disabled: false, lastLoginAt: now() };
-  DB.users.push(u);
-  session = { id: u.id, name: u.name, role: 'admin' };
-  audit('user.create', u.name, 'ok', 'bootstrap administrator');
-  return { user: { id: u.id, name: u.name, role: u.role } };
-},
-
-'auth.logout': function () {
+'DELETE /api/session': function () {
   if (session) audit('logout', session.name, 'ok', '');
   session = null;
+  closeAllSockets(4401);
   return {};
 },
 
-'auth.changePassword': function (a) {
+'POST /api/session/password': function (c) {
   needAuth();
+  var a = c.body;
   need(a.current && a.next, 'bad-request', 'both passwords are required');
   need(String(a.next).length >= 10, 'bad-request', 'the new password is too short');
   audit('user.password', session.name, 'ok', 'self-service change');
   return {};
 },
 
+'POST /api/bootstrap': function (c) {
+  var a = c.body;
+  need(a.token && String(a.token).length >= 8, 'bad-request', 'bootstrap token looks wrong');
+  need(a.name && a.password, 'bad-request', 'name and password are required');
+  var u = { id: uid('u'), name: a.name, role: 'admin', createdAt: now(), disabled: false, lastLoginAt: now() };
+  DB.users.push(u);
+  session = { id: u.id, name: u.name, role: 'admin', canExec: true };
+  audit('user.create', u.name, 'ok', 'bootstrap administrator');
+  return { user: { id: u.id, name: u.name, role: u.role, canExec: !!session.canExec },
+           csrfToken: newCsrf() };
+},
+
 /* ---- instances ---- */
 
-'instance.list': function () {
+'GET /api/instances': function () {
   needAuth();
   return { instances: myInstances().map(pubInstance) };
 },
 
-'instance.get': function (a) { needAuth(); return { instance: pubInstance(findInstance(a.id)) }; },
+'GET /api/instances/:id': function (c) { needAuth(); return { instance: pubInstance(findInstance(c.params.id)) }; },
 
-'instance.create': function (a) {
+'POST /api/instances': function (c) {
   needAuth();
-  var ch = DB.characters.filter(function (c) { return c.id === a.characterId; })[0];
+  var a = c.body;
+  var ch = DB.characters.filter(function (x) { return x.id === a.characterId; })[0];
   need(ch, 'not-found', 'no such character');
   need(!DB.instances.filter(function (i) { return i.characterId === ch.id; })[0],
        'conflict', 'that character already has an instance');
@@ -575,9 +657,9 @@ var H = {
   return { instance: pubInstance(inst) };
 },
 
-'instance.update': function (a) {
+'PATCH /api/instances/:id': function (c) {
   needAuth();
-  var i = findInstance(a.id), p = a.patch || {};
+  var i = findInstance(c.params.id), p = c.body || {};
   ['proxyId', 'botProfile', 'cavebotConfig', 'targetbotConfig', 'autoStart', 'autoRelogin'].forEach(function (k) {
     if (p[k] !== undefined) i[k] = p[k];
   });
@@ -598,75 +680,56 @@ var H = {
   return { instance: pubInstance(i) };
 },
 
-'instance.delete': function (a) {
+'DELETE /api/instances/:id': function (c) {
   needAuth();
-  var i = findInstance(a.id);
+  var i = findInstance(c.params.id);
   DB.instances = DB.instances.filter(function (x) { return x.id !== i.id; });
   audit('instance.delete', i.characterName, 'ok', '');
   emit('instance', { id: i.id, removed: true });
   return {};
 },
 
-'instance.start': function (a) {
+'POST /api/instances/actions': function (c) {
   needAuth();
-  return { results: (a.ids || []).map(function (id) {
+  var a = c.body || {};
+  var action = a.action;
+  need(['start', 'stop', 'restart', 'botEnable'].indexOf(action) >= 0, 'bad-request',
+       'unknown action: ' + action);
+  need(a.ids && a.ids.length !== undefined, 'bad-request', 'ids must be a list');
+  return { results: a.ids.map(function (id) {
     try {
       var i = findInstance(id);
-      if (i.state === 'online' || i.state === 'starting' || i.state === 'connecting')
-        return { id: id, ok: false, error: 'already running' };
-      i.state = 'starting'; i.live.uptimeMs = 0;
-      pushLog(i, 'info', 'supervisor: spawning worker for ' + i.characterName +
-        ' via ' + (i.proxyLabel || 'direct connection'));
-      audit('instance.start', i.characterName, 'ok', '');
+      if (action === 'start') {
+        if (i.state === 'online' || i.state === 'starting' || i.state === 'connecting')
+          return { id: id, ok: false, error: 'already running' };
+        i.state = 'starting'; i.live.uptimeMs = 0;
+        pushLog(i, 'info', 'supervisor: spawning worker for ' + i.characterName +
+          ' via ' + (i.proxyLabel || 'direct connection'));
+        audit('instance.start', i.characterName, 'ok', '');
+      } else if (action === 'stop') {
+        if (i.state === 'stopped') return { id: id, ok: false, error: 'already stopped' };
+        i.state = 'stopping';
+        pushLog(i, 'info', 'supervisor: sending shutdown');
+        audit('instance.stop', i.characterName, 'ok', '');
+      } else if (action === 'restart') {
+        i.state = 'starting'; i.live.uptimeMs = 0; i.live.reconnects++;
+        pushLog(i, 'info', 'supervisor: restart requested');
+        audit('instance.start', i.characterName, 'ok', 'restart');
+      } else {
+        if (i.state !== 'online') return { id: id, ok: false, error: 'instance is not online' };
+        i.botEnabled = !!a.on;
+        pushLog(i, 'info', 'bot ' + (a.on ? 'enabled' : 'disabled') + ' by ' + session.name);
+        audit('instance.config', i.characterName, 'ok', 'bot.enable=' + !!a.on);
+      }
+      emit('instance', { id: i.id, instance: pubInstance(i) });
       return { id: id, ok: true };
     } catch (e) { return { id: id, ok: false, error: e.message }; }
   }) };
 },
 
-'instance.stop': function (a) {
+'GET /api/instances/:id/configs': function (c) {
   needAuth();
-  return { results: (a.ids || []).map(function (id) {
-    try {
-      var i = findInstance(id);
-      if (i.state === 'stopped') return { id: id, ok: false, error: 'already stopped' };
-      i.state = 'stopping';
-      pushLog(i, 'info', 'supervisor: sending shutdown');
-      audit('instance.stop', i.characterName, 'ok', '');
-      return { id: id, ok: true };
-    } catch (e) { return { id: id, ok: false, error: e.message }; }
-  }) };
-},
-
-'instance.restart': function (a) {
-  needAuth();
-  return { results: (a.ids || []).map(function (id) {
-    try {
-      var i = findInstance(id);
-      i.state = 'starting'; i.live.uptimeMs = 0; i.live.reconnects++;
-      pushLog(i, 'info', 'supervisor: restart requested');
-      audit('instance.start', i.characterName, 'ok', 'restart');
-      return { id: id, ok: true };
-    } catch (e) { return { id: id, ok: false, error: e.message }; }
-  }) };
-},
-
-'instance.botEnable': function (a) {
-  needAuth();
-  return { results: (a.ids || []).map(function (id) {
-    try {
-      var i = findInstance(id);
-      if (i.state !== 'online') return { id: id, ok: false, error: 'instance is not online' };
-      i.botEnabled = !!a.on;
-      pushLog(i, 'info', 'bot ' + (a.on ? 'enabled' : 'disabled') + ' by ' + session.name);
-      audit('instance.config', i.characterName, 'ok', 'bot.enable=' + !!a.on);
-      return { id: id, ok: true };
-    } catch (e) { return { id: id, ok: false, error: e.message }; }
-  }) };
-},
-
-'instance.configs': function (a) {
-  needAuth();
-  var i = findInstance(a.id);
+  var i = findInstance(c.params.id);
   return {
     cavebot: CAVEBOTS.slice(),
     targetbot: TARGETBOT.slice(),
@@ -677,105 +740,108 @@ var H = {
   };
 },
 
-'instance.setMacro': function (a) {
+'PUT /api/instances/:id/macros/:name': function (c) {
   needAuth();
-  var i = findInstance(a.id);
-  var m = (macroState[i.id] || []).filter(function (x) { return x.name === a.name; })[0];
-  need(m, 'not-found', 'no such macro: ' + a.name);
-  m.on = !!a.on;
+  var i = findInstance(c.params.id);
+  var m = (macroState[i.id] || []).filter(function (x) { return x.name === c.params.name; })[0];
+  need(m, 'not-found', 'no such macro: ' + c.params.name);
+  m.on = !!(c.body || {}).on;
   pushLog(i, 'info', 'macro ' + m.name + ' -> ' + (m.on ? 'on' : 'off'));
   audit('instance.config', i.characterName, 'ok', 'macro ' + m.name + '=' + m.on);
-  return {};
+  return { macro: { name: m.name, label: m.label, on: m.on, hotkey: m.hotkey || null } };
 },
 
-'instance.reload': function (a) {
+'POST /api/instances/:id/reload': function (c) {
   needAuth();
-  var i = findInstance(a.id);
+  var i = findInstance(c.params.id);
   pushLog(i, 'info', 'bot: reloading profile ' + i.botProfile);
   audit('instance.config', i.characterName, 'ok', 'bot.reload');
   return {};
 },
 
-'instance.exec': function (a) {
-  needAuth();
-  var i = findInstance(a.id);
-  need(typeof a.code === 'string' && a.code.length, 'bad-request', 'no code given');
-  audit('exec', i.characterName, 'ok', 'code: ' + String(a.code).slice(0, 400));
-  var src = String(a.code).trim();
+'POST /api/instances/:id/exec': function (c) {
+  needExec();
+  var i = findInstance(c.params.id);
+  var code = (c.body || {}).code;
+  need(typeof code === 'string' && code.length, 'bad-request', 'no code given');
+  audit('exec', i.characterName, 'ok', 'code: ' + String(code).slice(0, 400));
+  var src = String(code).trim();
   var out;
   if (/getLevel|\blevel\b/i.test(src)) out = String(i.live.level);
   else if (/getHealth|\bhp\b/i.test(src)) out = i.live.hp + ' / ' + i.live.maxHp;
   else if (/getPosition|\bpos\b/i.test(src)) out =
     '{x = ' + i.live.pos.x + ', y = ' + i.live.pos.y + ', z = ' + i.live.pos.z + '}';
   else if (/getName/i.test(src)) out = i.characterName;
-  else if (/error|assert\(false\)/i.test(src)) throw E('exec-error', 'chunk:1: something went wrong');
+  else if (/error|assert\(false\)/i.test(src)) throw E('bad-request', 'chunk:1: something went wrong');
   else if (/^\s*(print|info)\s*\(/.test(src)) out = 'nil    (printed to the worker log)';
   else out = 'nil';
   if (/^\s*(print|info)\s*\(/.test(src)) pushLog(i, 'info', 'exec: ' + src);
   return { output: out };
 },
 
-'instance.history': function (a) {
+'GET /api/instances/:id/history': function (c) {
   needAuth();
-  var i = findInstance(a.id);
-  var since = a.since || 0;
+  var i = findInstance(c.params.id);
+  var since = Number(c.query.since || 0);
   return { points: (HIST[i.id] || []).filter(function (p) { return p.t >= since; }) };
 },
 
-'instance.logs': function (a) {
+'GET /api/instances/:id/logs': function (c) {
   needAuth();
-  var i = findInstance(a.id);
-  var lim = Math.min(a.limit || 200, 800);
+  var i = findInstance(c.params.id);
+  var lim = Math.min(Number(c.query.limit) || 200, 800);
   var all = LOGS[i.id] || [];
   return { lines: all.slice(Math.max(0, all.length - lim)) };
 },
 
-'instance.chat': function (a) {
+'GET /api/instances/:id/chat': function (c) {
   needAuth();
-  var i = findInstance(a.id);
-  var lim = Math.min(a.limit || 200, 500);
+  var i = findInstance(c.params.id);
+  var lim = Math.min(Number(c.query.limit) || 200, 500);
   var all = CHAT[i.id] || [];
   return { messages: all.slice(Math.max(0, all.length - lim)) };
 },
 
-'instance.say': function (a) {
+'POST /api/instances/:id/chat': function (c) {
   needAuth();
-  var i = findInstance(a.id);
+  var i = findInstance(c.params.id);
+  var a = c.body || {};
   need(i.state === 'online', 'conflict', 'the character is not online');
   need(a.text && String(a.text).trim(), 'bad-request', 'empty message');
   var m = { id: i.id, t: now(), channel: a.channel ? 'Ch' + a.channel : 'Default',
             from: i.characterName, text: String(a.text) };
   CHAT[i.id].push(m);
-  emit('chat', m);
+  emitTo('chat', i.id, 'chat', m);
   return {};
 },
 
 /* ---- game accounts ---- */
 
-'account.list': function () {
+'GET /api/accounts': function () {
   needAuth();
   return { accounts: DB.accounts
     .filter(function (a) { return session.role === 'admin' || a.ownerUserId === session.id; })
     .map(pubAccount) };
 },
 
-'account.create': function (a) {
+'POST /api/accounts': function (c) {
   needAuth();
+  var a = c.body;
   need(a.label && a.login, 'bad-request', 'label and login are required');
   need(a.password, 'bad-request', 'a password is required');
   var acc = { id: uid('a'), label: a.label, login: a.login, ownerUserId: session.id,
-              has2fa: !!a.token2fa, token2fa: !!a.token2fa };
+              has2fa: !!a.token2fa };
   DB.accounts.push(acc);
   audit('account.create', acc.label, 'ok', '');      // never the password
   return { account: pubAccount(acc) };
 },
 
-'account.update': function (a) {
+'PATCH /api/accounts/:id': function (c) {
   needAuth();
-  var acc = DB.accounts.filter(function (x) { return x.id === a.id; })[0];
+  var acc = DB.accounts.filter(function (x) { return x.id === c.params.id; })[0];
   need(acc, 'not-found', 'no such account');
   need(session.role === 'admin' || acc.ownerUserId === session.id, 'forbidden', 'not your account');
-  var p = a.patch || {};
+  var p = c.body || {};
   if (p.label) acc.label = p.label;
   if (p.login) acc.login = p.login;
   if (p.token2fa !== undefined) acc.has2fa = !!p.token2fa;
@@ -784,19 +850,19 @@ var H = {
   return { account: pubAccount(acc) };
 },
 
-'account.delete': function (a) {
+'DELETE /api/accounts/:id': function (c) {
   needAuth();
-  var acc = DB.accounts.filter(function (x) { return x.id === a.id; })[0];
+  var acc = DB.accounts.filter(function (x) { return x.id === c.params.id; })[0];
   need(acc, 'not-found', 'no such account');
-  var chars = DB.characters.filter(function (c) { return c.accountId === acc.id; });
-  chars.forEach(function (c) {
+  var chars = DB.characters.filter(function (x) { return x.accountId === acc.id; });
+  chars.forEach(function (ch) {
     DB.instances = DB.instances.filter(function (i) {
-      if (i.characterId !== c.id) return true;
+      if (i.characterId !== ch.id) return true;
       emit('instance', { id: i.id, removed: true });
       return false;
     });
   });
-  DB.characters = DB.characters.filter(function (c) { return c.accountId !== acc.id; });
+  DB.characters = DB.characters.filter(function (x) { return x.accountId !== acc.id; });
   DB.accounts = DB.accounts.filter(function (x) { return x.id !== acc.id; });
   audit('account.delete', acc.label, 'ok', chars.length + ' characters removed');
   return {};
@@ -804,7 +870,7 @@ var H = {
 
 /* ---- characters ---- */
 
-'character.list': function () {
+'GET /api/characters': function () {
   needAuth();
   var mine = DB.accounts.filter(function (a) {
     return session.role === 'admin' || a.ownerUserId === session.id;
@@ -814,52 +880,56 @@ var H = {
     .map(pubCharacter) };
 },
 
-'character.create': function (a) {
+'POST /api/characters': function (c) {
   needAuth();
+  var a = c.body;
   need(a.accountId && a.name && a.world, 'bad-request', 'accountId, name and world are required');
-  need(!DB.characters.filter(function (c) {
-    return c.name.toLowerCase() === String(a.name).toLowerCase();
+  need(!DB.characters.filter(function (x) {
+    return x.name.toLowerCase() === String(a.name).toLowerCase();
   })[0], 'conflict', 'a character with that name already exists');
-  var c = { id: uid('c'), accountId: a.accountId, name: a.name, world: a.world,
-            vocation: a.vocation || null, lastLevel: null };
-  DB.characters.push(c);
-  audit('character.create', c.name, 'ok', '');
-  return { character: pubCharacter(c) };
+  var ch = { id: uid('c'), accountId: a.accountId, name: a.name, world: a.world,
+             vocation: a.vocation || null, lastLevel: null };
+  DB.characters.push(ch);
+  audit('character.create', ch.name, 'ok', '');
+  return { character: pubCharacter(ch) };
 },
 
-'character.delete': function (a) {
+'DELETE /api/characters/:id': function (c) {
   needAuth();
-  var c = DB.characters.filter(function (x) { return x.id === a.id; })[0];
-  need(c, 'not-found', 'no such character');
+  var ch = DB.characters.filter(function (x) { return x.id === c.params.id; })[0];
+  need(ch, 'not-found', 'no such character');
   DB.instances = DB.instances.filter(function (i) {
-    if (i.characterId !== c.id) return true;
+    if (i.characterId !== ch.id) return true;
     emit('instance', { id: i.id, removed: true });
     return false;
   });
-  DB.characters = DB.characters.filter(function (x) { return x.id !== c.id; });
-  audit('character.delete', c.name, 'ok', '');
+  DB.characters = DB.characters.filter(function (x) { return x.id !== ch.id; });
+  audit('character.delete', ch.name, 'ok', '');
   return {};
 },
 
 /* ---- proxies ---- */
 
-'proxy.list': function () { needAuth(); return { proxies: DB.proxies.map(pubProxy) }; },
+'GET /api/proxies': function () { needAuth(); return { proxies: DB.proxies.map(pubProxy) }; },
 
-'proxy.create': function (a) {
+'POST /api/proxies': function (c) {
   needAuth();
+  var a = c.body;
   need(a.label && a.host && a.port, 'bad-request', 'label, host and port are required');
   var p = { id: uid('p'), label: a.label, kind: a.kind || 'http-connect', host: a.host,
-            port: Number(a.port), user: a.user || null, hasPass: !!a.pass };
+            port: Number(a.port), user: a.user || null, hasPass: !!a.pass,
+            ownerUserId: session && session.id };
   DB.proxies.push(p);
-  audit('proxy.create', p.label, 'ok', p.host + ':' + p.port);
+  audit('proxy.create', p.label, 'ok', p.host + ':' + p.port);   // never the password
   return { proxy: pubProxy(p) };
 },
 
-'proxy.update': function (a) {
+'PATCH /api/proxies/:id': function (c) {
   needAuth();
-  var p = DB.proxies.filter(function (x) { return x.id === a.id; })[0];
+  var p = DB.proxies.filter(function (x) { return x.id === c.params.id; })[0];
   need(p, 'not-found', 'no such proxy');
-  var q = a.patch || {};
+  proxyOwnedOrAdmin(p);
+  var q = c.body || {};
   ['label', 'kind', 'host', 'user'].forEach(function (k) { if (q[k] !== undefined) p[k] = q[k]; });
   if (q.port !== undefined) p.port = Number(q.port);
   if (q.pass) p.hasPass = true;
@@ -868,10 +938,11 @@ var H = {
   return { proxy: pubProxy(p) };
 },
 
-'proxy.delete': function (a) {
+'DELETE /api/proxies/:id': function (c) {
   needAuth();
-  var p = DB.proxies.filter(function (x) { return x.id === a.id; })[0];
+  var p = DB.proxies.filter(function (x) { return x.id === c.params.id; })[0];
   need(p, 'not-found', 'no such proxy');
+  proxyOwnedOrAdmin(p);
   need(!DB.instances.filter(function (i) { return i.proxyId === p.id; }).length,
        'conflict', 'the proxy is still assigned to an instance');
   DB.proxies = DB.proxies.filter(function (x) { return x.id !== p.id; });
@@ -879,9 +950,9 @@ var H = {
   return {};
 },
 
-'proxy.test': function (a) {
+'POST /api/proxies/:id/test': function (c) {
   needAuth();
-  var p = DB.proxies.filter(function (x) { return x.id === a.id; })[0];
+  var p = DB.proxies.filter(function (x) { return x.id === c.params.id; })[0];
   need(p, 'not-found', 'no such proxy');
   if (rnd() < 0.2) return { ok: false, latencyMs: 0, error: 'CONNECT refused (HTTP 403)' };
   return { ok: true, latencyMs: ri(18, 240) };
@@ -889,20 +960,21 @@ var H = {
 
 /* ---- scripts ---- */
 
-'script.list': function () { needAuth(); return { scripts: DB.scripts.map(pubScript) }; },
+'GET /api/scripts': function () { needAuth(); return { scripts: DB.scripts.map(pubScript) }; },
 
-'script.get': function (a) {
+'GET /api/scripts/:id': function (c) {
   needAuth();
-  var s = DB.scripts.filter(function (x) { return x.id === a.id; })[0];
+  var s = DB.scripts.filter(function (x) { return x.id === c.params.id; })[0];
   need(s, 'not-found', 'no such script');
   return { script: pubScript(s), source: s.source };
 },
 
-'script.upload': function (a) {
-  needAuth();
+'POST /api/scripts': function (c) {
+  needExec();
+  var a = c.body;
   need(a.name && /^[\w.\- ]{1,64}$/.test(a.name), 'bad-request', 'invalid script name');
   need(typeof a.source === 'string' && a.source.length, 'bad-request', 'empty source');
-  need(a.source.length <= 512 * 1024, 'bad-request', 'script exceeds 512 KiB');
+  need(a.source.length <= 512 * 1024, 'too-large', 'script exceeds 512 KiB');
   var existing = DB.scripts.filter(function (x) { return x.name === a.name; })[0];
   var s = existing || { id: uid('s'), name: a.name, instanceIds: [], ownerUserId: session.id };
   s.source = a.source;
@@ -915,9 +987,9 @@ var H = {
   return { script: pubScript(s) };
 },
 
-'script.delete': function (a) {
+'DELETE /api/scripts/:id': function (c) {
   needAuth();
-  var s = DB.scripts.filter(function (x) { return x.id === a.id; })[0];
+  var s = DB.scripts.filter(function (x) { return x.id === c.params.id; })[0];
   need(s, 'not-found', 'no such script');
   DB.instances.forEach(function (i) {
     i.scripts = i.scripts.filter(function (x) { return x !== s.id; });
@@ -928,11 +1000,11 @@ var H = {
   return {};
 },
 
-'script.assign': function (a) {
+'PUT /api/scripts/:id/assignments': function (c) {
   needAuth();
-  var s = DB.scripts.filter(function (x) { return x.id === a.id; })[0];
+  var s = DB.scripts.filter(function (x) { return x.id === c.params.id; })[0];
   need(s, 'not-found', 'no such script');
-  var ids = (a.instanceIds || []).slice();
+  var ids = ((c.body || {}).instanceIds || []).slice();
   s.instanceIds = ids;
   DB.instances.forEach(function (i) {
     var want = ids.indexOf(i.id) >= 0, at = i.scripts.indexOf(s.id);
@@ -947,10 +1019,11 @@ var H = {
 
 /* ---- admin ---- */
 
-'admin.users': function () { needAdmin(); return { users: DB.users.map(pubUser) }; },
+'GET /api/admin/users': function () { needAdmin(); return { users: DB.users.map(pubUser) }; },
 
-'admin.userCreate': function (a) {
+'POST /api/admin/users': function (c) {
   needAdmin();
+  var a = c.body;
   need(a.name && /^[\w.\-]{2,32}$/.test(a.name), 'bad-request', 'invalid account name');
   need(!userByName(a.name), 'conflict', 'that name is taken');
   need(a.password && String(a.password).length >= 10, 'bad-request', 'password too short');
@@ -961,21 +1034,22 @@ var H = {
   return { user: pubUser(u) };
 },
 
-'admin.userUpdate': function (a) {
+'PATCH /api/admin/users/:id': function (c) {
   needAdmin();
-  var u = userById(a.id);
+  var u = userById(c.params.id);
   need(u, 'not-found', 'no such account');
   need(u.id !== session.id, 'forbidden', 'you cannot change your own role or status');
-  var p = a.patch || {};
+  var p = c.body || {};
   if (p.role) { need(p.role === 'admin' || p.role === 'user', 'bad-request', 'bad role'); u.role = p.role; }
   if (p.disabled !== undefined) u.disabled = !!p.disabled;
+  if (p.canExec !== undefined) u.canExec = !!p.canExec;
   audit('user.create', u.name, 'ok', 'updated ' + Object.keys(p).join(','));
   return { user: pubUser(u) };
 },
 
-'admin.userDelete': function (a) {
+'DELETE /api/admin/users/:id': function (c) {
   needAdmin();
-  var u = userById(a.id);
+  var u = userById(c.params.id);
   need(u, 'not-found', 'no such account');
   need(u.id !== session.id, 'forbidden', 'you cannot delete your own account');
   DB.users = DB.users.filter(function (x) { return x.id !== u.id; });
@@ -984,17 +1058,18 @@ var H = {
   return {};
 },
 
-'admin.userResetPassword': function (a) {
+'POST /api/admin/users/:id/password': function (c) {
   needAdmin();
-  var u = userById(a.id);
+  var u = userById(c.params.id);
   need(u, 'not-found', 'no such account');
-  need(a.password && String(a.password).length >= 10, 'bad-request', 'password too short');
+  var pw = (c.body || {}).password;
+  need(pw && String(pw).length >= 10, 'bad-request', 'password too short');
   DB.sessions = DB.sessions.filter(function (s) { return s.userId !== u.id || s.current; });
   audit('user.password', u.name, 'ok', 'reset by administrator');   // never the password
   return {};
 },
 
-'admin.sessions': function () {
+'GET /api/admin/sessions': function () {
   needAdmin();
   return { sessions: DB.sessions.map(function (s) {
     return { id: s.id, userId: s.userId, userName: nameOf(s.userId), ip: s.ip,
@@ -1003,22 +1078,23 @@ var H = {
   }) };
 },
 
-'admin.sessionRevoke': function (a) {
+'DELETE /api/admin/sessions/:id': function (c) {
   needAdmin();
-  var s = DB.sessions.filter(function (x) { return x.id === a.id; })[0];
+  var s = DB.sessions.filter(function (x) { return x.id === c.params.id; })[0];
   need(s, 'not-found', 'no such session');
-  DB.sessions = DB.sessions.filter(function (x) { return x.id !== a.id; });
+  DB.sessions = DB.sessions.filter(function (x) { return x.id !== c.params.id; });
   audit('session.revoke', nameOf(s.userId), 'ok', s.ip);
   return {};
 },
 
-'admin.audit': function (a) {
+'GET /api/admin/audit': function (c) {
   needAdmin();
+  var a = c.query;
   var rows = DB.audit;
   if (a.actor)  rows = rows.filter(function (r) { return r.actor === a.actor; });
   if (a.action) rows = rows.filter(function (r) { return r.action === a.action; });
-  if (a.from)   rows = rows.filter(function (r) { return r.t >= a.from; });
-  if (a.to)     rows = rows.filter(function (r) { return r.t <= a.to; });
+  if (a.from)   rows = rows.filter(function (r) { return r.t >= Number(a.from); });
+  if (a.to)     rows = rows.filter(function (r) { return r.t <= Number(a.to); });
   if (a.q) {
     var q = String(a.q).toLowerCase();
     rows = rows.filter(function (r) {
@@ -1026,7 +1102,7 @@ var H = {
     });
   }
   var start = a.cursor ? Number(a.cursor) : 0;
-  var lim = Math.min(a.limit || 100, 500);
+  var lim = Math.min(Number(a.limit) || 100, 500);
   var page = rows.slice(start, start + lim);
   var actors = {}, actions = {};
   DB.audit.forEach(function (r) { actors[r.actor] = 1; actions[r.action] = 1; });
@@ -1041,51 +1117,181 @@ var H = {
 
 };
 
-/* ------------------------- the transport ------------------------ */
+/* --------------------------- the router ------------------------- */
 
-function latency(cmd) {
+var COMPILED = Object.keys(ROUTES).map(function (key) {
+  var sp = key.indexOf(' ');
+  var method = key.slice(0, sp), tmpl = key.slice(sp + 1);
+  var names = [];
+  var rx = tmpl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+               .replace(/:([A-Za-z_][A-Za-z0-9_]*)/g, function (m, n) { names.push(n); return '([^/]+)'; });
+  return { key: key, method: method, tmpl: tmpl, rx: new RegExp('^' + rx + '$'), names: names,
+           fn: ROUTES[key] };
+});
+
+function match(method, path) {
+  for (var i = 0; i < COMPILED.length; i++) {
+    var r = COMPILED[i];
+    if (r.method !== method) continue;
+    var m = r.rx.exec(path);
+    if (!m) continue;
+    var params = {};
+    for (var j = 0; j < r.names.length; j++) params[r.names[j]] = decodeURIComponent(m[j + 1]);
+    return { route: r, params: params };
+  }
+  return null;
+}
+
+var SAFE = { GET: true, HEAD: true, OPTIONS: true };
+
+function handle(method, url, init) {
+  var qmark = url.indexOf('?');
+  var path = qmark < 0 ? url : url.slice(0, qmark);
+  var query = {};
+  if (qmark >= 0) {
+    url.slice(qmark + 1).split('&').forEach(function (pair) {
+      if (!pair) return;
+      var eq = pair.indexOf('=');
+      var k = decodeURIComponent(eq < 0 ? pair : pair.slice(0, eq));
+      query[k] = eq < 0 ? '' : decodeURIComponent(pair.slice(eq + 1).replace(/\+/g, ' '));
+    });
+  }
+
+  var hit = match(method, path);
+  if (!hit) return { status: 404, body: { error: { code: 'not-found', message: 'no route: ' + method + ' ' + path } } };
+
+  /* the CSRF check the real hub must also make */
+  if (!SAFE[method]) {
+    var hdr = (init && init.headers && (init.headers['X-CSRF-Token'] || init.headers['x-csrf-token'])) || '';
+    if (hdr !== csrf) {
+      return { status: 403, body: { error: { code: 'csrf-invalid', message: 'bad or missing X-CSRF-Token' } } };
+    }
+  }
+
+  var body = {};
+  if (init && init.body) {
+    try { body = JSON.parse(init.body); }
+    catch (e) { return { status: 400, body: { error: { code: 'bad-request', message: 'malformed JSON body' } } }; }
+  }
+
+  try {
+    var result = hit.route.fn({ params: hit.params, query: query, body: body });
+    return { status: 200, body: result || {} };
+  } catch (e) {
+    var code = e.code || 'internal';
+    return { status: STATUS[code] || 500, body: { error: { code: code, message: e.message || String(e) } } };
+  }
+}
+
+/* ------------------------- the fake fetch ----------------------- */
+
+function latency(path) {
   if (API.latencyMs !== null) return API.latencyMs;
-  if (cmd === 'instance.exec') return 120 + rnd() * 500;
-  if (cmd.indexOf('admin.audit') === 0) return 60 + rnd() * 180;
-  if (cmd === 'proxy.test') return 300 + rnd() * 1400;
+  if (/\/exec$/.test(path)) return 120 + rnd() * 500;
+  if (/\/audit/.test(path)) return 60 + rnd() * 180;
+  if (/\/test$/.test(path)) return 300 + rnd() * 1400;
   return 35 + rnd() * 130;
 }
 
-function dispatch(cmd, args) {
-  var fn = H[cmd];
-  if (!fn) return { ok: false, error: { code: 'unknown-command', message: 'no such command: ' + cmd } };
-  try { return { ok: true, result: fn(args || {}) }; }
-  catch (e) { return { ok: false, error: { code: e.code || 'internal', message: e.message || String(e) } }; }
+function fakeFetch(url, init) {
+  init = init || {};
+  var method = (init.method || 'GET').toUpperCase();
+  var d = latency(url);
+  var run = function () {
+    var r = handle(method, String(url), init);
+    var text = JSON.stringify(r.body);
+    return {
+      status: r.status,
+      ok: r.status >= 200 && r.status < 300,
+      headers: { get: function () { return 'application/json'; } },
+      text: function () { return Promise.resolve(text); },
+      json: function () { return Promise.resolve(JSON.parse(text)); }
+    };
+  };
+  if (!d) return Promise.resolve().then(run);
+  return new Promise(function (resolve) { setTimeout(function () { resolve(run()); }, d); });
 }
 
+/* ---------------------- the fake WebSocket ---------------------- */
+
+/* Delivery scheduling. With HubMock.latencyMs = 0 (what automated tests set)
+   everything runs on microtasks: a hidden or backgrounded browser tab clamps
+   setTimeout hard, which made socket tests flaky for no good reason. */
+function soon(fn, ms) {
+  if (API.latencyMs === 0) { Promise.resolve().then(fn); return 0; }
+  return setTimeout(fn, ms);
+}
+
+function FakeWebSocket(url) {
+  var self = this;
+  this.url = url;
+  this.readyState = 0;                 // CONNECTING
+  this.onopen = this.onmessage = this.onclose = this.onerror = null;
+  this._ready = false;
+  this._subs = { logs: null, chat: null };
+  sockets.push(this);
+  soon(function () {
+    if (self.readyState !== 0) return;
+    self.readyState = 1;               // OPEN
+    if (self.onopen) self.onopen({});
+  }, 20);
+}
+FakeWebSocket.prototype.send = function (raw) {
+  var self = this;
+  var f;
+  try { f = JSON.parse(raw); } catch (e) { return; }
+  if (f.type === 'auth') {
+    /* the same rule the hub enforces: a cookie session AND a matching CSRF token */
+    if (!session || f.csrf !== csrf) { this.close(4401); return; }
+    this._ready = true;
+    soon(function () {
+      self._push('ready', { version: 'mock-2.0', user: session ? session.name : null, t: now() });
+      if (!timer) timer = setInterval(tick, 1000);
+    }, 5);
+    return;
+  }
+  if (!this._ready) return;
+  if (f.type === 'subscribe') { this._subs = { logs: f.logs || null, chat: f.chat || null }; return; }
+  if (f.type === 'ping') { this._push('pong', { t: f.t }); return; }
+};
+FakeWebSocket.prototype._push = function (ev, data) {
+  if (this.readyState !== 1 || !this.onmessage) return;
+  var payload = JSON.stringify({ event: ev, data: data });
+  var self = this;
+  soon(function () { if (self.onmessage) self.onmessage({ data: payload }); }, 0);
+};
+FakeWebSocket.prototype.close = function (code, reason) {
+  var self = this;
+  if (this.readyState === 3) return;
+  this.readyState = 3;                 // CLOSED
+  this._ready = false;
+  var at = sockets.indexOf(this);
+  if (at >= 0) sockets.splice(at, 1);
+  if (!sockets.length && timer) { clearInterval(timer); timer = null; }
+  soon(function () { if (self.onclose) self.onclose({ code: code || 1000, reason: reason || '' }); }, 0);
+};
+
+function closeAllSockets(code) {
+  sockets.slice().forEach(function (s) { s.close(code); });
+}
+
+/* --------------------------- exports ---------------------------- */
+
 var API = {
-  /* Simulated round-trip time. null = the per-command profile in latency();
+  /* Simulated round-trip time. null = the per-path profile in latency();
      set HubMock.latencyMs = 0 to answer on a microtask instead, which is what
      automated tests want (a hidden browser tab throttles setTimeout hard). */
   latencyMs: null,
 
-  rpc: function (cmd, args) {
-    var d = latency(cmd);
-    if (!d) return Promise.resolve().then(function () { return dispatch(cmd, args); });
-    return new Promise(function (resolve) {
-      setTimeout(function () { resolve(dispatch(cmd, args)); }, d);
-    });
-  },
-
-  subscribe: function (fn) {
-    listener = fn;
-    if (!timer) timer = setInterval(tick, 1000);
-    setTimeout(function () { if (listener) listener('hello', { version: 'mock-1.0', t: now() }); }, 50);
-  },
-
-  unsubscribe: function () {
-    listener = null;
-    if (timer) { clearInterval(timer); timer = null; }
-  },
+  fetch: fakeFetch,
+  WebSocket: FakeWebSocket,
 
   /* handy in the browser console while developing the UI */
   _db: DB,
-  _tick: tick
+  _tick: tick,
+  _routes: function () { return COMPILED.map(function (r) { return r.key; }); },
+  _csrf: function () { return csrf; },
+  _session: function () { return session; }
 };
 
 window.HubMock = API;

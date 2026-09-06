@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>panel tests</title>
+<style>
+  body { background:#0d1117; color:#c9d5e1; font:13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+         margin:0; padding:18px 20px; }
+  h1 { font-size:15px; margin:0 0 4px; color:#e6edf3; }
+  .hint { color:#7d8b9a; margin:0 0 14px; }
+  #out div { white-space:pre; padding:1px 0; }
+  .p { color:#3fb950; }
+  .f { color:#f85149; }
+  .sum { margin-top:12px; border-top:1px solid #1c2732; padding-top:10px !important; font-weight:600; }
+</style>
+</head>
+<body>
+
+<h1>panel transport tests</h1>
+<p class="hint">No DOM rendering, no network: fake fetch, fake WebSocket, fake clock, plus the mock hub.
+Results are also on <code>window.TESTS_RESULT</code>.</p>
+<div id="out"></div>
+
+<script src="../mock/api.js"></script>
+<script src="../rpc.js"></script>
+<script src="../api.js"></script>
+<script src="tests.js"></script>
+
+</body>
+</html>

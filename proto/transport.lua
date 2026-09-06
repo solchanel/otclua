@@ -5,6 +5,14 @@
 --
 -- Spec: docs/framing-crypto.md (VERIFIER Corrections are authoritative).
 --
+-- PROXY (opts.proxy = {host, port, user, pass}): the TCP connection is made to the
+-- proxy and lib/proxy.lua's HTTP CONNECT handshake runs to completion BEFORE any game
+-- byte -- including the raw world-name preamble -- is written, which is exactly the
+-- order the reference client uses (connection.cpp:293-400).  State machine:
+--   idle -> connecting -> [proxying] -> connected.
+-- Bytes the proxy has already buffered past its 200 response (`hs.leftover`) are game
+-- bytes and are fed straight into the frame accumulator.
+--
 -- OUTGOING (Protocol::send, protocol.cpp:122-188), in order:
 --   1. compression header "\0\0\0\0"  -- ONLY when XTEA is already on and
 --                                        60 <= os <= 62 (always true here).
@@ -35,11 +43,12 @@
 local transport = {}
 
 -- lazily required so this module loads before lib/ is fully populated
-local _xtea, _inflate, _socket, _sched
+local _xtea, _inflate, _socket, _sched, _proxy
 local function XTEA()    if not _xtea    then _xtea    = require('lib.xtea')    end return _xtea    end
 local function INFLATE() if not _inflate then _inflate = require('lib.inflate') end return _inflate end
 local function SOCKET()  if not _socket  then _socket  = require('lib.socket')  end return _socket  end
 local function SCHED()   if not _sched   then _sched   = require('lib.sched')   end return _sched   end
+local function PROXY()   if not _proxy   then _proxy   = require('lib.proxy')   end return _proxy   end
 
 -- monotonic clock; falls back to os.time() when lib/sys is unavailable (never on either
 -- supported platform, but the transport must stay loadable in a bare interpreter).
@@ -99,6 +108,20 @@ function transport.new(opts)
     self.connectTimeoutMs = opts.connectTimeoutMs or 30000
     self.readTimeoutMs    = opts.readTimeoutMs    or 30000
 
+    -- HTTP CONNECT tunnel (work item B1 / PANEL.md "Proxy support").  When set, the TCP
+    -- connection is made to the PROXY and lib/proxy.lua's handshake runs to completion
+    -- BEFORE a single game byte -- including the raw world-name preamble -- is written.
+    -- opts.proxy = { host=, port=, user=, pass=, timeoutMs=, userAgent= }
+    if opts.proxy then
+        local p = opts.proxy
+        if type(p) ~= 'table' or not p.host or not p.port then
+            error('transport: opts.proxy needs {host=, port=}')
+        end
+        self.proxy = { host = p.host, port = tonumber(p.port),
+                       user = p.user, pass = p.pass,
+                       timeoutMs = p.timeoutMs, userAgent = p.userAgent }
+    end
+
     -- crypto / framing state
     self.xteaOn   = false
     self.xteaKey  = nil
@@ -116,7 +139,7 @@ function transport.new(opts)
     self.compressionMode = nil
     self.zstream         = nil
 
-    self.state = 'idle'               -- idle|connecting|connected|closed|error
+    self.state = 'idle'               -- idle|connecting|proxying|connected|closed|error
     self.dead  = false
 
     self.stats = { sent = 0, recv = 0, bytesIn = 0, bytesOut = 0, seq = 0 }
@@ -372,8 +395,27 @@ function Transport:connect()
     self:_resetSession()
     local socket = SOCKET()
     socket.init()
+
+    -- With a proxy the TCP connection goes to the PROXY; `self.host/port` become the
+    -- CONNECT target.  The handshake object is built here so a bad endpoint/credential
+    -- is a connect()-time error rather than a mid-poll surprise.
+    local dialHost, dialPort = self.host, self.port
+    if self.proxy then
+        local hs, herr = PROXY().newHandshake{
+            host = self.host, port = self.port,
+            proxyHost = self.proxy.host, proxyPort = self.proxy.port,
+            user = self.proxy.user, pass = self.proxy.pass,
+            userAgent = self.proxy.userAgent,
+            timeoutMs = self.proxy.timeoutMs or self.connectTimeoutMs,
+        }
+        if not hs then return nil, tostring(herr) end
+        self._proxyHs   = hs
+        self._proxySent = false
+        dialHost, dialPort = self.proxy.host, self.proxy.port
+    end
+
     local s = socket.tcp()
-    local ok, err = s:connect(self.host, self.port)
+    local ok, err = s:connect(dialHost, dialPort)
     if not ok then
         self.sock = s
         return self:_fail('connect failed: ' .. tostring(err))
@@ -413,27 +455,82 @@ end
 
 -- Drives connect completion and reads. Safe to call repeatedly; the
 -- scheduler calls it every 10 ms until the socket is registered for reads.
+-- The TCP connection is up (directly, or the CONNECT tunnel has been established):
+-- hand the socket to the reactor, write the raw world-name preamble and tell the caller.
+function Transport:_enterConnected()
+    self.state = 'connected'
+    self.lastReadMs = self:_nowMs()          -- arm the read watchdog
+    if self._sched and self._pollTimer then
+        self._sched.cancel(self._pollTimer)
+        self._pollTimer = nil
+        self._sched.onSocket(self.sock, function() self:pump() end)
+    end
+    -- The very first bytes on the socket: world name + '\n', raw.
+    local ok = self:sendRaw((self.worldName or '') .. '\n')
+    if not ok then return end
+    self.onConnect()
+    return true
+end
+
 function Transport:poll()
     if self.dead or not self.sock then return end
     if self.state == 'connecting' then
         if self.sock:isConnected() then
-            self.state = 'connected'
-            self.lastReadMs = self:_nowMs()      -- arm the read watchdog
-            if self._sched and self._pollTimer then
-                self._sched.cancel(self._pollTimer)
-                self._pollTimer = nil
-                self._sched.onSocket(self.sock, function() self:pump() end)
+            if self._proxyHs then
+                -- The proxy speaks first: CONNECT host:port, then its status line.  NOTHING
+                -- of the game protocol -- not even the world-name preamble -- may go out
+                -- until the tunnel answers 200, or the proxy would parse it as a request.
+                self.state = 'proxying'
+                self.proxyStartMs = self:_nowMs()
+                if not self._proxySent then
+                    local ok = self:_write(self._proxyHs.request)
+                    if not ok then return end
+                    self._proxySent = true
+                end
+                return self:_pumpProxy()
             end
-            -- The very first bytes on the socket: world name + '\n', raw.
-            local ok = self:sendRaw((self.worldName or '') .. '\n')
-            if not ok then return end
-            self.onConnect()
+            return self:_enterConnected()
         elseif self.sock.state == 'error' or self.sock.state == 'closed' then
             return self:_fail(tostring(self.sock.err or ('socket ' .. self.sock.state)))
         end
+    elseif self.state == 'proxying' then
+        self:_pumpProxy()
     elseif self.state == 'connected' then
         self:pump()
     end
+end
+
+-- Read the proxy's answer.  lib/proxy.lua is a pure state machine: we only own the
+-- socket and the clock.  On success the tunnel bytes it already buffered (`leftover`)
+-- are fed to the frame accumulator, because they are game bytes, not proxy bytes.
+function Transport:_pumpProxy()
+    local proxy = PROXY()
+    local hs = self._proxyHs
+    if not hs then return end
+    self.sock:flush()
+    local data, err = self.sock:recv(self.recvChunk)
+    local status, a, b
+    if data == nil then
+        if err == 'closed' then status, a, b = hs:eof()
+        else return self:_fail('proxy: recv failed: ' .. tostring(err)) end
+    elseif #data > 0 then
+        status, a, b = hs:feed(data, self:_nowMs())
+    else
+        status, a, b = hs:tick(self:_nowMs())
+    end
+
+    if status == proxy.ERROR then
+        return self:_fail(('proxy %s:%s: %s'):format(tostring(self.proxy.host),
+                          tostring(self.proxy.port), tostring(a)) ..
+                          (b and (' [' .. tostring(b) .. ']') or ''))
+    end
+    if status ~= proxy.CONNECTED then return end          -- need-more: try again next poll
+
+    self._proxyHs = nil
+    self.proxyEstablished = true
+    local leftover = a or ''
+    if not self:_enterConnected() then return end
+    if #leftover > 0 then return self:feed(leftover) end
 end
 
 -- Read everything currently available and feed it to the accumulator.

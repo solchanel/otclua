@@ -6,3 +6,8 @@ scratch/
 scratch-profile/
 live-*.log
 test/.tmp/
+
+# A worker resolves --bot-profile relative to --workers-dir, so a suite that
+# starts a real worker from the project root leaves its bot storage here.
+profile_1/
+hub-data/

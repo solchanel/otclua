@@ -230,6 +230,38 @@ end
 local DEFAULT_REDACT = { 'password', 'passwd', 'pass', 'token', 'secret',
                          'proxy%-auth', 'auth', 'key', 'apikey', 'credential' }
 
+--- A REFERENCE to a secret is not a secret.  `--control-token-fd=0` names a file
+--- descriptor and `--proxy-auth=@/run/creds` names a path; neither publishes
+--- anything through /proc/<pid>/cmdline, and refusing them would force every
+--- caller to disarm the denylist for the whole command line just to pass a
+--- descriptor number -- which is strictly worse than this narrow exemption.
+---
+--- Exempt, and ONLY these:
+---   a value spelled fd:N                             fd:0
+---   a value that starts with '@' (read from a path)  @/run/creds, @C:/x/creds
+---   a flag whose NAME ends in fd / file / path       --control-token-file=C:/x
+---   a BARE number, but only under a flag ending 'fd' --control-token-fd 0
+--- `--token 123456` is therefore still a secret: the flag does not name a
+--- descriptor, so the number is read as the value it looks like.
+--- `--proxy-auth=user:pass` matches none of them and is still refused.
+local function looksLikeReference(flag, value)
+    if value == nil or value == '' then return false end
+    if value:match('^[Ff][Dd]:%d+$') then return true end
+    if value:sub(1, 1) == '@' and #value > 1 then return true end
+    -- flag arrives with its separator, e.g. '--control-token-file='
+    local name = flag:gsub('[:=]$', ''):gsub('^%-+', ''):lower()
+    -- a BARE number is only a descriptor when the flag says so: `--token 123456`
+    -- is a token, not a file descriptor.
+    if name:match('fd$') and value:match('^%d+$') then return true end
+    if name:match('fd$') or name:match('file$') or name:match('path$') then
+        -- a path may legitimately contain ':' on Windows (C:/...), but never a
+        -- newline, and it must not look like `user:pass` on a POSIX host
+        return not value:match('^[^:/\\]+:[^:/\\]+$')
+    end
+    return false
+end
+process.looksLikeReference = looksLikeReference
+
 --- Does `a` look like `--<something-secret><sep>VALUE`?  Returns the flag part
 --- (including the separator) and the value.  Matching is case-INSENSITIVE and both
 --- '=' and ':' count as separators, so --proxyAuth=u:p and --password:pw are caught
@@ -273,11 +305,14 @@ local function redactCmd(cmd, patterns, secretArgs)
         elseif byValue[a] then
             out[i] = '***'
         else
-            local flag = secretArgParts(a, patterns)
-            if flag then
+            local flag, value = secretArgParts(a, patterns)
+            if flag and looksLikeReference(flag, value) then
+                out[i] = a               -- a descriptor or a path, not a credential
+            elseif flag then
                 out[i] = flag .. '***'
             elseif i > 1 and isSecretFlag(tostring(cmd[i - 1]), patterns)
-                   and not byIndex[i - 1] then
+                   and not byIndex[i - 1]
+                   and not looksLikeReference(tostring(cmd[i - 1]) .. '=', a) then
                 out[i] = '***'                  -- `--password VALUE` as two elements
             else
                 -- a value that merely CONTAINS a listed secret is masked too
@@ -298,10 +333,11 @@ local function secretInArgv(cmd, patterns)
     for i = 1, #cmd do
         local a = tostring(cmd[i])
         local flag, value = secretArgParts(a, patterns)
-        if flag and value ~= '' then
+        if flag and value ~= '' and not looksLikeReference(flag, value) then
             return i, a:sub(1, #flag - 1)
         end
-        if i > 1 and isSecretFlag(tostring(cmd[i - 1]), patterns) and a ~= '' then
+        if i > 1 and isSecretFlag(tostring(cmd[i - 1]), patterns) and a ~= ''
+           and not looksLikeReference(tostring(cmd[i - 1]) .. '=', a) then
             return i, tostring(cmd[i - 1])
         end
     end
@@ -839,6 +875,23 @@ cdef [[ int waitpid(int, int*, int); ]]
 cdef [[ void _exit(int); ]]
 cdef [[ int prctl(int, unsigned long, unsigned long, unsigned long, unsigned long); ]]
 cdef [[ extern char** environ; ]]
+-- The post-fork hygiene set.  A signal MASK survives both fork and execve, and
+-- the hub blocks SIGHUP/SIGINT/SIGTERM for its own polled signal gate
+-- (hub/main.lua's installSignalGate), so without an explicit reset here every
+-- worker starts with those three blocked: PR_SET_PDEATHSIG's SIGTERM is then
+-- queued and never delivered, and the supervisor's graceful stop is inert too.
+-- The sigset_t glibc uses is 128 bytes; sixteen unsigned longs matches it on
+-- both 64- and 32-bit, and only the first word is ever touched here.
+-- ffi.cdef is process-global and the FIRST declaration wins, and hub/main.lua
+-- declares sigprocmask against a sigset_t struct of its own.  Declaring it here
+-- too is therefore best-effort; the CALL is made through an explicitly cast
+-- function pointer taking void*, which is correct under either declaration.
+cdef [[ void* signal(int, void*); ]]
+cdef [[ int sigprocmask(int, const void*, void*); ]]
+-- close_range(2) (Linux 5.9+) closes the whole inherited range in one syscall.
+-- Older kernels answer ENOSYS and the loop below does it one fd at a time.
+cdef [[ int close_range(unsigned int, unsigned int, unsigned int); ]]
+cdef [[ long sysconf(int); ]]
 -- close/read/write are declared by other modules with the same prototypes;
 -- pcall'd cdef makes a duplicate harmless either way.
 cdef [[ int close(int); ]]
@@ -857,8 +910,37 @@ local c_execvpe = nil
 pcall(function() c_execvpe = C.execvpe end)     -- glibc >= 2.11, musl; optional
 local c_prctl = nil
 pcall(function() c_prctl = C.prctl end)         -- Linux only; optional
+local c_signal = nil
+pcall(function() c_signal = C.signal end)
+local c_sigprocmask = nil
+pcall(function()
+    c_sigprocmask = ffi.cast('int (*)(int, const void*, void*)', C.sigprocmask)
+end)
+local c_close_range = nil
+pcall(function() c_close_range = C.close_range end)   -- glibc >= 2.34 + Linux 5.9
+local c_sysconf = nil
+pcall(function() c_sysconf = C.sysconf end)
 
 local PR_SET_PDEATHSIG = 1
+local SIG_SETMASK      = 2
+local SIG_DFL          = ffi.cast('void*', 0)
+local _SC_OPEN_MAX     = 4
+
+-- Everything the child touches between fork() and execve() has to be allocated
+-- HERE, in the parent: an allocation in the child can take a lock the fork froze.
+-- glibc's sigset_t is 128 bytes; sixteen unsigned longs covers it on 32- and
+-- 64-bit alike, and ffi.new zero-fills, which IS the empty set.
+local emptyMask = ffi.new('unsigned long[16]')
+
+-- How high the close sweep has to go when close_range is unavailable.  Resolved
+-- once, in the parent; RLIMIT_NOFILE is normally 1024 and rarely above 1M, and a
+-- pathological limit is clamped so the fallback loop stays bounded.
+local OPEN_MAX = 4096
+if c_sysconf then
+  local ok, n = pcall(function() return tonumber(c_sysconf(_SC_OPEN_MAX)) end)
+  if ok and n and n > 3 then OPEN_MAX = (n > 65536) and 65536 or n end
+end
+process._openMaxSweep = OPEN_MAX
 
 local O_CLOEXEC        = 0x80000    -- 02000000 octal
 local O_NONBLOCK       = 0x800      -- 04000 octal
@@ -999,6 +1081,7 @@ function backend.spawn(h, opts)
     -- -9 does not leave workers behind.  It survives execve (except for setuid
     -- images) and is inherited by nothing, so each child arms its own.
     local deathSig = h.deathSignal or 0
+    local sweepMax = OPEN_MAX        -- plain local: no table read after the fork
 
     local pid = C.fork()
     if pid < 0 then
@@ -1019,6 +1102,40 @@ function backend.spawn(h, opts)
             c_close(outR); c_close(outW); c_close(errR); c_close(errW)
         end
         c_close(xR)
+        -- ---- post-fork hygiene, in this order --------------------------------
+        -- 1. Close every OTHER inherited descriptor.  The three std pipes are
+        --    already in place, and xW must stay open (it is CLOEXEC, so a
+        --    successful exec closes it and a failed one still carries the errno),
+        --    so the sweep skips exactly those four.  Without it the child gets
+        --    the hub's listening socket (an orphan keeps the port bound), its
+        --    audit-log append handle and every other data file -- and the child
+        --    runs operator-supplied Lua.
+        if xW > 2 then
+            if c_close_range ~= nil then
+                if c_close_range(3, xW - 1, 0) ~= 0 then
+                    for fd = 3, xW - 1 do c_close(fd) end
+                end
+                if c_close_range(xW + 1, 0x7FFFFFFF, 0) ~= 0 then
+                    for fd = xW + 1, sweepMax do c_close(fd) end
+                end
+            else
+                for fd = 3, sweepMax do
+                    if fd ~= xW then c_close(fd) end
+                end
+            end
+        end
+        -- 2. Restore a clean signal mask and the two dispositions this module
+        --    changed in the parent.  A mask survives execve, so a hub that blocks
+        --    SIGTERM for its own signal gate would otherwise hand every worker a
+        --    permanently-blocked SIGTERM -- which makes PR_SET_PDEATHSIG below,
+        --    and the supervisor's graceful stop, silently do nothing.
+        if c_sigprocmask ~= nil then
+            c_sigprocmask(SIG_SETMASK, emptyMask, nil)
+        end
+        if c_signal ~= nil then
+            c_signal(13, SIG_DFL)       -- SIGPIPE: the parent set SIG_IGN
+            c_signal(17, SIG_DFL)       -- SIGCHLD, in case a caller changed it
+        end
         if cwdC ~= nil then
             if c_chdir(cwdC) ~= 0 then
                 errnoBuf[0] = ffi.errno()

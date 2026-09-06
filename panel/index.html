@@ -21,9 +21,13 @@
 <div id="toasts" role="status" aria-live="polite"></div>
 
 <!--
-  Mock mode: open this file with ?mock=1 (works straight off the filesystem).
-  document.write keeps the script order deterministic without a bundler; the
-  mock installs window.HubMock, and app.js picks it up if present.
+  Mock mode: open this page with ?mock=1 and the whole panel runs against
+  mock/api.js, which fakes fetch() and WebSocket rather than the API, so the
+  real rpc.js / api.js / app.js code paths (methods, paths, CSRF header, the
+  /ws handshake) are the ones being exercised. ?mock=1&fleet=40 makes it a
+  forty-instance fleet.
+
+  document.write keeps the script order deterministic without a bundler.
 -->
 <script>
 (function () {
@@ -34,6 +38,8 @@
   } catch (e) { /* nothing we can do this early */ }
 })();
 </script>
+<script src="rpc.js"></script>
+<script src="api.js"></script>
 <script src="app.js"></script>
 
 </body>

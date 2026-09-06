@@ -1,9 +1,12 @@
 /* ==================================================================
    luaclient hub — panel front-end
    ------------------------------------------------------------------
-   Vanilla ES2017+. No framework, no bundler, no CDN. Served as a
-   static file by the hub; also runs straight off the filesystem with
-   ?mock=1 (see mock/api.js).
+   Vanilla ES5-dialect JS. No framework, no bundler, no CDN. Served as
+   a static file by the hub; also runs against panel/mock/api.js with
+   ?mock=1 (same code paths, only the network is faked).
+
+   Loads after panel/rpc.js (transport) and panel/api.js (the endpoint
+   table, which is the contract the hub must match).
 
    Security notes that are load-bearing, not decoration:
      * Every piece of server data reaches the DOM through
@@ -11,9 +14,12 @@
        assigned anywhere in this file. Search for it: zero hits.
      * The session lives in an HttpOnly cookie set by the hub. No
        password, token or session id is ever put in a URL, in
-       localStorage/sessionStorage, or logged to the console.
+       localStorage/sessionStorage, or logged to the console. The CSRF
+       token lives in memory inside the HttpClient for the life of the
+       page.
      * localStorage is used for exactly two cosmetic keys:
        `panel.tab.<instanceId>` and `panel.rail`.
+     * Every destructive action goes through Modal.confirm.
    ================================================================== */
 
 (function () {
@@ -21,9 +27,12 @@
 
 /* ============================ 0. env ============================= */
 
-var QS      = new URLSearchParams(location.search);
-var MOCK    = !!window.HubMock && QS.get('mock') === '1';
-var API     = QS.get('api') || '';           // optional hub origin override
+var RPC = window.PanelRpc;
+var APIDEF = window.PanelApi;
+
+var QS       = new URLSearchParams(location.search);
+var MOCK     = !!window.HubMock && QS.get('mock') === '1';
+var BASE     = QS.get('api') || '';           // optional hub origin override
 var IS_HTTPS = location.protocol === 'https:';
 
 /* ========================= 1. DOM helpers ======================== */
@@ -67,6 +76,10 @@ function append(el, kid) {
 
 function clear(el) { while (el.firstChild) el.removeChild(el.firstChild); }
 function txt(s) { return document.createTextNode(s === null || s === undefined ? '' : String(s)); }
+function setText(node, s) {                       // cheap: skip identical writes
+  var v = (s === null || s === undefined) ? '' : String(s);
+  if (node.textContent !== v) node.textContent = v;
+}
 
 /* ========================= 2. formatting ========================= */
 
@@ -131,10 +144,17 @@ var Toast = {
   info: function (t, d) { return Toast.show('info', t, d); }
 };
 
+/**
+ * The single place a failed call becomes visible. Shows the stable error
+ * code and, for anything the operator may need to report, which endpoint
+ * it was — a 404 on /api/instances/x is a different bug from a 404 on
+ * /api/scripts/y and the toast should not hide that.
+ */
 function failed(what, e) {
-  var msg = e && e.message ? e.message : String(e);
-  var code = e && e.code ? ' [' + e.code + ']' : '';
-  Toast.err(what + ' failed' + code, msg);
+  var msg = (e && e.message) ? e.message : String(e);
+  var code = (e && e.code) ? ' [' + e.code + ']' : '';
+  var where = (e && e.method && e.path) ? e.method + ' ' + e.path : '';
+  Toast.err(what + ' failed' + code, where ? msg + '  (' + where + ')' : msg);
 }
 
 /* =========================== 4. modal ============================ */
@@ -197,10 +217,11 @@ var Modal = (function () {
     if (lastFocus && lastFocus.focus) { try { lastFocus.focus(); } catch (e) {} }
   }
 
+  /** Every destructive action in this file goes through here. */
   function confirm(title, message, onYes, yesLabel) {
     open({
       title: title,
-      body: h('div', { text: message }),
+      body: h('div', null, h('div', { text: message })),
       actions: [
         { label: 'Cancel' },
         { label: yesLabel || 'Confirm', kind: 'danger', onclick: function (c) { c(); onYes(); } }
@@ -211,165 +232,28 @@ var Modal = (function () {
   return { open: open, close: close, confirm: confirm };
 })();
 
-/* ======================== 5. the RPC client ====================== */
+/* ====================== 5. transport wiring ====================== */
 
-function RpcError(code, message) {
-  this.name = 'RpcError'; this.code = code || 'internal'; this.message = message || 'request failed';
-}
-RpcError.prototype = Object.create(Error.prototype);
-
-/**
- * Rpc — one HTTP POST endpoint for commands, one WebSocket for events.
- *
- *   POST <base>/api/rpc   {id, cmd, args}  ->  {id, ok:true, result} | {id, ok:false, error:{code,message}}
- *   WS   <base>/api/events                 ->  {event, data} frames
- *
- * Reconnects with exponential backoff + jitter; every call has a timeout.
- */
-function Rpc(opts) {
-  opts = opts || {};
-  this.base = opts.base || '';
-  this.mock = opts.mock || null;
-  this.timeoutMs = opts.timeoutMs || 15000;
-  this.seq = 0;
-  this.handlers = Object.create(null);
-  this.ws = null;
-  this.wsWanted = false;
-  this.retries = 0;
-  this.retryTimer = null;
-  this.status = 'idle';       // idle | connecting | live | retry | down
-  this.inflight = 0;
-}
-
-Rpc.prototype.on = function (ev, fn) {
-  (this.handlers[ev] || (this.handlers[ev] = [])).push(fn);
-  return this;
-};
-Rpc.prototype.emit = function (ev, data) {
-  var list = this.handlers[ev];
-  if (list) for (var i = 0; i < list.length; i++) {
-    try { list[i](data); } catch (e) { console.error('handler for ' + ev, e); }
+var http = new RPC.HttpClient({
+  base: BASE,
+  timeoutMs: 15000,
+  fetch: MOCK ? window.HubMock.fetch : null,
+  onUnauthorized: function () { onUnauthorized(); },
+  refreshCsrf: function () {
+    /* the token went stale: ask for a new one, without recursing */
+    return http.request('GET', '/api/session', null, { noCsrfRetry: true, retries: 0 })
+      .then(function () {}, function () {});
   }
-  var any = this.handlers['*'];
-  if (any && ev !== '*') for (var j = 0; j < any.length; j++) {
-    try { any[j](ev, data); } catch (e) { console.error('handler *', e); }
-  }
-};
+});
 
-Rpc.prototype.setStatus = function (s, detail) {
-  if (this.status === s) return;
-  this.status = s;
-  this.emit('#status', { status: s, detail: detail || '' });
-};
+var ws = new RPC.WsClient({
+  base: BASE,
+  path: APIDEF.WS.path,
+  getCsrf: function () { return http.csrf; },
+  WebSocket: MOCK ? window.HubMock.WebSocket : null
+});
 
-Rpc.prototype.call = function (cmd, args, opt) {
-  var self = this;
-  opt = opt || {};
-  var id = ++this.seq;
-  var payload = { id: id, cmd: cmd, args: args || {} };
-
-  if (this.mock) {
-    return this.mock.rpc(cmd, payload.args).then(function (res) {
-      if (res && res.ok === false) throw new RpcError(res.error.code, res.error.message);
-      return res.result;
-    });
-  }
-
-  var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
-  var timedOut = false;
-  var timer = setTimeout(function () { timedOut = true; if (ctrl) ctrl.abort(); },
-                         opt.timeoutMs || this.timeoutMs);
-
-  this.inflight++;
-  return fetch(this.base + '/api/rpc', {
-    method: 'POST',
-    credentials: 'same-origin',
-    cache: 'no-store',
-    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-    body: JSON.stringify(payload),
-    signal: ctrl ? ctrl.signal : undefined
-  }).then(function (res) {
-    if (res.status === 401) { self.emit('#unauthorized', null); throw new RpcError('unauthorized', 'session expired'); }
-    return res.text().then(function (body) {
-      var j;
-      try { j = JSON.parse(body); }
-      catch (e) { throw new RpcError('bad-response', 'HTTP ' + res.status + ': malformed JSON body'); }
-      if (j.ok === false || j.error) throw new RpcError(
-        (j.error && j.error.code) || 'internal',
-        (j.error && j.error.message) || 'unknown error');
-      if (!res.ok) throw new RpcError('http-' + res.status, 'HTTP ' + res.status);
-      return j.result;
-    });
-  }).catch(function (e) {
-    if (e instanceof RpcError) throw e;
-    if (timedOut) throw new RpcError('timeout', 'no answer in ' + (opt.timeoutMs || self.timeoutMs) + ' ms');
-    throw new RpcError('network', e && e.message ? e.message : 'network error');
-  }).then(function (r) { clearTimeout(timer); self.inflight--; return r; },
-          function (e) { clearTimeout(timer); self.inflight--; throw e; });
-};
-
-Rpc.prototype.connect = function () {
-  var self = this;
-  this.wsWanted = true;
-  if (this.mock) {
-    this.setStatus('live');
-    this.mock.subscribe(function (ev, data) { self.emit(ev, data); });
-    return;
-  }
-  this._openWs();
-};
-
-Rpc.prototype._wsUrl = function () {
-  if (this.base) return this.base.replace(/^http/, 'ws') + '/api/events';
-  return (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/api/events';
-};
-
-Rpc.prototype._openWs = function () {
-  var self = this;
-  if (this.ws || !this.wsWanted) return;
-  var ws;
-  this.setStatus(this.retries ? 'retry' : 'connecting');
-  try { ws = new WebSocket(this._wsUrl()); }
-  catch (e) { this._scheduleRetry('cannot open socket'); return; }
-  this.ws = ws;
-
-  ws.onopen = function () {
-    self.retries = 0;
-    self.setStatus('live');
-    self.emit('#reconnected', null);
-  };
-  ws.onmessage = function (m) {
-    var frame;
-    try { frame = JSON.parse(m.data); } catch (e) { return; }
-    if (!frame || !frame.event) return;
-    self.emit(frame.event, frame.data);
-  };
-  ws.onerror = function () { /* onclose always follows */ };
-  ws.onclose = function (e) {
-    self.ws = null;
-    if (!self.wsWanted) { self.setStatus('idle'); return; }
-    self._scheduleRetry('socket closed' + (e && e.code ? ' (' + e.code + ')' : ''));
-  };
-};
-
-Rpc.prototype._scheduleRetry = function (why) {
-  var self = this;
-  if (!this.wsWanted) return;
-  this.retries++;
-  var wait = Math.min(15000, 500 * Math.pow(2, Math.min(this.retries, 6)));
-  wait = Math.round(wait * (0.7 + Math.random() * 0.6));       // jitter
-  this.setStatus(this.retries > 4 ? 'down' : 'retry', why + '; retry in ' + Math.round(wait / 100) / 10 + 's');
-  clearTimeout(this.retryTimer);
-  this.retryTimer = setTimeout(function () { self._openWs(); }, wait);
-};
-
-Rpc.prototype.disconnect = function () {
-  this.wsWanted = false;
-  clearTimeout(this.retryTimer);
-  if (this.mock) { this.mock.unsubscribe(); this.setStatus('idle'); return; }
-  if (this.ws) { try { this.ws.close(); } catch (e) {} this.ws = null; }
-  this.setStatus('idle');
-};
+var api = new APIDEF.Api(http);
 
 /* ============================ 6. store =========================== */
 
@@ -399,6 +283,39 @@ function pushCapped(arr, item, cap) {
   if (arr.length > cap) arr.splice(0, arr.length - cap);
   return arr;
 }
+
+/* ---- paint scheduling -------------------------------------------
+   With 20+ instances the hub pushes 20+ status frames a second. Doing a
+   full re-render per frame is O(instances^2) work per second and the tab
+   stops being interactive. Instead every frame marks its instance dirty
+   and one requestAnimationFrame flush repaints only those rows.        */
+
+var DIRTY = Object.create(null);
+var dirtyAll = false;
+var frame = null;
+
+function markDirty(id) {
+  if (id) DIRTY[id] = true; else dirtyAll = true;
+  if (frame !== null) return;
+  frame = -1;                      // "scheduling": see the guard below
+  var handle = (window.requestAnimationFrame || function (fn) { return setTimeout(fn, 40); })(flush);
+  /* If the scheduler ran flush() synchronously (a test harness, a polyfill),
+     flush already cleared `frame`; storing the handle here would wedge the
+     queue for good. Only record it when we are still the pending frame. */
+  if (frame === -1) frame = handle;
+}
+
+function flush() {
+  frame = null;
+  var ids = dirtyAll ? null : Object.keys(DIRTY);
+  DIRTY = Object.create(null);
+  dirtyAll = false;
+  try { renderRail(ids); } catch (e) { console.error(e); }
+  if (currentView && currentView.update) { try { currentView.update(ids); } catch (e) { console.error(e); } }
+}
+
+/** Structural change (list membership, roles, route): repaint everything. */
+function refresh() { markDirty(null); }
 
 /* ============================ 7. charts ========================== */
 
@@ -508,7 +425,7 @@ function chartBox(label, color, key, opts) {
   var box = h('div.chartbox', null,
     h('div.chead', null, h('span', { text: label }), big), cv);
   box.update = function (points, latest, fmt) {
-    big.textContent = fmt ? fmt(latest) : short(latest);
+    setText(big, fmt ? fmt(latest) : short(latest));
     drawSeries(cv, points, key, opts || { color: color });
   };
   return box;
@@ -529,8 +446,9 @@ function barCell(kind, cur, max, label) {
     h('div.bar.' + kind, { role: 'progressbar', 'aria-valuenow': Math.round(pct(cur, max)),
                            'aria-valuemin': '0', 'aria-valuemax': '100' }, fill), cap);
   wrap.set = function (c, m, l) {
-    fill.style.width = pct(c, m).toFixed(1) + '%';
-    cap.textContent = l || (num(c) + ' / ' + num(m));
+    var w = pct(c, m).toFixed(1) + '%';
+    if (fill.style.width !== w) fill.style.width = w;
+    setText(cap, l || (num(c) + ' / ' + num(m)));
   };
   return wrap;
 }
@@ -549,7 +467,7 @@ function selectOf(items, value, mapper) {
 function emptyBox(msg) { return h('div.empty', { text: msg }); }
 
 /* ============================ 9. views =========================== */
-/* Every view returns {el, update?, onEvent?, destroy?}.                */
+/* Every view returns {el, update?(dirtyIds), onEvent?, destroy?}.      */
 
 /* ---------- 9.1 dashboard ---------- */
 
@@ -575,22 +493,21 @@ function ViewDashboard() {
       r.tr.classList.toggle('sel', !!S.selection[id]);
     });
     var n = selected().length;
-    countLbl.textContent = n ? n + ' selected' : '';
+    setText(countLbl, n ? n + ' selected' : '');
     bulkBtns.forEach(function (b) { b.disabled = n === 0; });
     selAll.checked = n > 0 && n === S.instances.length;
     selAll.indeterminate = n > 0 && n < S.instances.length;
   }
 
   function bulk(label, kind, fn) {
-    var b = h('button.btn.sm' + (kind ? '.' + kind : ''), { text: label, disabled: true,
+    return h('button.btn.sm' + (kind ? '.' + kind : ''), { text: label, disabled: true,
       onclick: function () { fn(selected()); } });
-    return b;
   }
 
   var bulkBtns = [
     bulk('Start', 'primary', function (ids) { doStart(ids); }),
-    bulk('Stop', null, function (ids) { doStop(ids); }),
-    bulk('Restart', null, function (ids) { doRestart(ids); }),
+    bulk('Stop', null, function (ids) { confirmBulk('Stop', ids, function () { doStop(ids); }); }),
+    bulk('Restart', null, function (ids) { confirmBulk('Restart', ids, function () { doRestart(ids); }); }),
     bulk('Bot on', null, function (ids) { doBot(ids, true); }),
     bulk('Bot off', null, function (ids) { doBot(ids, false); })
   ];
@@ -617,7 +534,7 @@ function ViewDashboard() {
       h('span.spacer'),
       countLbl,
       h('div.row', null, bulkBtns),
-      h('button.btn.sm', { text: 'Refresh', onclick: function () { loadInstances().then(render); } })
+      h('button.btn.sm', { text: 'Refresh', onclick: function () { loadInstances().then(function () { rebuild(); }); } })
     ),
     h('div.tablewrap', null, table),
     h('div.hint', { style: { marginTop: '8px' },
@@ -645,45 +562,61 @@ function ViewDashboard() {
       h('td', null, hp), h('td', null, mp),
       target, wp, up, act);
     var r = { tr: tr, cb: cb, sub: sub, stateTd: stateTd, lvl: lvl, exph: exph, money: money,
-              hp: hp, mp: mp, target: target, wp: wp, up: up, act: act, nameBtn: nameBtn };
+              hp: hp, mp: mp, target: target, wp: wp, up: up, act: act, nameBtn: nameBtn,
+              stateKey: '', actKey: '' };
     fillRow(r, inst);
     return r;
   }
 
   function fillRow(r, inst) {
     var L = inst.live || {};
-    r.nameBtn.textContent = inst.characterName;
-    r.sub.textContent = inst.world + (inst.proxyLabel ? ' · ' + inst.proxyLabel : ' · direct');
-    clear(r.stateTd); r.stateTd.appendChild(statePill(inst.state));
-    r.stateTd.appendChild(txt(' '));
-    r.stateTd.appendChild(botPill(inst.botEnabled));
-    r.lvl.textContent = L.level ? String(L.level) : '-';
-    r.exph.textContent = rate(L.expPerHour);
-    r.money.textContent = rate(L.moneyPerHour);
+    setText(r.nameBtn, inst.characterName);
+    setText(r.sub, inst.world + (inst.proxyLabel ? ' · ' + inst.proxyLabel : ' · direct'));
+
+    var key = inst.state + '/' + (inst.botEnabled ? '1' : '0');
+    if (r.stateKey !== key) {                   // pills only rebuild when they change
+      r.stateKey = key;
+      clear(r.stateTd);
+      r.stateTd.appendChild(statePill(inst.state));
+      r.stateTd.appendChild(txt(' '));
+      r.stateTd.appendChild(botPill(inst.botEnabled));
+    }
+    setText(r.lvl, L.level ? String(L.level) : '-');
+    setText(r.exph, rate(L.expPerHour));
+    setText(r.money, rate(L.moneyPerHour));
     r.hp.set(L.hp || 0, L.maxHp || 1, (L.hp || 0) + ' / ' + (L.maxHp || 0));
     r.mp.set(L.mana || 0, L.maxMana || 1, (L.mana || 0) + ' / ' + (L.maxMana || 0));
-    r.target.textContent = L.target || '-';
-    r.wp.textContent = L.waypoint
+    setText(r.target, L.target || '-');
+    setText(r.wp, L.waypoint
       ? L.waypoint + (L.waypointCount ? ' (' + L.waypointIndex + '/' + L.waypointCount + ')' : '')
-      : '-';
-    r.up.textContent = inst.state === 'stopped' ? '-' : dur(L.uptimeMs);
+      : '-');
+    setText(r.up, inst.state === 'stopped' ? '-' : dur(L.uptimeMs));
 
-    clear(r.act);
     var running = inst.state !== 'stopped' && inst.state !== 'error';
-    r.act.appendChild(h('button.btn.sm', {
-      text: running ? 'Stop' : 'Start',
-      onclick: function () { running ? doStop([inst.id]) : doStart([inst.id]); }
-    }));
+    var actKey = running ? 'stop' : 'start';
+    if (r.actKey !== actKey) {
+      r.actKey = actKey;
+      clear(r.act);
+      r.act.appendChild(h('button.btn.sm', {
+        text: running ? 'Stop' : 'Start',
+        onclick: function () {
+          if (running) confirmBulk('Stop', [inst.id], function () { doStop([inst.id]); });
+          else doStart([inst.id]);
+        }
+      }));
+    }
   }
 
   var emptyRow = null;
-  function render() {
+
+  /** full pass: membership + order + values */
+  function rebuild() {
     if (emptyRow) { if (emptyRow.parentNode) tbody.removeChild(emptyRow); emptyRow = null; }
     var seen = Object.create(null);
     S.instances.forEach(function (inst, idx) {
       seen[inst.id] = true;
       var r = rows[inst.id];
-      if (!r) { r = rows[inst.id] = makeRow(inst); }
+      if (!r) r = rows[inst.id] = makeRow(inst);
       else fillRow(r, inst);
       var at = tbody.children[idx];
       if (at !== r.tr) tbody.insertBefore(r.tr, at || null);
@@ -699,12 +632,29 @@ function ViewDashboard() {
     syncSelection();
   }
 
-  render();
+  rebuild();
   return {
     el: el,
-    update: render,
-    onEvent: function (ev) { if (ev === 'status' || ev === 'stats' || ev === 'instance') render(); }
+    /** dirtyIds === null means "something structural changed" */
+    update: function (dirtyIds) {
+      if (!dirtyIds) { rebuild(); return; }
+      for (var i = 0; i < dirtyIds.length; i++) {
+        var inst = S.byId[dirtyIds[i]], r = rows[dirtyIds[i]];
+        if (inst && r) fillRow(r, inst);
+        else { rebuild(); return; }
+      }
+    }
   };
+}
+
+function confirmBulk(what, ids, run) {
+  if (ids.length <= 1) {
+    var i = S.byId[ids[0]];
+    Modal.confirm(what + ' instance', what + ' ' + (i ? i.characterName : ids[0]) + '?', run, what);
+    return;
+  }
+  Modal.confirm(what + ' ' + ids.length + ' instances',
+    what + ' all ' + ids.length + ' selected instances? Their characters go offline.', run, what + ' all');
 }
 
 /* ---------- 9.2 instance ---------- */
@@ -730,9 +680,23 @@ function ViewInstance(params) {
     titleState, titleBot,
     h('span.spacer'),
     h('button.btn.sm.primary', { text: 'Start', onclick: function () { doStart([id]); } }),
-    h('button.btn.sm', { text: 'Stop', onclick: function () { doStop([id]); } }),
-    h('button.btn.sm', { text: 'Restart', onclick: function () { doRestart([id]); } }),
-    h('button.btn.sm', { text: 'Toggle bot', onclick: function () { doBot([id], !S.byId[id].botEnabled); } })
+    h('button.btn.sm', { text: 'Stop', onclick: function () {
+      confirmBulk('Stop', [id], function () { doStop([id]); }); } }),
+    h('button.btn.sm', { text: 'Restart', onclick: function () {
+      confirmBulk('Restart', [id], function () { doRestart([id]); }); } }),
+    h('button.btn.sm', { text: 'Toggle bot', onclick: function () { doBot([id], !S.byId[id].botEnabled); } }),
+    h('button.btn.sm.danger', { text: 'Delete', onclick: function () {
+      var i = S.byId[id] || inst;
+      Modal.confirm('Delete instance',
+        'Delete the instance for ' + i.characterName + '? The worker is stopped and its ' +
+        'configuration is removed from the hub. The character itself is kept.',
+        function () {
+          api.call('instances.delete', { id: id })
+            .then(function () { Toast.ok('Instance deleted'); return loadInstances(); })
+            .then(function () { go('#/dashboard'); refresh(); })
+            .catch(function (e) { failed('Delete instance', e); });
+        }, 'Delete');
+    } })
   );
 
   var tabbar = h('div.tabs', { role: 'tablist' });
@@ -744,12 +708,19 @@ function ViewInstance(params) {
     }));
   });
 
+  var stateKey = '';
   function setTitle() {
     var i = S.byId[id] || inst;
+    var key = i.state + '/' + (i.botEnabled ? '1' : '0');
+    if (key === stateKey) return;
+    stateKey = key;
     clear(titleState); titleState.appendChild(statePill(i.state));
     clear(titleBot); titleBot.appendChild(botPill(i.botEnabled));
   }
   setTitle();
+
+  /* only the open tab needs the log / chat firehose */
+  ws.subscribe(tabName === 'console' ? id : null, tabName === 'chat' ? id : null);
 
   if (tabName === 'bot') sub = TabBot(id);
   else if (tabName === 'console') sub = TabConsole(id);
@@ -760,9 +731,9 @@ function ViewInstance(params) {
 
   return {
     el: h('div', null, head, tabbar, pane),
-    update: function () { setTitle(); if (sub.update) sub.update(); },
+    update: function (dirty) { setTitle(); if (sub.update) sub.update(dirty); },
     onEvent: function (ev, data) { setTitle(); if (sub.onEvent) sub.onEvent(ev, data); },
-    destroy: function () { if (sub.destroy) sub.destroy(); }
+    destroy: function () { ws.subscribe(null, null); if (sub.destroy) sub.destroy(); }
   };
 }
 
@@ -813,23 +784,26 @@ function TabOverview(id) {
   );
 
   var loaded = false;
-  rpc.call('instance.history', { id: id }).then(function (r) {
+  api.call('instances.history', { id: id }).then(function (r) {
     S.history[id] = r.points || [];
     loaded = true; update();
   }).catch(function (e) { failed('History', e); });
 
+  /* the charts are the expensive part: repaint them at most twice a second */
+  var lastChart = 0;
+
   function update() {
     var i = S.byId[id]; if (!i) return;
     var L = i.live || {};
-    stats.level.textContent = L.level ? String(L.level) : '-';
-    stats.exph.textContent = rate(L.expPerHour);
-    stats.moneyh.textContent = rate(L.moneyPerHour);
-    stats.looth.textContent = rate(L.lootPerHour);
-    stats.wasteh.textContent = rate(L.wastePerHour);
-    stats.balance.textContent = rate(L.balancePerHour);
+    setText(stats.level, L.level ? String(L.level) : '-');
+    setText(stats.exph, rate(L.expPerHour));
+    setText(stats.moneyh, rate(L.moneyPerHour));
+    setText(stats.looth, rate(L.lootPerHour));
+    setText(stats.wasteh, rate(L.wastePerHour));
+    setText(stats.balance, rate(L.balancePerHour));
     stats.balance.className = 'v ' + ((L.balancePerHour || 0) >= 0 ? 'pos' : 'neg');
-    stats.killsh.textContent = L.killsPerHour === undefined ? '-' : (Math.round(L.killsPerHour * 10) / 10);
-    stats.deaths.textContent = L.deaths === undefined ? '-' : String(L.deaths);
+    setText(stats.killsh, L.killsPerHour === undefined ? '-' : (Math.round(L.killsPerHour * 10) / 10));
+    setText(stats.deaths, L.deaths === undefined ? '-' : String(L.deaths));
 
     hp.set(L.hp || 0, L.maxHp || 1, (L.hp || 0) + ' / ' + (L.maxHp || 0) + ' hp');
     mp.set(L.mana || 0, L.maxMana || 1, (L.mana || 0) + ' / ' + (L.maxMana || 0) + ' mana');
@@ -852,7 +826,9 @@ function TabOverview(id) {
     ].forEach(function (p) { kv.appendChild(h('dt', { text: p[0] })); kv.appendChild(h('dd', { text: p[1] })); });
 
     clear(supplies);
-    var sup = L.supplies || [];
+    /* Defensive: a worker that reports supplies in some other shape must make the
+       column say "no supply data", never take the whole Overview down with it. */
+    var sup = Array.isArray(L.supplies) ? L.supplies : [];
     if (!sup.length) supplies.appendChild(h('div.hint', { text: 'no supply data' }));
     sup.forEach(function (s) {
       var low = s.count < s.min;
@@ -863,8 +839,10 @@ function TabOverview(id) {
           h('i', { style: { width: pct(s.count, Math.max(s.min * 2, s.count, 1)).toFixed(0) + '%' } }))));
     });
 
-    var pts = S.history[id] || [];
-    if (loaded) {
+    var t = Date.now();
+    if (loaded && t - lastChart > 500) {
+      lastChart = t;
+      var pts = S.history[id] || [];
       chExp.update(pts, L.expPerHour);
       chMoney.update(pts, L.moneyPerHour);
       chHp.update(pts, pct(L.hp, L.maxHp), function (v) { return Math.round(v) + '%'; });
@@ -873,7 +851,7 @@ function TabOverview(id) {
   }
 
   update();
-  return { el: el, update: update, onEvent: function (ev) { if (ev === 'status' || ev === 'stats') update(); } };
+  return { el: el, update: update };
 }
 
 /* --- Bot --- */
@@ -884,13 +862,13 @@ function TabBot(id) {
   var el = h('div', null, body);
 
   function load() {
-    rpc.call('instance.configs', { id: id }).then(function (cfg) {
+    api.call('instances.configs', { id: id }).then(function (cfg) {
       S.configs[id] = cfg;
       render(cfg);
     }).catch(function (e) {
       clear(body);
       body.appendChild(emptyBox('Could not read the bot configuration: ' + e.message));
-      failed('instance.configs', e);
+      failed('Bot configuration', e);
     });
   }
 
@@ -907,15 +885,15 @@ function TabBot(id) {
 
     cave.addEventListener('change', function () {
       optimistic(i, { cavebotConfig: cave.value },
-        'instance.update', { id: id, patch: { cavebotConfig: cave.value } }, 'Cavebot config');
+        'instances.update', { id: id, cavebotConfig: cave.value }, 'Cavebot config');
     });
     targ.addEventListener('change', function () {
       optimistic(i, { targetbotConfig: targ.value },
-        'instance.update', { id: id, patch: { targetbotConfig: targ.value } }, 'Targetbot config');
+        'instances.update', { id: id, targetbotConfig: targ.value }, 'Targetbot config');
     });
     prof.addEventListener('change', function () {
       optimistic(i, { botProfile: prof.value },
-        'instance.update', { id: id, patch: { botProfile: prof.value } }, 'Bot profile');
+        'instances.update', { id: id, botProfile: prof.value }, 'Bot profile');
     });
 
     var macros = h('div');
@@ -923,9 +901,11 @@ function TabBot(id) {
       var cb = h('input', { type: 'checkbox', checked: !!m.on });
       cb.addEventListener('change', function () {
         var want = cb.checked;
-        rpc.call('instance.setMacro', { id: id, name: m.name, on: want })
+        cb.disabled = true;
+        api.call('instances.macro', { id: id, name: m.name, on: want })
           .then(function () { m.on = want; })
-          .catch(function (e) { cb.checked = !want; failed('Macro ' + m.name, e); });
+          .catch(function (e) { cb.checked = !want; failed('Macro ' + m.name, e); })
+          .then(function () { cb.disabled = false; });
       });
       macros.appendChild(h('div', { style: { marginBottom: '5px' } },
         h('label.check', null, cb, txt(m.label || m.name),
@@ -943,10 +923,13 @@ function TabBot(id) {
         assigned.appendChild(h('div.row', { style: { marginBottom: '4px' } },
           h('span.grow.mono', { text: sc ? sc.name : sid }),
           h('button.btn.sm', { text: 'Unassign', onclick: function () {
-            var next = ids.filter(function (x) { return x !== sid; });
-            optimistic(S.byId[id], { scripts: next }, 'instance.update',
-              { id: id, patch: { scripts: next } }, 'Unassign script')
-              .then(renderAssigned);
+            Modal.confirm('Unassign script',
+              'Stop running ' + (sc ? sc.name : sid) + ' on ' + i.characterName + '?', function () {
+                var next = ids.filter(function (x) { return x !== sid; });
+                optimistic(S.byId[id], { scripts: next }, 'instances.update',
+                  { id: id, scripts: next }, 'Unassign script')
+                  .then(renderAssigned);
+              }, 'Unassign');
           } })));
       });
     }
@@ -955,12 +938,12 @@ function TabBot(id) {
     var autoStart = h('input', { type: 'checkbox', checked: !!i.autoStart });
     var autoRelog = h('input', { type: 'checkbox', checked: !!i.autoRelogin });
     autoStart.addEventListener('change', function () {
-      optimistic(i, { autoStart: autoStart.checked }, 'instance.update',
-        { id: id, patch: { autoStart: autoStart.checked } }, 'Auto-start');
+      optimistic(i, { autoStart: autoStart.checked }, 'instances.update',
+        { id: id, autoStart: autoStart.checked }, 'Auto-start');
     });
     autoRelog.addEventListener('change', function () {
-      optimistic(i, { autoRelogin: autoRelog.checked }, 'instance.update',
-        { id: id, patch: { autoRelogin: autoRelog.checked } }, 'Auto-relogin');
+      optimistic(i, { autoRelogin: autoRelog.checked }, 'instances.update',
+        { id: id, autoRelogin: autoRelog.checked }, 'Auto-relogin');
     });
 
     body.appendChild(h('div.grid.c2', null,
@@ -973,7 +956,7 @@ function TabBot(id) {
           h('label.check', null, autoRelog, txt('Auto-relogin on disconnect'))),
         h('div.row', { style: { marginTop: '12px' } },
           h('button.btn.sm', { text: 'Reload bot', onclick: function () {
-            rpc.call('instance.reload', { id: id })
+            api.call('instances.reload', { id: id })
               .then(function () { Toast.ok('Bot reloaded'); load(); })
               .catch(function (e) { failed('Reload', e); });
           } }),
@@ -990,7 +973,7 @@ function TabBot(id) {
   }
 
   load();
-  return { el: el, update: function () {}, onEvent: function () {} };
+  return { el: el };
 }
 
 function assignDialog(instanceId, done) {
@@ -1009,7 +992,7 @@ function assignDialog(instanceId, done) {
     body: list,
     onsubmit: function (close) {
       var next = boxes.filter(function (b) { return b.cb.checked; }).map(function (b) { return b.id; });
-      rpc.call('instance.update', { id: instanceId, patch: { scripts: next } })
+      api.call('instances.update', { id: instanceId, scripts: next })
         .then(function (r) { mergeInstance(r.instance); close(); if (done) done(); Toast.ok('Scripts assigned'); })
         .catch(function (e) { failed('Assign', e); });
     },
@@ -1050,7 +1033,7 @@ function TabConsole(id) {
   filter.addEventListener('input', redraw);
   level.addEventListener('change', redraw);
 
-  rpc.call('instance.logs', { id: id, limit: 400 }).then(function (r) {
+  api.call('instances.logs', { id: id, limit: 400 }).then(function (r) {
     S.logs[id] = r.lines || [];
     redraw();
   }).catch(function (e) { failed('Log fetch', e); });
@@ -1062,7 +1045,7 @@ function TabConsole(id) {
     pushCapped(S.logs[id] || (S.logs[id] = []),
       { t: Date.now(), level: 'info', kind: 'echo', text: '> ' + src.replace(/\n/g, '\n  ') }, 2000);
     redraw();
-    rpc.call('instance.exec', { id: id, code: src }, { timeoutMs: 30000 }).then(function (r) {
+    api.call('instances.exec', { id: id, code: src }, { timeoutMs: 30000 }).then(function (r) {
       pushCapped(S.logs[id], { t: Date.now(), level: 'info', kind: 'ret',
         text: r.output === undefined || r.output === null ? '(no value)' : String(r.output) }, 2000);
       code.value = '';
@@ -1086,8 +1069,14 @@ function TabConsole(id) {
         h('label.check', null, follow, txt('follow')),
         h('button.btn.sm', { text: 'Clear', onclick: function () { S.logs[id] = []; redraw(); } })),
       box),
-    h('div.card', null, h('h3', { text: 'Execute Lua in the worker' }),
-      h('div.warnbox', { text: 'This runs with the bot’s full privileges inside the worker process. ' +
+    (S.me && S.me.canExec === false)
+      ? h('div.card', null, h('h3', { text: 'Execute Lua in the worker' }),
+          h('div.warnbox', { text: 'Running Lua in a worker is administrator-only on this hub. ' +
+            'The code would run unsandboxed under the hub’s own user account, so an ' +
+            'administrator has to grant this account the remote-Lua capability first.' }))
+      : h('div.card', null, h('h3', { text: 'Execute Lua in the worker' }),
+      h('div.warnbox', { text: 'This runs with the bot’s full privileges inside the worker process — ' +
+        'unsandboxed, under the hub’s own user account. ' +
         'The code, the actor and the result are recorded in the admin audit log.' }),
       code,
       h('div.row', { style: { marginTop: '8px' } }, runBtn,
@@ -1127,7 +1116,7 @@ function TabChat(id) {
     box.scrollTop = box.scrollHeight;
   }
 
-  rpc.call('instance.chat', { id: id, limit: 300 }).then(function (r) {
+  api.call('instances.chat', { id: id, limit: 300 }).then(function (r) {
     S.chats[id] = r.messages || []; redraw();
   }).catch(function (e) { failed('Chat fetch', e); });
 
@@ -1135,7 +1124,7 @@ function TabChat(id) {
     var t = input.value.trim();
     if (!t) return;
     input.value = '';
-    rpc.call('instance.say', { id: id, channel: Number(chan.value), text: t })
+    api.call('instances.say', { id: id, channel: Number(chan.value), text: t })
       .catch(function (e) { failed('Say', e); input.value = t; });
   }
   input.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); send(); } });
@@ -1167,8 +1156,8 @@ function ViewCharacters() {
 
   function reload() {
     return Promise.all([
-      rpc.call('account.list', {}), rpc.call('character.list', {}),
-      rpc.call('proxy.list', {}), loadInstances()
+      api.call('accounts.list'), api.call('characters.list'),
+      api.call('proxies.list'), loadInstances()
     ]).then(function (r) {
       S.accounts = r[0].accounts || [];
       S.characters = r[1].characters || [];
@@ -1192,6 +1181,7 @@ function ViewCharacters() {
         h('td', { text: c.world }),
         h('td', { text: c.vocation || '-' }),
         h('td.num', { text: c.lastLevel ? String(c.lastLevel) : '-' }),
+        h('td', null, inst ? proxyPicker(inst) : h('span.hint', { text: 'needs an instance' })),
         h('td', null, inst
           ? h('button.linkish', { text: 'instance: ' + inst.state,
               onclick: function () { go('#/i/' + encodeURIComponent(inst.id) + '/overview'); } })
@@ -1200,7 +1190,7 @@ function ViewCharacters() {
           h('button.btn.sm.danger', { text: 'Remove', onclick: function () {
             Modal.confirm('Remove character', 'Remove ' + c.name + '? Its instance is deleted too.',
               function () {
-                rpc.call('character.delete', { id: c.id })
+                api.call('characters.delete', { id: c.id })
                   .then(function () { Toast.ok('Character removed'); reload(); })
                   .catch(function (e) { failed('Remove character', e); });
               }, 'Remove');
@@ -1209,7 +1199,7 @@ function ViewCharacters() {
     charCard.appendChild(S.characters.length
       ? h('div.tablewrap', { style: { marginTop: '10px' } },
           h('table.grid-table', null,
-            h('thead', null, h('tr', null, ['Name', 'Account', 'World', 'Vocation', 'Level', 'Instance', ''].map(
+            h('thead', null, h('tr', null, ['Name', 'Account', 'World', 'Vocation', 'Level', 'Proxy', 'Instance', ''].map(
               function (t) { return h('th', { text: t }); }))), ctb))
       : emptyBox('No characters yet.'));
 
@@ -1230,7 +1220,7 @@ function ViewCharacters() {
           h('button.btn.sm', { text: 'Edit', onclick: function () { accDialog(a); } }),
           h('button.btn.sm.danger', { text: 'Remove', onclick: function () {
             Modal.confirm('Remove account', 'Remove ' + a.label + ' and all its characters?', function () {
-              rpc.call('account.delete', { id: a.id })
+              api.call('accounts.delete', { id: a.id })
                 .then(function () { Toast.ok('Account removed'); reload(); })
                 .catch(function (e) { failed('Remove account', e); });
             }, 'Remove');
@@ -1243,7 +1233,8 @@ function ViewCharacters() {
               function (t) { return h('th', { text: t }); }))), atb))
       : emptyBox('No game accounts yet.'));
     accCard.appendChild(h('div.hint', { style: { marginTop: '8px' },
-      text: 'Passwords are encrypted at rest with the hub master key and never sent back to the browser.' }));
+      text: 'The account password is write-only: it is encrypted at rest with the hub master key ' +
+            'and no endpoint ever returns it. Leave the field empty to keep the stored one.' }));
 
     /* --- proxies --- */
     clear(proxyCard);
@@ -1258,19 +1249,26 @@ function ViewCharacters() {
         h('td', { text: p.kind }),
         h('td', { text: p.user ? p.user + (p.hasPass ? ' / •••' : '') : '-' }),
         h('td.num', { text: String(p.inUse || 0) }),
+        h('td', { text: p.ownerName || '-' }),
         h('td.nowrap', null,
           h('button.btn.sm', { text: 'Test', onclick: function (e) {
             var b = e.currentTarget; b.disabled = true;
-            rpc.call('proxy.test', { id: p.id }, { timeoutMs: 20000 }).then(function (r) {
+            api.call('proxies.test', { id: p.id }, { timeoutMs: 20000 }).then(function (r) {
               r.ok ? Toast.ok('Proxy OK', p.label + ': ' + r.latencyMs + ' ms')
                    : Toast.err('Proxy unreachable', r.error || '');
             }).catch(function (er) { failed('Proxy test', er); })
               .then(function () { b.disabled = false; });
           } }),
-          h('button.btn.sm', { text: 'Edit', onclick: function () { proxyDialog(p); } }),
-          h('button.btn.sm.danger', { text: 'Remove', onclick: function () {
+          h('button.btn.sm', { text: 'Edit', disabled: p.canEdit === false,
+            title: p.canEdit === false ? 'Only the owner or an administrator may change this proxy'
+                                       : 'Change this proxy',
+            onclick: function () { proxyDialog(p); } }),
+          h('button.btn.sm.danger', { text: 'Remove', disabled: p.canEdit === false,
+            title: p.canEdit === false ? 'Only the owner or an administrator may remove this proxy'
+                                       : 'Remove this proxy',
+            onclick: function () {
             Modal.confirm('Remove proxy', 'Remove ' + p.label + '?', function () {
-              rpc.call('proxy.delete', { id: p.id })
+              api.call('proxies.delete', { id: p.id })
                 .then(function () { Toast.ok('Proxy removed'); reload(); })
                 .catch(function (e) { failed('Remove proxy', e); });
             }, 'Remove');
@@ -1279,9 +1277,25 @@ function ViewCharacters() {
     proxyCard.appendChild(S.proxies.length
       ? h('div.tablewrap', { style: { marginTop: '10px' } },
           h('table.grid-table', null,
-            h('thead', null, h('tr', null, ['Label', 'Endpoint', 'Kind', 'Auth', 'Used by', ''].map(
+            h('thead', null, h('tr', null,
+              ['Label', 'Endpoint', 'Kind', 'Auth', 'Used by', 'Owner', ''].map(
               function (t) { return h('th', { text: t }); }))), ptb))
       : emptyBox('No proxies configured — instances will connect directly.'));
+  }
+
+  /** The per-character proxy assignment: it lives on that character's instance. */
+  function proxyPicker(inst) {
+    var sel = selectOf([{ id: '', label: '(direct)' }].concat(S.proxies), inst.proxyId || '',
+      function (p) { return { value: p.id, label: p.label }; });
+    sel.addEventListener('change', function () {
+      var want = sel.value || null;
+      sel.disabled = true;
+      api.call('instances.update', { id: inst.id, proxyId: want })
+        .then(function (r) { mergeInstance(r.instance); Toast.ok('Proxy assigned'); reload(); })
+        .catch(function (e) { sel.value = inst.proxyId || ''; failed('Assign proxy', e); })
+        .then(function () { sel.disabled = false; });
+    });
+    return sel;
   }
 
   function accDialog(a) {
@@ -1295,14 +1309,16 @@ function ViewCharacters() {
       body: h('div', null,
         field('Label', label, 'Shown in the panel; any name you like.'),
         field('Game login', login),
-        field('Password', pass, 'Stored encrypted; never returned to the browser.'),
+        field('Password', pass, 'Write-only: stored encrypted, never returned to the browser.'),
         field('2FA secret (optional)', tok)),
       onsubmit: function (close) {
         var patch = { label: label.value, login: login.value };
         if (pass.value) patch.password = pass.value;
         if (tok.value) patch.token2fa = tok.value;
-        var p = a ? rpc.call('account.update', { id: a.id, patch: patch })
-                  : rpc.call('account.create', patch);
+        var p;
+        if (a) { patch.id = a.id; p = api.call('accounts.update', patch); }
+        else p = api.call('accounts.create', patch);
+        pass.value = ''; tok.value = '';           // do not leave secrets in the DOM
         p.then(function () { close(); Toast.ok(a ? 'Account updated' : 'Account added'); reload(); })
          .catch(function (e) { failed('Save account', e); });
       },
@@ -1322,8 +1338,8 @@ function ViewCharacters() {
       body: h('div', null, field('Game account', acc), field('Character name', name),
                            field('World', world), field('Vocation', voc)),
       onsubmit: function (close) {
-        rpc.call('character.create', { accountId: acc.value, name: name.value,
-                                       world: world.value, vocation: voc.value || null })
+        api.call('characters.create', { accountId: acc.value, name: name.value,
+                                        world: world.value, vocation: voc.value || null })
           .then(function () { close(); Toast.ok('Character added'); reload(); })
           .catch(function (e) { failed('Add character', e); });
       },
@@ -1340,13 +1356,17 @@ function ViewCharacters() {
     Modal.open({
       title: p ? 'Edit proxy' : 'Add proxy',
       body: h('div', null, field('Label', label), field('Host', host), field('Port', port),
-              field('User (optional)', user), field('Password (optional)', pass),
+              field('User (optional)', user), field('Password (optional)', pass,
+                'Write-only, like the account password.'),
               h('div.hint', { text: 'Only http-connect is implemented on the worker side today.' })),
       onsubmit: function (close) {
         var patch = { label: label.value, kind: 'http-connect', host: host.value, port: Number(port.value),
                       user: user.value || null };
         if (pass.value) patch.pass = pass.value;
-        var q = p ? rpc.call('proxy.update', { id: p.id, patch: patch }) : rpc.call('proxy.create', patch);
+        var q;
+        if (p) { patch.id = p.id; q = api.call('proxies.update', patch); }
+        else q = api.call('proxies.create', patch);
+        pass.value = '';
         q.then(function () { close(); Toast.ok('Proxy saved'); reload(); })
          .catch(function (e) { failed('Save proxy', e); });
       },
@@ -1367,7 +1387,7 @@ function ViewCharacters() {
           h('label.check', null, autoStart, txt('Auto-start')),
           h('label.check', null, autoRelog, txt('Auto-relogin')))),
       onsubmit: function (close) {
-        rpc.call('instance.create', {
+        api.call('instances.create', {
           characterId: c.id, proxyId: proxy.value || null, botProfile: profile.value,
           autoStart: autoStart.checked, autoRelogin: autoRelog.checked
         }).then(function (r) {
@@ -1389,13 +1409,19 @@ function ViewScripts() {
   var listWrap = h('div');
   var el = h('div', null,
     h('div.view-head', null, h('h1', { text: 'Scripts' }), h('span.spacer'),
+      (S.me && S.me.canExec === false) ? h('span') :
       h('button.btn.primary', { text: 'Upload .lua…', onclick: uploadDialog })),
-    h('div.warnbox', { text: 'Uploaded scripts run as arbitrary Lua inside the worker, in the same ' +
-      'environment as the bot’s own scripts. There is no sandbox. Upload only code you trust.' }),
+    h('div.warnbox', { text: (S.me && S.me.canExec === false)
+      ? 'Uploading a script is administrator-only on this hub: the code runs unsandboxed ' +
+        'under the hub’s own user account. An administrator has to grant this account the ' +
+        'remote-Lua capability first.'
+      : 'Uploaded scripts run as arbitrary Lua inside the worker, in the same ' +
+        'environment as the bot’s own scripts. There is no sandbox, and the worker runs ' +
+        'under the hub’s own user account. Upload only code you trust.' }),
     listWrap);
 
   function reload() {
-    return Promise.all([rpc.call('script.list', {}), loadInstances()]).then(function (r) {
+    return Promise.all([api.call('scripts.list'), loadInstances()]).then(function (r) {
       S.scripts = r[0].scripts || [];
       render();
     }).catch(function (e) { failed('Script list', e); });
@@ -1421,11 +1447,13 @@ function ViewScripts() {
           h('button.btn.sm', { text: 'View', onclick: function () { viewSource(sc); } }),
           h('button.btn.sm', { text: 'Assign', onclick: function () { scriptAssign(sc); } }),
           h('button.btn.sm.danger', { text: 'Delete', onclick: function () {
-            Modal.confirm('Delete script', 'Delete ' + sc.name + '?', function () {
-              rpc.call('script.delete', { id: sc.id })
-                .then(function () { Toast.ok('Script deleted'); reload(); })
-                .catch(function (e) { failed('Delete script', e); });
-            }, 'Delete');
+            Modal.confirm('Delete script',
+              'Delete ' + sc.name + '? It is removed from the ' + (sc.instanceIds || []).length +
+              ' instance(s) it is assigned to.', function () {
+                api.call('scripts.delete', { id: sc.id })
+                  .then(function () { Toast.ok('Script deleted'); reload(); })
+                  .catch(function (e) { failed('Delete script', e); });
+              }, 'Delete');
           } }))));
     });
     listWrap.appendChild(h('div.tablewrap', null, h('table.grid-table', null,
@@ -1455,7 +1483,7 @@ function ViewScripts() {
         var n = (name.value || '').trim();
         if (!/^[\w.\- ]{1,64}$/.test(n)) { Toast.err('Bad name', 'letters, digits, . _ - and spaces, max 64'); return; }
         if (!area.value.trim()) { Toast.err('Empty script'); return; }
-        rpc.call('script.upload', { name: n, source: area.value }, { timeoutMs: 30000 })
+        api.call('scripts.upload', { name: n, source: area.value }, { timeoutMs: 30000 })
           .then(function () { close(); Toast.ok('Uploaded'); reload(); })
           .catch(function (e) { failed('Upload', e); });
       },
@@ -1464,7 +1492,7 @@ function ViewScripts() {
   }
 
   function viewSource(sc) {
-    rpc.call('script.get', { id: sc.id }).then(function (r) {
+    api.call('scripts.get', { id: sc.id }).then(function (r) {
       var pre = h('pre.mono', { text: r.source,
         style: { whiteSpace: 'pre-wrap', margin: '0', maxHeight: '55vh', overflow: 'auto', fontSize: '12px' } });
       Modal.open({ title: sc.name, body: pre, actions: [{ label: 'Close' }] });
@@ -1485,7 +1513,7 @@ function ViewScripts() {
       title: 'Assign ' + sc.name,
       body: list,
       onsubmit: function (close) {
-        rpc.call('script.assign', { id: sc.id,
+        api.call('scripts.assign', { id: sc.id,
           instanceIds: boxes.filter(function (b) { return b.cb.checked; }).map(function (b) { return b.id; }) })
           .then(function () { close(); Toast.ok('Assignment saved'); reload(); })
           .catch(function (e) { failed('Assign', e); });
@@ -1518,7 +1546,7 @@ function ViewAdmin(params) {
 function AdminUsers() {
   var wrap = h('div.card');
   function reload() {
-    rpc.call('admin.users', {}).then(function (r) { S.users = r.users || []; render(); })
+    api.call('admin.users').then(function (r) { S.users = r.users || []; render(); })
       .catch(function (e) { failed('User list', e); });
   }
   function render() {
@@ -1531,33 +1559,58 @@ function AdminUsers() {
         h('td', { text: u.name }),
         h('td', null, h('span.tag' + (u.role === 'admin' ? '.role-admin' : ''), { text: u.role })),
         h('td', { text: u.disabled ? 'disabled' : 'active' }),
+        h('td', null, h('span.tag' + (u.canExec ? '.role-admin' : ''),
+          { text: u.role === 'admin' ? 'always' : (u.canExec ? 'granted' : 'no') })),
         h('td', { text: stamp(u.createdAt) }),
         h('td', { text: u.lastLoginAt ? stamp(u.lastLoginAt) : 'never' }),
         h('td.nowrap', null,
           h('button.btn.sm', { text: u.disabled ? 'Enable' : 'Disable',
             disabled: S.me && u.id === S.me.id,
             onclick: function () {
-              rpc.call('admin.userUpdate', { id: u.id, patch: { disabled: !u.disabled } })
+              api.call('admin.userUpdate', { id: u.id, disabled: !u.disabled })
                 .then(function () { reload(); }).catch(function (e) { failed('Update user', e); });
             } }),
           h('button.btn.sm', { text: 'Reset password', onclick: function () { pwDialog(u); } }),
+          h('button.btn.sm', { text: u.canExec ? 'Revoke Lua' : 'Grant Lua',
+            disabled: u.role === 'admin',
+            onclick: function () {
+              var grant = !u.canExec;
+              Modal.confirm(grant ? 'Grant remote Lua' : 'Revoke remote Lua',
+                grant
+                  ? ('Let ' + u.name + ' run arbitrary Lua in a worker and upload scripts? '
+                     + 'That code runs unsandboxed under the hub's own user account and can '
+                     + 'read every stored credential -- it is equivalent to making them an '
+                     + 'administrator of this host.')
+                  : ('Stop ' + u.name + ' running Lua in a worker and uploading scripts?'),
+                function () {
+                  api.call('admin.userUpdate', { id: u.id, canExec: grant })
+                    .then(function () { reload(); }).catch(function (e) { failed('Update user', e); });
+                }, grant ? 'Grant' : 'Revoke');
+            } }),
           h('button.btn.sm', { text: u.role === 'admin' ? 'Make user' : 'Make admin',
             disabled: S.me && u.id === S.me.id,
             onclick: function () {
-              rpc.call('admin.userUpdate', { id: u.id, patch: { role: u.role === 'admin' ? 'user' : 'admin' } })
-                .then(function () { reload(); }).catch(function (e) { failed('Update user', e); });
+              var nextRole = u.role === 'admin' ? 'user' : 'admin';
+              Modal.confirm('Change role',
+                'Make ' + u.name + ' ' + (nextRole === 'admin'
+                  ? 'an administrator? Administrators see every instance and the audit log.'
+                  : 'an ordinary user?'), function () {
+                  api.call('admin.userUpdate', { id: u.id, role: nextRole })
+                    .then(function () { reload(); }).catch(function (e) { failed('Update user', e); });
+                }, 'Change role');
             } }),
           h('button.btn.sm.danger', { text: 'Delete', disabled: S.me && u.id === S.me.id,
             onclick: function () {
-              Modal.confirm('Delete web account', 'Delete ' + u.name + '?', function () {
-                rpc.call('admin.userDelete', { id: u.id })
-                  .then(function () { Toast.ok('Account deleted'); reload(); })
-                  .catch(function (e) { failed('Delete user', e); });
-              }, 'Delete');
+              Modal.confirm('Delete web account',
+                'Delete ' + u.name + '? Their sessions are revoked immediately.', function () {
+                  api.call('admin.userDelete', { id: u.id })
+                    .then(function () { Toast.ok('Account deleted'); reload(); })
+                    .catch(function (e) { failed('Delete user', e); });
+                }, 'Delete');
             } }))));
     });
     wrap.appendChild(h('div.tablewrap', { style: { marginTop: '10px' } }, h('table.grid-table', null,
-      h('thead', null, h('tr', null, ['Name', 'Role', 'Status', 'Created', 'Last login', ''].map(
+      h('thead', null, h('tr', null, ['Name', 'Role', 'Status', 'Remote Lua', 'Created', 'Last login', ''].map(
         function (t) { return h('th', { text: t }); }))), tb)));
   }
 
@@ -1574,7 +1627,9 @@ function AdminUsers() {
       onsubmit: function (close) {
         if (pw.value !== pw2.value) { Toast.err('Passwords do not match'); return; }
         if (pw.value.length < 10) { Toast.err('Password too short', 'at least 10 characters'); return; }
-        rpc.call('admin.userCreate', { name: name.value, role: role.value, password: pw.value })
+        var payload = { name: name.value, role: role.value, password: pw.value };
+        pw.value = pw2.value = '';
+        api.call('admin.userCreate', payload)
           .then(function () { close(); Toast.ok('Account created'); reload(); })
           .catch(function (e) { failed('Create account', e); });
       },
@@ -1591,7 +1646,10 @@ function AdminUsers() {
         h('div.hint', { text: 'All existing sessions for this account are revoked.' })),
       onsubmit: function (close) {
         if (pw.value !== pw2.value) { Toast.err('Passwords do not match'); return; }
-        rpc.call('admin.userResetPassword', { id: u.id, password: pw.value })
+        if (pw.value.length < 10) { Toast.err('Password too short', 'at least 10 characters'); return; }
+        var payload = { id: u.id, password: pw.value };
+        pw.value = pw2.value = '';
+        api.call('admin.userPassword', payload)
           .then(function () { close(); Toast.ok('Password reset'); reload(); })
           .catch(function (e) { failed('Reset password', e); });
       },
@@ -1606,13 +1664,14 @@ function AdminUsers() {
 function AdminSessions() {
   var wrap = h('div.card');
   function reload() {
-    rpc.call('admin.sessions', {}).then(function (r) { S.sessions = r.sessions || []; render(); })
+    api.call('admin.sessions').then(function (r) { S.sessions = r.sessions || []; render(); })
       .catch(function (e) { failed('Session list', e); });
   }
   function render() {
     clear(wrap);
     wrap.appendChild(h('div.row', null, h('h3', { text: 'Active sessions', style: { margin: '0' } }),
       h('span.spacer'), h('button.btn.sm', { text: 'Refresh', onclick: reload })));
+    if (!S.sessions.length) { wrap.appendChild(emptyBox('No sessions.')); return; }
     var tb = h('tbody');
     S.sessions.forEach(function (s) {
       tb.appendChild(h('tr', null,
@@ -1624,15 +1683,19 @@ function AdminSessions() {
         h('td', { text: stamp(s.lastSeenAt) }),
         h('td', null, s.current ? h('span.tag', { text: 'this browser' }) : null),
         h('td', null, h('button.btn.sm.danger', { text: 'Revoke', onclick: function () {
-          rpc.call('admin.sessionRevoke', { id: s.id })
-            .then(function () { Toast.ok('Session revoked'); reload(); })
-            .catch(function (e) { failed('Revoke', e); });
+          Modal.confirm('Revoke session',
+            'Sign ' + s.userName + ' out of ' + s.ip +
+            (s.current ? ' — this is your own browser, you will be sent to the login screen.' : '?'),
+            function () {
+              api.call('admin.sessionRevoke', { id: s.id })
+                .then(function () { Toast.ok('Session revoked'); reload(); })
+                .catch(function (e) { failed('Revoke', e); });
+            }, 'Revoke');
         } }))));
     });
     wrap.appendChild(h('div.tablewrap', { style: { marginTop: '10px' } }, h('table.grid-table', null,
       h('thead', null, h('tr', null, ['User', 'IP', 'User agent', 'Created', 'Last seen', '', ''].map(
         function (t) { return h('th', { text: t }); }))), tb)));
-    if (!S.sessions.length) { clear(wrap); wrap.appendChild(emptyBox('No sessions.')); }
   }
   reload();
   return { el: wrap };
@@ -1662,7 +1725,7 @@ function AdminAudit() {
     return isNaN(d.getTime()) ? null : d.getTime();
   }
 
-  function query(append) {
+  function query(more) {
     var args = { limit: 100 };
     if (actorSel.value) args.actor = actorSel.value;
     if (actionSel.value) args.action = actionSel.value;
@@ -1670,9 +1733,9 @@ function AdminAudit() {
     var f = tsOf(from), t = tsOf(to);
     if (f) args.from = f;
     if (t) args.to = t;
-    if (append && cursor) args.cursor = cursor;
-    rpc.call('admin.audit', args).then(function (r) {
-      if (!append) clear(tb);
+    if (more && cursor) args.cursor = cursor;
+    api.call('admin.audit', args).then(function (r) {
+      if (!more) clear(tb);
       (r.rows || []).forEach(function (row) { tb.appendChild(rowNode(row)); });
       cursor = r.nextCursor || null;
       moreBtn.hidden = !cursor;
@@ -1757,18 +1820,20 @@ function renderLogin(bootstrapNeeded) {
     e.preventDefault();
     errBox.hidden = true;
     btn.disabled = true;
-    var cmd = bootstrapNeeded ? 'auth.bootstrap' : 'auth.login';
+    var endpoint = bootstrapNeeded ? 'bootstrap' : 'session.login';
     var args = bootstrapNeeded
       ? { token: tokenIn.value, name: name.value, password: pass.value }
       : { name: name.value, password: pass.value };
-    rpc.call(cmd, args, { timeoutMs: 20000 }).then(function (r) {
-      pass.value = '';                       // never keep the secret around
+    pass.value = '';                         // never keep the secret in the DOM
+    api.call(endpoint, args, { timeoutMs: 20000 }).then(function (r) {
+      args.password = '';
       S.me = r.user;
       startApp();
     }).catch(function (er) {
-      pass.value = '';
+      args.password = '';
       showErr(er.code === 'unauthorized' ? 'Wrong name or password.'
             : er.code === 'rate-limited' ? 'Too many attempts — wait and try again.'
+            : er.code === 'forbidden' ? (er.message || 'This account cannot sign in.')
             : er.message);
       btn.disabled = false;
       pass.focus();
@@ -1798,33 +1863,33 @@ function renderLogin(bootstrapNeeded) {
  * Never rejects: a failure is rolled back, reported as a toast, and the
  * promise settles with null, so call sites can chain without a catch.
  */
-function optimistic(obj, patch, cmd, args, label) {
+function optimistic(obj, patch, endpoint, args, label) {
   var before = {};
   Object.keys(patch).forEach(function (k) { before[k] = obj[k]; obj[k] = patch[k]; });
   refresh();
-  return rpc.call(cmd, args).then(function (r) {
+  return api.call(endpoint, args).then(function (r) {
     if (r && r.instance) mergeInstance(r.instance);
     refresh();
     return r;
   }).catch(function (e) {
     Object.keys(before).forEach(function (k) { obj[k] = before[k]; });
     refresh();
-    failed(label || cmd, e);
+    failed(label || endpoint, e);
     return null;
   });
 }
 
-function bulkAction(cmd, ids, extra, optimisticPatch, label) {
+function bulkAction(action, ids, extra, optimisticPatch, label) {
   if (!ids.length) return Promise.resolve();
   var before = ids.map(function (id) {
     var i = S.byId[id]; if (!i) return null;
     var b = {}; Object.keys(optimisticPatch).forEach(function (k) { b[k] = i[k]; i[k] = optimisticPatch[k]; });
     return { id: id, before: b };
   });
-  refresh();
-  var args = { ids: ids };
+  ids.forEach(markDirty);
+  var args = { action: action, ids: ids };
   for (var k in extra) args[k] = extra[k];
-  return rpc.call(cmd, args, { timeoutMs: 30000 }).then(function (r) {
+  return api.call('instances.action', args, { timeoutMs: 30000 }).then(function (r) {
     var bad = (r.results || []).filter(function (x) { return !x.ok; });
     if (bad.length) {
       bad.forEach(function (x) {
@@ -1846,14 +1911,14 @@ function bulkAction(cmd, ids, extra, optimisticPatch, label) {
   });
 }
 
-function doStart(ids)   { return bulkAction('instance.start', ids, {}, { state: 'starting' }, 'Start'); }
-function doStop(ids)    { return bulkAction('instance.stop', ids, {}, { state: 'stopping' }, 'Stop'); }
-function doRestart(ids) { return bulkAction('instance.restart', ids, {}, { state: 'starting' }, 'Restart'); }
-function doBot(ids, on) { return bulkAction('instance.botEnable', ids, { on: on }, { botEnabled: on },
+function doStart(ids)   { return bulkAction('start', ids, {}, { state: 'starting' }, 'Start'); }
+function doStop(ids)    { return bulkAction('stop', ids, {}, { state: 'stopping' }, 'Stop'); }
+function doRestart(ids) { return bulkAction('restart', ids, {}, { state: 'starting' }, 'Restart'); }
+function doBot(ids, on) { return bulkAction('botEnable', ids, { on: on }, { botEnabled: on },
                                             on ? 'Bot enable' : 'Bot disable'); }
 
 function loadInstances() {
-  return rpc.call('instance.list', {}).then(function (r) {
+  return api.call('instances.list').then(function (r) {
     S.instances = r.instances || [];
     S.instances.sort(function (a, b) { return String(a.characterName).localeCompare(String(b.characterName)); });
     indexInstances();
@@ -1870,9 +1935,9 @@ function mergeInstance(inst) {
 
 /* =========================== 11. shell =========================== */
 
-var rpc = new Rpc({ base: API, mock: MOCK ? window.HubMock : null });
 var mainEl = null, railList = null, currentView = null, currentRoute = '';
 var connPill = null, tickTimer = null;
+var railItems = Object.create(null);
 
 function bannerBar() {
   var bar = h('div#banners');
@@ -1898,6 +1963,7 @@ function buildShell() {
   var appEl = document.getElementById('app');
   clear(appEl);
   appEl.appendChild(bannerBar());
+  railItems = Object.create(null);
 
   connPill = h('span#conn-pill', null, h('i.dot'), h('span', { text: 'connecting' }));
 
@@ -1930,22 +1996,52 @@ function buildShell() {
   appEl.appendChild(h('div#body', null, rail, mainEl));
 }
 
-function renderRail() {
+/** Incremental, like the dashboard: 40 instances must not cost 40 rebuilds a second. */
+function renderRail(dirtyIds) {
   if (!railList) return;
+
+  if (dirtyIds) {
+    for (var d = 0; d < dirtyIds.length; d++) {
+      var it = railItems[dirtyIds[d]], ins = S.byId[dirtyIds[d]];
+      if (!it || !ins) { renderRail(null); return; }
+      fillRail(it, ins);
+    }
+    return;
+  }
+
+  var empty = !S.instances.length;
   clear(railList);
-  if (!S.instances.length) { railList.appendChild(h('div.hint', { style: { padding: '10px' }, text: 'none yet' })); return; }
+  railItems = Object.create(null);
+  if (empty) { railList.appendChild(h('div.hint', { style: { padding: '10px' }, text: 'none yet' })); return; }
+
   S.instances.forEach(function (i) {
-    var L = i.live || {};
     var active = currentRoute.indexOf('#/i/' + i.id) === 0;
-    railList.appendChild(h('button.rail-item' + (active ? '.active' : ''), {
-      onclick: function () { go('#/i/' + encodeURIComponent(i.id) + '/overview');
-                             document.body.classList.remove('rail-open'); } },
-      h('div.l1', null, h('span.nm', { text: i.characterName }), h('span.spacer'), statePill(i.state)),
-      h('div.l2', null,
-        h('span', { text: L.level ? 'lvl ' + L.level : '–' }),
-        h('span', { text: rate(L.expPerHour) }),
-        h('span', { text: i.botEnabled ? 'bot' : '' }))));
+    var nm = h('span.nm', { text: i.characterName });
+    var pillWrap = h('span');
+    var lvl = h('span'), exp = h('span'), bot = h('span');
+    var btn = h('button.rail-item' + (active ? '.active' : ''), {
+        onclick: function () { go('#/i/' + encodeURIComponent(i.id) + '/overview');
+                               document.body.classList.remove('rail-open'); } },
+      h('div.l1', null, nm, h('span.spacer'), pillWrap),
+      h('div.l2', null, lvl, exp, bot));
+    var item = { btn: btn, nm: nm, pillWrap: pillWrap, lvl: lvl, exp: exp, bot: bot, stateKey: '' };
+    fillRail(item, i);
+    railItems[i.id] = item;
+    railList.appendChild(btn);
   });
+}
+
+function fillRail(item, i) {
+  var L = i.live || {};
+  setText(item.nm, i.characterName);
+  if (item.stateKey !== i.state) {
+    item.stateKey = i.state;
+    clear(item.pillWrap);
+    item.pillWrap.appendChild(statePill(i.state));
+  }
+  setText(item.lvl, L.level ? 'lvl ' + L.level : '–');
+  setText(item.exp, rate(L.expPerHour));
+  setText(item.bot, i.botEnabled ? 'bot' : '');
 }
 
 function setConn(status, detail) {
@@ -1954,16 +2050,11 @@ function setConn(status, detail) {
   connPill.id = 'conn-pill';
   if (status === 'live' || status === 'retry' || status === 'down') connPill.classList.add(status);
   connPill.title = detail || '';
-  connPill.lastChild.textContent =
+  setText(connPill.lastChild,
     status === 'live' ? (MOCK ? 'mock live' : 'live')
     : status === 'connecting' ? 'connecting'
     : status === 'retry' ? 'reconnecting'
-    : status === 'down' ? 'offline' : 'idle';
-}
-
-function refresh() {
-  renderRail();
-  if (currentView && currentView.update) { try { currentView.update(); } catch (e) { console.error(e); } }
+    : status === 'down' ? 'offline' : 'idle');
 }
 
 /* ---------- router ---------- */
@@ -2002,7 +2093,7 @@ function route() {
     var base = '#/' + r.name;
     a.classList.toggle('active', a.dataset.route.indexOf(base) === 0);
   });
-  renderRail();
+  renderRail(null);
 }
 
 /* ---------- account actions ---------- */
@@ -2018,41 +2109,48 @@ function changeOwnPassword() {
     onsubmit: function (close) {
       if (nw.value !== nw2.value) { Toast.err('Passwords do not match'); return; }
       if (nw.value.length < 10) { Toast.err('Password too short', 'at least 10 characters'); return; }
-      rpc.call('auth.changePassword', { current: cur.value, next: nw.value })
+      var payload = { current: cur.value, next: nw.value };
+      cur.value = nw.value = nw2.value = '';
+      api.call('session.password', payload)
         .then(function () { close(); Toast.ok('Password changed'); })
-        .catch(function (e) { failed('Change password', e); })
-        .then(function () { cur.value = nw.value = nw2.value = ''; });
+        .catch(function (e) { failed('Change password', e); });
     },
     actions: [{ label: 'Cancel' }, { label: 'Change', kind: 'primary', submit: true }]
   });
 }
 
 function signOut() {
-  rpc.call('auth.logout', {}).catch(function () {}).then(function () {
-    rpc.disconnect();
+  api.call('session.logout').catch(function () {}).then(function () {
+    ws.disconnect();
     S.me = null;
     clearTimeout(tickTimer);
     renderLogin(false);
   });
 }
 
+/** Reached from a 401 on any call, and from a 4401 close on the socket. */
+function onUnauthorized() {
+  if (!S.me) return;
+  S.me = null;
+  ws.disconnect();
+  clearTimeout(tickTimer);
+  currentView = null;
+  renderLogin(false);
+  Toast.warn('Signed out', 'The hub rejected the session. Sign in again.');
+}
+
 /* ---------- live events ---------- */
 
 function wireEvents() {
-  rpc.on('#status', function (s) { setConn(s.status, s.detail); });
+  ws.on('#status', function (s) { setConn(s.status, s.detail); });
+  ws.on('#unauthorized', function () { onUnauthorized(); });
 
-  rpc.on('#unauthorized', function () {
-    if (!S.me) return;
-    S.me = null; rpc.disconnect(); clearTimeout(tickTimer);
-    renderLogin(false);
-    Toast.warn('Signed out', 'The hub rejected the session.');
-  });
-
-  rpc.on('#reconnected', function () {
+  ws.on('#ready', function () {
+    /* every reconnect can have missed changes: resync the authoritative list */
     if (S.me) loadInstances().then(refresh).catch(function () {});
   });
 
-  rpc.on('status', function (d) {
+  ws.on('status', function (d) {
     var i = d && S.byId[d.id]; if (!i) return;
     if (d.state) i.state = d.state;
     if (d.botEnabled !== undefined) i.botEnabled = d.botEnabled;
@@ -2060,9 +2158,10 @@ function wireEvents() {
     ['hp', 'maxHp', 'mana', 'maxMana', 'level', 'expPercent', 'target', 'waypoint',
      'waypointIndex', 'waypointCount', 'uptimeMs', 'onlineMs', 'pos', 'cap', 'maxCap',
      'soul', 'stamina'].forEach(function (k) { if (d[k] !== undefined) i.live[k] = d[k]; });
+    markDirty(d.id);
   });
 
-  rpc.on('stats', function (d) {
+  ws.on('stats', function (d) {
     var i = d && S.byId[d.id]; if (!i) return;
     i.live = i.live || {};
     Object.keys(d).forEach(function (k) { if (k !== 'id' && k !== 't') i.live[k] = d[k]; });
@@ -2073,38 +2172,44 @@ function wireEvents() {
       killsPerHour: d.killsPerHour, level: d.level,
       hpPercent: pct(i.live.hp, i.live.maxHp), manaPercent: pct(i.live.mana, i.live.maxMana)
     }, 360);
+    markDirty(d.id);
   });
 
-  rpc.on('instance', function (d) {
+  ws.on('instance', function (d) {
     if (!d) return;
     if (d.removed) {
       S.instances = S.instances.filter(function (i) { return i.id !== d.id; });
       indexInstances();
-    } else if (d.instance) mergeInstance(d.instance);
-    refresh();
+      refresh();
+    } else if (d.instance) {
+      var known = !!S.byId[d.instance.id];
+      mergeInstance(d.instance);
+      if (known) markDirty(d.instance.id); else refresh();
+    }
   });
 
-  rpc.on('loginState', function (d) {
+  ws.on('loginState', function (d) {
     var i = d && S.byId[d.id]; if (!i) return;
     if (d.state) i.state = d.state;
+    markDirty(d.id);
   });
 
-  rpc.on('death', function (d) {
+  ws.on('death', function (d) {
     var i = d && S.byId[d.id];
     Toast.err('Death', (i ? i.characterName : d.id) + ' died at level ' + (d.level || '?'));
   });
 
-  rpc.on('error', function (d) {
+  ws.on('error', function (d) {
     var i = d && S.byId[d.id];
     Toast.err(i ? i.characterName : 'Worker', d && d.message ? d.message : 'unknown error');
   });
 
-  rpc.on('gameEnd', function (d) {
+  ws.on('gameEnd', function (d) {
     var i = d && S.byId[d.id];
     if (i) Toast.warn(i.characterName + ' left the game', d.reason || '');
   });
 
-  rpc.on('*', function (ev, data) {
+  ws.on('*', function (ev, data) {
     if (currentView && currentView.onEvent) {
       try { currentView.onEvent(ev, data); } catch (e) { console.error(e); }
     }
@@ -2140,10 +2245,11 @@ function wireKeys() {
 function startApp() {
   buildShell();
   wireEvents();
-  rpc.connect();
+  ws.connect();
 
   loadInstances().then(function () {
-    return rpc.call('script.list', {}).then(function (r) { S.scripts = r.scripts || []; }).catch(function () {});
+    return api.call('scripts.list').then(function (r) { S.scripts = r.scripts || []; })
+      .catch(function () {});
   }).then(function () {
     route();
     refresh();
@@ -2152,9 +2258,15 @@ function startApp() {
     route();
   });
 
+  /* one slow heartbeat so uptime counters move even between pushes */
   clearTimeout(tickTimer);
   (function tick() {
-    tickTimer = setTimeout(function () { refresh(); tick(); }, 1000);
+    tickTimer = setTimeout(function () {
+      S.instances.forEach(function (i) {
+        if (i.state !== 'stopped' && i.live) { i.live.uptimeMs = (i.live.uptimeMs || 0) + 1000; markDirty(i.id); }
+      });
+      tick();
+    }, 1000);
   })();
 
   window.onhashchange = route;
@@ -2162,9 +2274,9 @@ function startApp() {
 
 function boot() {
   wireKeys();
-  window.addEventListener('resize', function () { if (currentView && currentView.update) currentView.update(); });
+  window.addEventListener('resize', function () { refresh(); });
 
-  rpc.call('auth.session', {}, { timeoutMs: 10000 }).then(function (r) {
+  api.call('session.get', {}, { timeoutMs: 10000 }).then(function (r) {
     S.serverVersion = r.version || '';
     if (r.bootstrap) { renderLogin(true); return; }
     if (r.user) { S.me = r.user; startApp(); }
@@ -2178,7 +2290,8 @@ function boot() {
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
 else boot();
 
-/* expose a tiny surface for debugging / the mock's own console output */
-window.Panel = { S: S, rpc: rpc, go: go, refresh: refresh };
+/* a tiny surface for debugging and for panel/test/tests.js */
+window.Panel = { S: S, api: api, http: http, ws: ws, go: go, refresh: refresh,
+                 markDirty: markDirty, MOCK: MOCK };
 
 })();
