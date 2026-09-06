@@ -11,3 +11,5 @@ test/.tmp/
 # starts a real worker from the project root leaves its bot storage here.
 profile_1/
 hub-data/
+hub-smoke/
+hub-data/
