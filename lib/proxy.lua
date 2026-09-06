@@ -60,6 +60,7 @@ proxy.DEFAULT_PROXY_CONNECTION = 'keep-alive'
 proxy.DEFAULT_TIMEOUT_MS       = 30000        -- Connection::READ_TIMEOUT / WRITE_TIMEOUT
 proxy.DEFAULT_MAX_HEADER_BYTES = 32768
 proxy.MAX_LEADING_BLANK_LINES  = 4            -- RFC 9112 s2.2 robustness allowance
+proxy.MAX_INTERIM              = 8            -- 1xx responses skipped before we give up
 
 -- ============================================================ base64 (RFC 4648)
 -- cppcodec::base64_rfc4648 as used by Crypt::base64Encode: standard alphabet,
@@ -127,9 +128,20 @@ function proxy.formatTarget(host, port)
 end
 
 --- Replace the base64 credential in a built request with a placeholder.
+--- The separators are horizontal whitespace only: `%s` matches CR and LF, so the old pattern's
+--- greedy `%s+` swallowed the line terminator of a header whose credential blob was empty and
+--- then ate the NEXT header, destroying a line the log was supposed to show.
 function proxy.redact(request)
     if type(request) ~= 'string' then return request end
-    return (request:gsub('([Pp]roxy%-[Aa]uthorization:%s*%a+%s+)[^\r\n]*', '%1<redacted>'))
+    -- "Proxy-Authorization: <scheme> <blob>" -- mask the blob, keep the scheme.
+    local out = request:gsub('([Pp]roxy%-[Aa]uthorization:[ \t]*%a+[ \t]+)[^\r\n]*', '%1<redacted>')
+    -- "Proxy-Authorization: <anything-not-scheme-plus-blob>" -- mask whatever is left on the
+    -- line, so a shape this helper does not model cannot leak through unmasked.
+    out = out:gsub('([Pp]roxy%-[Aa]uthorization:[ \t]*)([^\r\n]*)', function(head, rest)
+        if rest == '' or rest:find('<redacted>', 1, true) then return head .. rest end
+        return head .. '<redacted>'
+    end)
+    return out
 end
 
 --- "host:port" -> host, port.  Accepts "[::1]:6754".
@@ -341,15 +353,34 @@ function HS:_readAuthChallenge()
     if not v then return end
     self.realm = v:match('[Rr][Ee][Aa][Ll][Mm]%s*=%s*"([^"]*)"')
               or v:match('[Rr][Ee][Aa][Ll][Mm]%s*=%s*([^,%s]+)')
-    local schemes = {}
-    for token in v:gmatch('[^,]+') do
-        local s = trim(token):match('^([%a%-]+)')
-        if s then schemes[#schemes + 1] = s end
+    -- Split on TOP-LEVEL commas only: a comma inside a quoted realm ("Basic realm=\"a,b\"")
+    -- is part of the value, not a challenge separator.  Truncating to the first scheme (what
+    -- this did before) threw away exactly the diagnostic this module exists to recover -- the
+    -- operator could not see that the proxy would also accept Digest or NTLM.
+    local schemes, seen, start, inQuotes = {}, {}, 1, false
+    local function addFragment(frag)
+        local s = trim(frag):match('^([%a][%w%-%.%_%~%+]*)')
+        -- A fragment like `realm="corp"` is a PARAMETER of the previous challenge, not a
+        -- scheme: anything with an '=' before the first space is skipped.
+        if s and not trim(frag):match('^[%w%-%.%_%~%+]+%s*=') then
+            local key = s:lower()
+            if not seen[key] then
+                seen[key] = true
+                schemes[#schemes + 1] = s
+            end
+        end
     end
-    -- "Basic realm=..." splits on the comma inside the realm too; keep only the
-    -- leading token of the first fragment plus any later fragment that looks like
-    -- a bare scheme name followed by a space or end.
-    self.authSchemes = (#schemes > 0) and { schemes[1] } or nil
+    for i = 1, #v do
+        local c = sub(v, i, i)
+        if c == '"' then
+            inQuotes = not inQuotes
+        elseif c == ',' and not inQuotes then
+            addFragment(sub(v, start, i - 1))
+            start = i + 1
+        end
+    end
+    addFragment(sub(v, start))
+    self.authSchemes = (#schemes > 0) and schemes or nil
 end
 
 function HS:_resetResponse()
@@ -363,10 +394,17 @@ end
 ---   'need-more'
 ---   'connected', leftover        -- leftover = early tunnel bytes (possibly '')
 ---   'error', message, kind
+---
+--- feed() is TOTAL: it is safe to call in the unconditional loop docs/proxy.md documents, even
+--- after the tunnel opened.  Late bytes are appended to `leftover` and handed back rather than
+--- dropped or raised on -- the ordinary case where the 200 arrives in one TCP segment and the
+--- first tunnel bytes in the next used to raise an uncaught error and kill the worker.
 function HS:feed(chunk, nowMs)
     if self.state == 'done' then
-        error('lib/proxy: feed() called after the tunnel opened -- the transport owns the '
-              .. 'stream from here (hand hs.leftover to the framer first)', 2)
+        if chunk ~= nil and #chunk > 0 then
+            self.leftover = self.leftover .. chunk
+        end
+        return proxy.CONNECTED, self.leftover
     end
     if self.state == 'failed' then
         return proxy.ERROR, self.err, self.errorKind
@@ -387,6 +425,17 @@ function HS:feed(chunk, nowMs)
                 '%s: CONNECT to %s got a non-HTTP response (first bytes %q)',
                 self:_where(), self.target, sanitise(sub(self.buf, 1, 32), 32)))
         end
+    end
+
+    -- The cap has to be enforced BEFORE the parse loop.  Enforced after it, a hostile or broken
+    -- proxy that puts the whole block in ONE read is buffered in full and never checked at all
+    -- (4 MB sailed past a 32 KiB cap).  A legitimate 200 followed by a large tunnel payload in
+    -- the same segment still succeeds: what fails is the absence of a blank line within the cap.
+    if self.maxHeaderBytes > 0 and #self.buf > self.maxHeaderBytes
+       and not find(sub(self.buf, 1, self.maxHeaderBytes + 3), '\r?\n\r?\n') then
+        return self:_fail('too-large', format(
+            '%s: CONNECT to %s response header exceeds %d bytes',
+            self:_where(), self.target, self.maxHeaderBytes))
     end
 
     while true do
@@ -415,8 +464,16 @@ function HS:feed(chunk, nowMs)
                             '%s: CONNECT to %s rejected -- %s',
                             self:_where(), self.target, sanitise(self.statusLine)))
                     end
-                    -- DEVIATION: skip the interim response and keep reading.
+                    -- DEVIATION: skip the interim response and keep reading.  Bounded, like
+                    -- every other unbounded input here: the skip branch resets self.buf, so
+                    -- maxHeaderBytes can never fire on a 1xx flood and a feed-only transport
+                    -- (one that never runs tick()'s watchdog) would otherwise spin forever.
                     self.interimCount = self.interimCount + 1
+                    if self.interimCount > proxy.MAX_INTERIM then
+                        return self:_fail('malformed', format(
+                            '%s: CONNECT to %s answered with %d interim (1xx) responses and no '
+                            .. 'final status', self:_where(), self.target, self.interimCount))
+                    end
                     self.buf, self.scan = sub(self.buf, self.scan), 1
                     self.leadingBlank = 0
                     self:_resetResponse()
@@ -441,7 +498,17 @@ function HS:feed(chunk, nowMs)
         elseif self.statusLine == nil then
             -- Status line.  DEVIATION: the reference only checks that the char
             -- after the first space is '2'.
-            local ver, code, reason = line:match('^HTTP/(%d+%.?%d*)[ \t]+(%d%d%d)[ \t]*(.*)$')
+            --
+            -- The 3-digit code must be ANCHORED at both ends.  With a single trailing `[ \t]*`
+            -- the `(.*)` behind it absorbed the rest of the token, so "HTTP/1.1 2000 OK" parsed
+            -- as 200 and opened a tunnel onto a dead pipe, and "HTTP/1.1 4070 Nope" was reported
+            -- to the operator as 407 'auth-required'.  Either real whitespace follows the code,
+            -- or the code ends the line.
+            local ver, code, reason = line:match('^HTTP/(%d+%.?%d*)[ \t]+(%d%d%d)[ \t]+(.*)$')
+            if not ver then
+                ver, code = line:match('^HTTP/(%d+%.?%d*)[ \t]+(%d%d%d)[ \t]*$')
+                reason = ''
+            end
             if not ver then
                 return self:_fail('malformed', format(
                     '%s: CONNECT to %s got a malformed status line %q',
@@ -456,11 +523,6 @@ function HS:feed(chunk, nowMs)
         end
     end
 
-    if self.maxHeaderBytes > 0 and #self.buf > self.maxHeaderBytes then
-        return self:_fail('too-large', format(
-            '%s: CONNECT to %s response header exceeds %d bytes',
-            self:_where(), self.target, self.maxHeaderBytes))
-    end
     return proxy.NEED_MORE
 end
 

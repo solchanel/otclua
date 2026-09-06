@@ -676,7 +676,9 @@ function ViewDashboard() {
     }));
   }
 
+  var emptyRow = null;
   function render() {
+    if (emptyRow) { if (emptyRow.parentNode) tbody.removeChild(emptyRow); emptyRow = null; }
     var seen = Object.create(null);
     S.instances.forEach(function (inst, idx) {
       seen[inst.id] = true;
@@ -690,9 +692,9 @@ function ViewDashboard() {
       if (!seen[id]) { if (rows[id].tr.parentNode) tbody.removeChild(rows[id].tr); delete rows[id]; }
     });
     if (!S.instances.length) {
-      clear(tbody);
-      tbody.appendChild(h('tr', null, h('td', { colspan: '12' },
-        emptyBox('No instances yet. Create one from Characters & Accounts.'))));
+      emptyRow = h('tr', null, h('td', { colspan: '12' },
+        emptyBox('No instances yet. Create one from Characters & Accounts.')));
+      tbody.appendChild(emptyRow);
     }
     syncSelection();
   }
@@ -1020,7 +1022,7 @@ function assignDialog(instanceId, done) {
 function TabConsole(id) {
   var box = h('div.logbox', { tabindex: '0', role: 'log', 'aria-label': 'Worker log' });
   var follow = h('input', { type: 'checkbox', checked: true });
-  var filter = h('input', { type: 'search', placeholder: 'filter…', style: { width: '180px' } });
+  var filter = h('input', { type: 'search', placeholder: 'filter…' });
   var level = selectOf(['debug', 'info', 'warn', 'error'], 'debug',
     function (v) { return { value: v, label: '≥ ' + v }; });
   var code = h('textarea', { rows: '3', spellcheck: 'false',
@@ -1079,7 +1081,8 @@ function TabConsole(id) {
       h('div.row', { style: { marginBottom: '8px' } },
         h('h3', { text: 'Worker log', style: { margin: '0' } }),
         h('span.spacer'),
-        level, filter,
+        h('div', { style: { width: '110px', flex: '0 0 auto' } }, level),
+        h('div', { style: { width: '180px', flex: '0 0 auto' } }, filter),
         h('label.check', null, follow, txt('follow')),
         h('button.btn.sm', { text: 'Clear', onclick: function () { S.logs[id] = []; redraw(); } })),
       box),
@@ -1790,7 +1793,11 @@ function renderLogin(bootstrapNeeded) {
 
 /* =========================== 10. actions ========================= */
 
-/** Apply a local patch immediately, send it, roll back on failure. */
+/**
+ * Apply a local patch immediately, send it, roll back on failure.
+ * Never rejects: a failure is rolled back, reported as a toast, and the
+ * promise settles with null, so call sites can chain without a catch.
+ */
 function optimistic(obj, patch, cmd, args, label) {
   var before = {};
   Object.keys(patch).forEach(function (k) { before[k] = obj[k]; obj[k] = patch[k]; });
@@ -1803,7 +1810,7 @@ function optimistic(obj, patch, cmd, args, label) {
     Object.keys(before).forEach(function (k) { obj[k] = before[k]; });
     refresh();
     failed(label || cmd, e);
-    throw e;
+    return null;
   });
 }
 
@@ -1945,8 +1952,7 @@ function setConn(status, detail) {
   if (!connPill) return;
   connPill.className = '';
   connPill.id = 'conn-pill';
-  connPill.classList.add(status === 'live' ? 'live' : status === 'retry' ? 'retry'
-                        : status === 'down' ? 'down' : '');
+  if (status === 'live' || status === 'retry' || status === 'down') connPill.classList.add(status);
   connPill.title = detail || '';
   connPill.lastChild.textContent =
     status === 'live' ? (MOCK ? 'mock live' : 'live')

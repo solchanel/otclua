@@ -407,23 +407,68 @@ function P:dropCreature(id)
   local st = self.state
   local c = self:creature(id)
   if not c then return nil end
+  if st.player and st.player.id == id then
+    -- Map::removeThing() takes the LocalPlayer off its tile; the object itself is owned by
+    -- g_game and survives, keeping its speed, outfit and name.  TFS really does send us a
+    -- 0x6C for OURSELVES on the surface -> underground floor change (protocolgame.cpp,
+    -- `oldPos.z == 7 && newPos.z >= 8` sends RemoveTileThing instead of 0x6D), and on a
+    -- teleport.  Deleting the record there would drop the creature speed the walker paces
+    -- on -- the step duration would silently fall back to 200 ms mid-hunt (bug 2).
+    if c.pos and st.creatureStackPos then
+      local sp = st:creatureStackPos(c.pos, id)
+      if sp then st:removeThing(c.pos, sp) end
+    end
+    c.pos = nil
+    return c
+  end
   if st.removeCreature then st:removeCreature(id) else st.creatures[id] = nil end
   self.emit('creatureDisappear', c)
   return c
 end
 
+-- Write state.player.pos and emit `positionChange` EXACTLY once per real move.  This is the
+-- only place in the parser that moves the local player.
+function P:setPlayerPos(p)
+  local pl = self:player()
+  local old = pl.pos
+  if old and old.x == p.x and old.y == p.y and old.z == p.z then return false end
+  pl.pos = { x = p.x, y = p.y, z = p.z }
+  self.emit('positionChange', { pos = pl.pos, oldPos = old })
+  return true
+end
+
+-- Map::setCentralPosition's deferred local-player fixup (map.cpp:566-580): the camera has
+-- moved; if we are no longer standing on a tile that holds us, the server relocated us
+-- without a 0x6D.  Two real cases: a teleport (TFS sends 0x6C + 0x64) and the surface ->
+-- underground floor change (TFS sends 0x6C + 0xBF, deliberately NOT a 0x6D --
+-- protocolgame.cpp sendMoveCreature, `oldPos.z == 7 && newPos.z >= 8`).
+--
+-- game/state.lua keeps `creatures[id].pos` nil while a creature is off the map (_removeAt)
+-- and re-stamps it from addThing, so the creature record is the wire's own statement of
+-- where we are and is preferred over the bare centre.
+function P:syncPlayerPos()
+  local st = self.state
+  local pl = self:player()
+  local c  = (pl.id and st.creatures) and st.creatures[pl.id] or nil
+  local cp = c and c.pos
+  if cp then return self:setPlayerPos(cp) end
+  if self.central then return self:setPlayerPos(self.central) end
+  return false
+end
+
+-- Map::setCentralPosition moves the CAMERA.  It does NOT move the local player: in the C++
+-- only Creature::walk (0x6D) and the deferred fixup above ever write the local player's
+-- position.  Writing pl.pos here is what made every step advance the client two tiles and,
+-- worse, made the NEXT row slice compute `movePos()` from an already-advanced centre and
+-- write its column one tile off (GameMapMovePosition is OFF at 1530, so movePos() returns
+-- centralPos()).  See docs/live-findings.md, bug 4.
 function P:setCentral(p)
   self.central = { x = p.x, y = p.y, z = p.z }
   -- Map::setCentralPosition -> removeUnawareThings(): drop the tiles that just left the
   -- aware range, exactly like the C++ (GameKeepUnawareTiles is never enabled).
   local st = self.state
   if st and st.setCentralPosition then st:setCentralPosition(self.central) end
-  local pl = self:player()
-  local old = pl.pos
-  pl.pos = { x = p.x, y = p.y, z = p.z }
-  if not old or old.x ~= p.x or old.y ~= p.y or old.z ~= p.z then
-    self.emit('positionChange', { pos = pl.pos, oldPos = old })
-  end
+  self:syncPlayerPos()
 end
 
 function P:centralPos()
@@ -990,6 +1035,8 @@ S[0x4B] = function(self, R)                       -- FloorDescription
   if p.z == floor then self:setCentral(p) end
   self:setFloorDescription(R, p.x - self.aware.left, p.y - self.aware.top,
                            floor, self:AW(), self:AH(), p.z - floor, 0)
+  -- position-authoritative: unlike the row slices this packet carries a real player position
+  if p.z == floor then self:setPlayerPos(p) end
   self.emit('mapDescription', { pos = p, floor = floor })
 end
 
@@ -998,6 +1045,9 @@ S[0x64] = function(self, R)                       -- FullMap
   self:setCentral(p)
   self:setMapDescription(R, p.x - self.aware.left, p.y - self.aware.top, p.z,
                          self:AW(), self:AH())
+  -- 0x64 is the login map AND the answer to every teleport (TFS sendMapDescription), so it
+  -- is position-authoritative even when a stale creature record still says otherwise.
+  self:setPlayerPos(p)
   self.emit('mapDescription', { pos = p, full = true })
 end
 
@@ -1087,6 +1137,13 @@ S[0x6D] = function(self, R)                       -- MoveCreature
   local creature = self:creature(creatureId)
   if not from and creature then from = creature.pos end
 
+  -- captured BEFORE the move: state:moveCreature mirrors the local player's position onto
+  -- state.player.pos silently, so the emit below has to remember where we were.
+  local isLocal = (st.player and st.player.id == creatureId) or false
+  local oldPlayerPos = isLocal and st.player.pos or nil
+  if isLocal then oldPlayerPos = oldPlayerPos and { x = oldPlayerPos.x, y = oldPlayerPos.y,
+                                                    z = oldPlayerPos.z } or nil end
+
   if st.moveCreature then
     st:moveCreature(creatureId, ref.pos, ref.stackpos, newPos)
   else
@@ -1099,8 +1156,24 @@ S[0x6D] = function(self, R)                       -- MoveCreature
   end
 
   creature = self:creature(creatureId)
-  local pl = st.player
-  if pl and pl.id == creatureId then self:setCentral(newPos) end
+  if isLocal then
+    -- Creature::walk is the ONLY thing that moves the local player.  parseCreatureMove does
+    -- NOT touch the camera: the row slice (0x65-0x68) that the server sends in the same
+    -- message does, and it derives its own position from the still-OLD centre.  Advancing
+    -- the centre here made that slice land one tile off and the client believe it was a
+    -- tile further along than it was -- docs/live-findings.md, bug 4.
+    local pl = st.player
+    pl.pos = { x = newPos.x, y = newPos.y, z = newPos.z }
+    if not self.central then
+      -- no map description has been parsed yet: keep the camera where we WERE, so a row
+      -- slice arriving next still resolves movePos() correctly.
+      if oldPlayerPos then self.central = oldPlayerPos end
+    end
+    if not oldPlayerPos or oldPlayerPos.x ~= newPos.x or oldPlayerPos.y ~= newPos.y
+       or oldPlayerPos.z ~= newPos.z then
+      self.emit('positionChange', { pos = pl.pos, oldPos = oldPlayerPos })
+    end
+  end
   self.emit('creatureMove',
             { creature = creature, from = from, to = { x = newPos.x, y = newPos.y, z = newPos.z } })
 end

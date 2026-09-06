@@ -72,6 +72,12 @@ DELIBERATE DEVIATIONS (each one is a documented vBot defect; each has a switch)
     creature.healthPercent -> floor(health*100/maxHealth) -> 101.  The middle
     step is the fallback the spec's own Open Questions authorise.
     `opts.hpPercentSource = 'server'|'derived'|'auto'` (default 'auto').
+ 8. BURST DAMAGE: DIVISION-BY-ZERO GUARD.  vlib.lua:66-76 has no guard, so with
+    #dmgTable > 1 and `now == dmgTable[1].t` -- two "you lose" messages inside a
+    single bot tick, since every `now` read in one tick is identical -- vBot
+    evaluates math.ceil(d / 0) and returns `inf`, firing any `burst >` rule.  We
+    return 0 there instead (fail closed).  `opts.vbotBurstInfinity = true`
+    reproduces vBot's `inf` exactly.
  7. BOTH POISON KEYS ARE READ.  The ConditionPanel default table writes the
     misspelled `curePosion` (Conditions.lua:30) while every reader uses
     `curePoison`.  We read `curePoison`, and only when it is nil fall back to
@@ -150,6 +156,7 @@ function healbot.new(b, cfg, opts)
     self.optimisticSpellCooldown = opts.optimisticSpellCooldown == true
     self.standByItemsEnabled     = opts.standByItems == true
     self.vbotBurstPrune          = opts.vbotBurstPrune == true
+    self.vbotBurstInfinity       = opts.vbotBurstInfinity == true   -- deviation 8
     self.hiddenCooldownWindow    = opts.hiddenCooldownWindow == true
     self.hpPercentSource         = opts.hpPercentSource or 'auto'
 
@@ -332,7 +339,8 @@ function H:burstDamageValue()
     local sum = 0
     for i = 1, #d do sum = sum + d[i].d end
     local dt = (self:now() - d[1].t) / 1000
-    if dt <= 0 then return 0 end
+    -- deviation 8: vBot divides by zero here and returns `inf`.
+    if dt <= 0 then return self.vbotBurstInfinity and math.huge or 0 end
     return math.ceil(sum / dt)
 end
 
@@ -632,7 +640,18 @@ function H:_hookEvents()
     end)
     -- standByItems is cleared by health/mana events (HealBot.lua:809-817); only
     -- meaningful when opts.standByItems restored the flag.
-    shared.evOn(ev, 'healthChange', function() self.standByItems = false end)
+    shared.evOn(ev, 'healthChange', function(d)
+        self.standByItems = false
+        -- REVIEW FIX: proto/parser.lua sets player.isDead = true on 0x28 and NOTHING
+        -- in the tree ever clears it except state:reset() (i.e. a whole new session).
+        -- A resurrection / custom death message / reconnect that reuses LC.state would
+        -- otherwise disable every heal loop for good, silently.  Demonstrably-alive
+        -- health clears it.
+        if d and (d.health or 0) > 0 then
+            local p = self:player()
+            if p then p.isDead = false end
+        end
+    end)
     shared.evOn(ev, 'manaChange',   function() self.standByItems = false end)
 end
 

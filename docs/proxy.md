@@ -35,8 +35,10 @@ httpProxy/entries:
     name: 31.59.20.176:6754
     host: 31.59.20.176
 httpProxy/selected: 31.59.20.176:6754
-httpProxy/expanded: true
 ```
+
+(`httpProxy/expanded: true` — the panel's open/closed state — also exists, but it lives far away
+at `config.otml:860`, not in the `1058-1066` block above, and it is not part of an entry.)
 
 Five keys per entry: `name` (the combo-box label, conventionally `host:port`), `host`, `port`
 (a number), `user`, `pass`. `pass` is stored **in clear text** in `config.otml`. `httpProxy/selected`
@@ -187,11 +189,20 @@ There is exactly one failure path for all three:
    the status-line split uses `find("\r\n")`. A proxy answering with LF-only line endings hangs
    until the 30 s read timeout. `lib/proxy.lua` treats *any* empty line as the end of the headers.
 3. **The acceptance test is far too loose.** `statusLine[codeStart+1] == '2'` accepts
-   `HTTP/1.1 2`, `GARBAGE 2`, or `x 2junk`. We require `HTTP/<version> <3 digits>`.
+   `HTTP/1.1 2`, `GARBAGE 2`, or `x 2junk`. We require `HTTP/<version> <3 digits>` with the code
+   **anchored at both ends** — either whitespace follows it or it ends the line. `2000 OK`,
+   `200OK`, `2007`, `299junk` and `4070 Nope` are all `malformed`, not `200`/`407`.
 4. **No cap on the header block.** A hostile or broken proxy can stream headers forever; asio's
    streambuf grows until the read timeout. `lib/proxy.lua` fails at `maxHeaderBytes` (32 KiB).
+   The cap is enforced **before** each parse pass, so a block delivered in one big read is
+   refused exactly like one dripped in a byte at a time; what it tests is the absence of a blank
+   line within the cap, so a legitimate `200` followed by a large tunnel payload in the same
+   TCP segment still connects and the payload comes back as `leftover`.
 5. **1xx interim responses are rejected**, since `'1' ~= '2'`. RFC 9110 requires a client to be able
-   to skip them. `lib/proxy.lua` skips them by default (`interim = 'skip'`).
+   to skip them. `lib/proxy.lua` skips them by default (`interim = 'skip'`), but **boundedly**:
+   at most `proxy.MAX_INTERIM` (8) before the handshake fails `malformed`. The skip branch resets
+   the buffer, so `maxHeaderBytes` can never fire on a 1xx flood and a feed-only transport would
+   otherwise spin forever.
 6. **No IPv6 bracketing.** `host + ":" + port` produces `::1:7171`, which is not a valid authority.
    `lib/proxy.lua` emits `[::1]:7171`.
 7. **No header-injection guard.** Host, user and pass go into the request unvalidated; a `\r\n` in
@@ -288,6 +299,11 @@ local st, a, b = hs:feed(chunk, sys.nowMs())
 --   st == 'error'       a = message, b = kind
 --                       kind ∈ 'auth-required'|'rejected'|'malformed'|'too-large'
 --                              |'timeout'|'closed'
+-- feed() is TOTAL, so this loop may stay unconditional: calling it again after 'connected'
+-- appends the new bytes to hs.leftover and re-returns ('connected', hs.leftover) rather than
+-- raising.  The common case — the 200 in one TCP segment and the first tunnel bytes in the
+-- next — therefore costs you nothing, and no byte is ever dropped.  Once you have handed
+-- hs.leftover to the framer, stop calling feed() and read the socket directly.
 hs:tick(sys.nowMs())    -- same return shape; call from the 1 s watchdog to enforce timeoutMs
 hs:eof()                -- the peer closed mid-handshake -> 'error', …, 'closed'
 ```
@@ -297,6 +313,11 @@ After a `407` the fields that matter for the operator are populated:
 Authorization."` for this proxy), `hs.authSchemes = { 'Basic' }`, and `hs.headers` /
 `hs.headerList` with every header the proxy sent (lower-cased keys; repeats joined with `", "`).
 
+`authSchemes` is a list because a proxy may offer several: `Proxy-Authenticate: Basic realm="r",
+Digest realm="d", NTLM` gives `{ 'Basic', 'Digest', 'NTLM' }`. The split is quote-aware, so a
+comma inside a quoted realm stays part of the realm and does not start a new challenge; scheme
+parameters (`realm=…`) are not mistaken for schemes, and repeats are collapsed.
+
 Guarantees, each covered by a test in `test/proxysuite.lua`:
 
 * arbitrary TCP chunk boundaries, down to one byte at a time;
@@ -304,10 +325,15 @@ Guarantees, each covered by a test in `test/proxysuite.lua`:
 * body/early bytes after the header block returned as `leftover`;
 * `\r\n`, bare `\n`, and mixed line endings;
 * leading blank lines before the status line (up to 4, RFC 9112 tolerance);
-* 1xx interim responses skipped (`interim = 'error'` to reject them like the reference);
-* `407` with the realm extracted;
-* malformed status line, oversized header block, peer EOF, and timeout all reported with a kind;
-* no credential ever appears in an error message, and `requestRedacted` masks the base64 blob.
+* 1xx interim responses skipped (`interim = 'error'` to reject them like the reference), and a
+  1xx flood bounded at `proxy.MAX_INTERIM`;
+* `407` with the realm extracted, and every offered auth scheme reported;
+* malformed status line — including a code run together with what follows it (`200OK`,
+  `2000 OK`, `4070 Nope`) — oversized header block (in one chunk as well as dripped), peer EOF,
+  and timeout, all reported with a kind;
+* `feed()` after the tunnel opened: late bytes appended to `leftover`, never dropped, never raised;
+* no credential ever appears in an error message, `requestRedacted` masks the base64 blob, and
+  `proxy.redact()` never eats the header that follows the masked one.
 
 Helpers for the CLI/panel plumbing: `proxy.parseEndpoint('host:port')` → `host, port` (handles
 `[v6]:port`), `proxy.parseAuth('user:pass')` → `user, pass` (splits on the **first** colon, so
@@ -342,5 +368,5 @@ precise wiring is listed in the P3 report's `crossFileRequests`.
 | login POST proxying + redaction of `proxy-authorization` | `otclient/src/framework/net/httplogin.cpp:85-95, 150-165, 215, 404, 455` |
 | httplib's own CONNECT | `vcpkg_installed/.../include/httplib.h:9847, 12929, 13616, 16034` (0.48.0) |
 | UI → `g_http_proxy`, settings keys | `otclient/modules/client_entergame/entergame.lua:566-700, 867-899` |
-| the stored entry | `otclient/profiles/config.otml:1058-1066` |
+| the stored entry | `otclient/profiles/config.otml:1058-1066` (entry), `:860` (`httpProxy/expanded`) |
 | the 407 evidence | `docs/live-login-notes.md` |

@@ -13,22 +13,71 @@
 --        Re-derives with the stored parameters and compares in constant time.  Returns
 --        false plus a message for a malformed or unsupported stored string -- never an error,
 --        so a corrupt users.json line cannot crash the login path.
+--        *** NOT for the login endpoint: it returns instantly for an unparsable stored string.
+--        Use verifyOrDummy() there -- see TIMING below. ***
+--   pbkdf2.verifyOrDummy(password, stored) -> boolean
+--        Same answer, constant cost: an absent/corrupt `stored` burns a real derivation first.
+--   pbkdf2.dummyStored() -> the stand-in stored string verifyOrDummy() burns against
 --   pbkdf2.params(stored) -> { iterations=, saltLen=, dkLen=, prf='sha256' } | nil, err
 --   pbkdf2.needsRehash(stored [, opts]) -> boolean   (stored below the current cost/param set)
 --
 -- COST.  PANEL.md asks for >= 200,000 iterations and DEFAULT_ITERATIONS is exactly that.  One
--- iteration is two SHA-256 compressions; measured on the two target machines with dkLen = 32:
+-- iteration is two SHA-256 compressions.  Measured 2026-09-06 with dkLen = 32, best of 3 runs,
+-- on the two target machines this repo is developed against -- a desktop Zen-class x86-64 host
+-- (Windows 11) and Debian under WSL2 on the SAME host.  Run-to-run spread is roughly 5-15%, so
+-- treat these as the shape of the curve, not as a contract; test/cryptosuite.lua's
+-- "pbkdf2 / cost" note prints the live figure with sys.os and jit.version on every run, and
+-- that live figure is the one to size a deployment from.
 --
 --     iterations |  Windows (LuaJIT 2.1.1781602682) | Debian/WSL (LuaJIT 2.1.1737090214)
---        100,000 |            124 ms                |            127 ms
---        200,000 |            248 ms                |            252 ms
---        250,000 |            309 ms                |            316 ms
+--        100,000 |            136 ms                |            126 ms
+--        200,000 |            273 ms                |            250 ms
+--        250,000 |            341 ms                |            312 ms
+--        800,000 |           1090 ms                |            994 ms
 --
--- 200k therefore lands just inside the ~300 ms budget on both, with no reduction needed.  It is
--- a per-login cost paid once, on a single-threaded hub, so raising it further trades login
--- latency (and a DoS surface on the login endpoint) for brute-force resistance.  The count is
--- stored inside every hash, so old hashes keep verifying after a change and needsRehash() flags
--- them for upgrade at the next successful login.
+-- 200k is therefore the largest round number inside the ~300 ms budget on both; 250k is already
+-- over it on Windows (341 ms), so do not read the 250k row as headroom.  It is a per-login cost
+-- paid once, on a single-threaded hub, so raising it further trades login latency (and a DoS
+-- surface on the login endpoint) for brute-force resistance.  The count is stored inside every
+-- hash, so old hashes keep verifying after a change and needsRehash() flags them for upgrade at
+-- the next successful login.
+--
+-- MAX_ITERATIONS is deliberately only 4x the default.  parse() accepts the iteration count out
+-- of a *stored string*, and verify() then runs it synchronously with no way to yield (derive()
+-- is a tight loop, not a coroutine).  On PANEL.md's single-threaded hub that is whole-process
+-- stall time: at the old 5,000,000 ceiling one hand-edited or hostile users.json row froze the
+-- hub -- every worker's telemetry and every panel socket -- for ~6.9 s per login attempt.  At
+-- 800,000 the worst case a data file can dictate is ~1.1 s.
+--
+-- The hub must additionally serialise logins behind a queue with a concurrency of 1 and a short
+-- cap on queued attempts, because even the honest 273 ms is uninterruptible.  If a yielding
+-- variant is ever needed, add M.deriveStep(state) that returns after N iterations so the caller
+-- can coroutine.yield between chunks; do not raise MAX_ITERATIONS instead.
+--
+-- TIMING (login-path requirement).  verify() costs ~273 ms for a parsable stored string and
+-- ~0 ms for one it cannot parse.  The natural hub line `pbkdf2.verify(pw, user and user.pwhash
+-- or '')` therefore leaks account existence by response time alone (measured ratio ~550,000x),
+-- which is exactly what per-account rate limiting cannot fix.  The login endpoint MUST call
+-- verifyOrDummy() and MUST NOT branch on account existence before it.
+--
+-- HAZARDS -- Lua-level facts about password material that cannot be fixed here, only worked
+-- around by the operator (lib/hmac.lua and lib/authsecret.lua point at this block):
+--   * Passwords and derived keys are LuaJIT strings.  Every string is INTERNED in a global hash
+--     table, so a password is not merely alive until the next GC: it is reachable from a table
+--     anyone walking a core dump or a swapped-out page can enumerate, and an identical password
+--     submitted later hits the same interned object.
+--   * There is no secure erase.  `s = nil` plus collectgarbage() frees the object without
+--     zeroing it, and the allocator need not return the page to the OS.
+--   * Every step multiplies copies that likewise cannot be scrubbed: hmac.padBlocks builds two
+--     64-byte derivatives of the password, base64.decode builds a table of 3-byte fragments of
+--     the salt and derived key, and `..` in authsecret's macInput copies the plaintext again.
+--   * Therefore a core dump, a swap file or a hibernation image of the hub process must be
+--     treated as containing every password handled since boot.  Disable core dumps for the hub
+--     (RLIMIT_CORE 0 on Linux; no local dump collection on Windows).
+--   * Never pass a password through an environment variable: /proc/PID/environ is readable, and
+--     sys.getEnv reads the same process environment.
+--   * Never call log.hex on, or log any value derived from, a password.  PANEL.md forwards log
+--     lines to every connected panel session as `log` events.
 --
 -- SPEED.  After the first block, the whole derivation is 32-byte-in/32-byte-out HMAC applied to
 -- itself, so the inner loop never touches a Lua string: the two SHA-256 states behind the
@@ -51,7 +100,10 @@ local M = {}
 M.DEFAULT_ITERATIONS = 200000
 M.DEFAULT_SALT_LEN   = 16
 M.DEFAULT_DK_LEN     = 32
-M.MAX_ITERATIONS     = 5000000        -- refuse absurd values parsed out of a stored string
+M.MIN_SALT_LEN       = 8              -- the same floor on the way in AND on the way out
+-- Ceiling on the iteration count parsed out of a STORED string.  Kept at a small multiple of
+-- the default so a data file cannot dictate seconds of synchronous work -- see the COST block.
+M.MAX_ITERATIONS     = 4 * M.DEFAULT_ITERATIONS   -- 800,000, ~1.1 s worst case
 
 local BLOCK_BITLEN = tobit(768)       -- (64 pad block + 32 message bytes) * 8
 local MSB          = tobit(0x80000000)
@@ -137,13 +189,27 @@ function M.hash(password, opts)
   if iterations < 1 or iterations > M.MAX_ITERATIONS then
     error('pbkdf2.hash: iterations out of range', 2)
   end
-  if saltLen < 8 then error('pbkdf2.hash: saltLen must be >= 8', 2) end
+  -- parse() demands integers on the way out; hold hash() to the same standard on the way in,
+  -- so the '%d' below can never record a different number than derive() actually ran.
+  if iterations ~= math.floor(iterations) then
+    error('pbkdf2.hash: iterations must be an integer', 2)
+  end
+  if saltLen ~= math.floor(saltLen) or dkLen ~= math.floor(dkLen) then
+    error('pbkdf2.hash: saltLen and dkLen must be integers', 2)
+  end
 
+  -- ONE length floor for both paths.  An explicit opts.salt used to skip this entirely, so
+  -- hash(pw, {salt=''}) minted an unsalted credential that parse() then refused to verify.
   local salt = opts.salt
   if salt == nil then
+    if saltLen < M.MIN_SALT_LEN then
+      error(sformat('pbkdf2.hash: saltLen must be >= %d', M.MIN_SALT_LEN), 2)
+    end
     salt = require('lib.sys').randomBytes(saltLen)
   elseif type(salt) ~= 'string' then
     error('pbkdf2.hash: salt must be a string', 2)
+  elseif #salt < M.MIN_SALT_LEN then
+    error(sformat('pbkdf2.hash: salt must be at least %d bytes', M.MIN_SALT_LEN), 2)
   end
 
   local dk = M.derive(password, salt, iterations, dkLen)
@@ -166,7 +232,7 @@ local function parse(stored)
   if not salt then return nil, 'bad salt: ' .. tostring(e1) end
   local dk, e2 = base64.decode(hashB64)
   if not dk then return nil, 'bad hash: ' .. tostring(e2) end
-  if #salt < 1 then return nil, 'empty salt' end
+  if #salt < M.MIN_SALT_LEN then return nil, 'salt too short' end
   if #dk < 16 then return nil, 'derived key too short' end
   return salt, dk, n
 end
@@ -185,6 +251,32 @@ function M.verify(password, stored)
   local ok, calc = pcall(M.derive, password, salt, n, #dk)
   if not ok then return false, 'derivation failed' end
   return hmac.equals(calc, dk)
+end
+
+--- The stand-in `stored` string verifyOrDummy() burns a derivation against when the real one is
+--- missing or unparsable.  It is built by string formatting only -- NOT by hashing anything -- so
+--- requiring this module costs nothing, and it deliberately is not the hash of any password: the
+--- comparison must always fail.  The iteration count tracks DEFAULT_ITERATIONS so the burn keeps
+--- costing exactly what a freshly created account's verify costs.
+local DUMMY_SALT = base64.encode('luaclient/pbkdf2/dummy-salt/v1')
+local DUMMY_DK   = base64.encode(('\0'):rep(M.DEFAULT_DK_LEN))
+function M.dummyStored()
+  return sformat('pbkdf2$sha256$%d$%s$%s', M.DEFAULT_ITERATIONS, DUMMY_SALT, DUMMY_DK)
+end
+
+--- Equal-cost verification for the LOGIN PATH.  Use this, never verify(), wherever `stored` may
+--- be absent because the account does not exist: verify() returns in ~0 ms for an unparsable
+--- string and ~273 ms for a real one, which tells an unauthenticated caller which usernames
+--- exist from response time alone.  Callers must not branch on account existence before this.
+--- Returns a bare boolean -- there is no diagnostic, because a diagnostic would leak the same
+--- distinction the burn exists to hide.
+function M.verifyOrDummy(password, stored)
+  if type(password) ~= 'string' then return false end
+  if type(stored) ~= 'string' or not parse(stored) then
+    M.verify(password, M.dummyStored())          -- burn the same time, discard the result
+    return false
+  end
+  return (M.verify(password, stored)) and true or false
 end
 
 --- True when the stored hash was produced with weaker parameters than the current defaults

@@ -178,6 +178,11 @@ function loot.new(ctx)
     self.world   = ctx.world
     self.path    = ctx.path
     self.storage = ctx.storage or {}
+    -- REVIEW FIX: seed the extras WIDGET default (vBot/extras.lua:139 addCheckBox(
+    -- "lootLast", ..., true)) exactly ONCE, so `L:lootLast` can read the key honestly
+    -- instead of hiding a TRUE default behind `~= false`.
+    if type(self.storage.extras) ~= 'table' then self.storage.extras = {} end
+    if self.storage.extras.lootLast == nil then self.storage.extras.lootLast = true end
     self.clientVersion = ctx.clientVersion or 1530
     if not self.state then error('loot.new: client.state is required', 2) end
     if not self.world then error('loot.new: ctx.world is required', 2) end
@@ -231,6 +236,7 @@ function L:_resetRuntime()
     self.status     = ''
     self.lastFood   = 0
     self.lootTries  = {}          -- deviation (2)
+    self.lastCount  = {}          -- containerId -> #items at the previous lootContainer()
     self.openedFromItemId = {}    -- containerId -> the item id we opened it from
     self.isLootContainer  = {}    -- containerId -> true
     self._seq       = 0
@@ -289,10 +295,16 @@ function L:extras()
     return type(e) == 'table' and e or {}
 end
 
---- storage.extras.lootLast defaults to TRUE (looting.lua:121).  With the queue sorted
---- DESCENDING by distance, list[#list] is the NEAREST corpse -- the option label
---- ("Start loot from last corpse") is misleading, the behaviour is not.
-function L:lootLast() return self:extras().lootLast ~= false end
+--- storage.extras.lootLast.  With the queue sorted DESCENDING by distance, list[#list]
+--- is the NEAREST corpse -- the option label ("Start loot from last corpse") is
+--- misleading, the behaviour is not.
+--- REVIEW FIX: the TRUE default lives in the extras WIDGET (vBot/extras.lua:139
+--- `addCheckBox("lootLast", ..., true)`), NOT in looting.lua -- looting.lua:121 just
+--- reads `storage.extras.lootLast`, so an ABSENT key is falsy there and vBot takes
+--- list[1], the FARTHEST corpse.  We keep the widget's default (the user's real storage
+--- has the key set to true) but seed it once, in `loot.new`, so the round trip is honest
+--- instead of hiding behind `~= false`.
+function L:lootLast() return self:extras().lootLast and true or false end
 
 function L:maxRange()  return tonumber(self:extras().looting)   or loot.DEFAULT_MAX_RANGE  end
 function L:lootDelay() return tonumber(self:extras().lootDelay) or loot.DEFAULT_LOOT_DELAY end
@@ -503,6 +515,7 @@ function L:onContainerClose(ct)
     if id == nil then return end
     self.isLootContainer[id]   = nil
     self.openedFromItemId[id]  = nil
+    if self.lastCount then self.lastCount[id] = nil end
     self:clearTriesFor(id)
 end
 
@@ -662,6 +675,18 @@ function L:lootContainer(lootContainers, ct)
     local everyItem = self:everyItem()
     local byId      = self.itemsById
     local items     = ct.items or {}
+    -- REVIEW FIX: vBot keys lootTries on the Item OBJECT (looting.lua:241-246), so every
+    -- distinct item starts at 0.  Our "<containerId>:<slot>:<itemId>" key collapses N
+    -- identical ids onto ONE counter, because removing an item shifts the remaining slots
+    -- down -- five gold-coin stacks all land on slot 1 and the 5th is abandoned after four
+    -- SUCCESSFUL moves.  Item-object identity is exactly "the contents changed", so reset
+    -- this container's counters whenever they did.  An item that genuinely will not move
+    -- leaves #items unchanged and still gets its 5 attempts.
+    self.lastCount = self.lastCount or {}
+    if self.lastCount[ct.id] ~= #items then
+        self:clearTriesFor(ct.id)
+        self.lastCount[ct.id] = #items
+    end
     local food      = self:foodItems()
     local nextContainer, nextSlot = nil, nil
 
@@ -710,6 +735,7 @@ function L:lootContainer(lootContainers, ct)
     self.isLootContainer[ct.id] = nil
     if self.sender then self.sender:closeContainer(ct.id) end
     self.stats.closes = self.stats.closes + 1
+    if self.lastCount then self.lastCount[ct.id] = nil end
     self:clearTriesFor(ct.id)
     self:pop()
 end

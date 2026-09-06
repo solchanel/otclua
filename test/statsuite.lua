@@ -104,6 +104,29 @@ do
     eq(stats.expForLevel(2), 100, 'expForLevel(2) == 100 (vBot expLeft formula)')
     eq(stats.expForLevel(8), 4200, 'expForLevel(8) == 4200')
     eq(stats.expForLevel(9), 6400, 'expForLevel(9) == 6400')
+    -- vBot's form divides by 3 TWICE and the two roundings compound, landing one experience
+    -- point low at 16 of the first 1000 levels.  These four are the earliest.
+    eq(stats.expForLevel(11), 13000, 'expForLevel(11) == 13000 (double rounding gave 12999)')
+    eq(stats.expForLevel(13), 23200, 'expForLevel(13) == 23200 (gave 23199)')
+    eq(stats.expForLevel(17), 57600, 'expForLevel(17) == 57600 (gave 57599)')
+    eq(stats.expForLevel(26), 232500, 'expForLevel(26) == 232500 (gave 232499)')
+    -- and the whole curve is integral: the numerator is always divisible by 3
+    local offBy = 0
+    for L = 1, 5000 do
+        local e = stats.expForLevel(L)
+        if e ~= (50 * L * L * L - 300 * L * L + 850 * L - 600) / 3 then offBy = offBy + 1 end
+    end
+    eq(offBy, 0, 'expForLevel is exact at every level 1..5000, no rounding at all')
+    -- the consequence the engine cares about: at exactly one point short of the next level,
+    -- expToLevel must be 1, not 0.
+    do
+        local e = stats.new{ window = 60000 }
+        e:sessionStart(BASE)
+        e:sampleLevel(BASE, 10, 99)
+        e:sampleExperience(BASE, stats.expForLevel(11) - 1)
+        eq(e:snapshot(BASE).expToLevel, 1,
+           'one exp short of level 11 reports 1 to go, not 0')
+    end
 
     local s = stats.new{ window = 15 * 60 * 1000 }
     s:sessionStart(BASE)
@@ -379,6 +402,30 @@ do
     local fs = f:snapshot(BASE + 600000)
     eq(fs.moneySource, 'balance', 'without cash samples money/h falls back to balance/h')
     eq(fs.moneyPerHour, fs.balancePerHour, '   and equals it exactly')
+
+    -- Once the caller HAS sampled gold, money/h must keep coming from the gold gauge for the
+    -- life of the session.  Gating on the ring's RETAINED length made it swap metric silently
+    -- as soon as both samples aged out of the window -- the headline number then moved by tens
+    -- of thousands of gp/h from nothing but the clock advancing, with no state the caller could
+    -- inspect to know it had happened.
+    local W = 15 * 60 * 1000
+    local g = stats.new{ window = W }
+    g:sessionStart(BASE)
+    g:sampleBalance(BASE, 10000)
+    g:sampleBalance(BASE + 1000, 4000)
+    local early = g:snapshot(BASE + 300000)
+    eq(early.moneySource, 'gold', 'money/h comes from the gold gauge while both samples are in')
+    near(early.moneyPerHour, -72000, 1, '   -6000 gp over 300 s is -72k gp/h')
+    -- now let both samples age past the window; only the baseline survives the trim
+    local late = g:snapshot(BASE + W + 120000)
+    eq(g.goldRing.n, 1, 'the window trim leaves a single retained gold sample')
+    eq(late.moneySource, 'gold', 'money/h STILL comes from the gold gauge after they age out')
+    eq(late.moneyPerHour, 0, '   and reads an honest 0 gp/h: the gauge has not moved since')
+    -- ... and it starts moving again the instant a new sample arrives
+    g:sampleBalance(BASE + W + 120000, 5000)
+    local resumed = g:snapshot(BASE + W + 120000)
+    eq(resumed.moneySource, 'gold', 'a fresh sample keeps the gold source')
+    check(resumed.moneyPerHour > 0, '   and reports the gain', fmt(resumed.moneyPerHour))
 end
 
 --=============================================================================
@@ -465,6 +512,52 @@ do
           'the cost per sample does not grow with history (amortised O(1))',
           ('first 50k %.3f s, second 50k %.3f s'):format(first, second))
     note(('first 50k %.3f s, second 50k %.3f s'):format(first, second))
+
+    -- BOUNDED means the BREAKDOWN TABLES too, not only the rings.  killsByName is keyed by a
+    -- name the remote server chooses and lootItems/wasteItems by ids it sends, so an unbounded
+    -- table is memory a hostile or buggy server controls (measured before the cap: 100k
+    -- distinct names -> 100k entries, +8 MB, at a frozen clock).
+    local function countKeys(t)
+        local n = 0
+        for _ in pairs(t) do n = n + 1 end
+        return n
+    end
+    local CAP = stats.MAX_BREAKDOWN
+    check(type(CAP) == 'number' and CAP > 0, 'stats.MAX_BREAKDOWN is published', CAP)
+    local b = stats.new{ window = 15 * 60 * 1000 }
+    b:sessionStart(BASE)
+    collectgarbage(); collectgarbage()
+    local heap0 = collectgarbage('count')
+    local N = CAP * 5
+    for i = 1, N do b:addKill(BASE, 'monster ' .. i) end
+    for i = 1, N do b:addLoot(BASE, 100000 + i, 1, 1) end
+    for i = 1, N do b:addWaste(BASE, 200000 + i, 1, 1) end
+    collectgarbage(); collectgarbage()
+    local heapKB = collectgarbage('count') - heap0
+    eq(countKeys(b.killsByName), CAP, 'killsByName stops at MAX_BREAKDOWN distinct names')
+    eq(countKeys(b.lootItems), CAP, 'lootItems stops at MAX_BREAKDOWN distinct ids')
+    eq(countKeys(b.wasteItems), CAP, 'wasteItems stops at MAX_BREAKDOWN distinct ids')
+    local bs = b:snapshot(BASE)
+    eq(bs.breakdownTruncated, true, 'the snapshot says the breakdown is partial')
+    -- the HEADLINE totals must stay exact: the cap only refuses NEW keys
+    eq(bs.kills, N, 'every kill is still counted in the total')
+    eq(bs.loot, N, 'every looted item still contributes its value')
+    eq(bs.waste, N, 'every wasted item does too')
+    -- an existing key keeps accumulating past the cap
+    local before = b.killsByName['monster 1']
+    b:addKill(BASE, 'monster 1')
+    eq(b.killsByName['monster 1'], before + 1, 'an EXISTING key still accumulates past the cap')
+    note(('%d distinct keys per breakdown table capped at %d each; heap +%.1f KB')
+         :format(N, CAP, heapKB))
+    check(heapKB < 8000, 'bounded memory: 3 x 5*CAP distinct keys stays well under 8 MB',
+          ('%.1f KB'):format(heapKB))
+
+    -- a wire-supplied creature name cannot be arbitrarily long either
+    local long = stats.new{}
+    long:sessionStart(BASE)
+    long:addKill(BASE, string.rep('A', 5000))
+    local k = next(long.killsByName)
+    check(#k <= 64, 'a 5000-character creature name is clamped to 64 chars', #k)
 end
 
 --=============================================================================
@@ -517,6 +610,41 @@ do
     s:setPrices{ [3035] = 250 }
     s:addLoot(BASE + 2000, 3035, 2)
     eq(s:snapshot(BASE + 2000).loot, 1200, 'setPrices() changes later valuations only')
+
+    -- A NAME-KEYED table is the shape the user's real analyser uses
+    -- (analyzer.lua: LootItems["gold coin"]), and every one of its entries is dropped here.
+    -- Dropping them silently made the whole money model collapse to a confident 0 gp/h with no
+    -- error, no warning and nothing in the snapshot to explain it.
+    local VBOT = { ['gold coin'] = 1, ['platinum coin'] = 100, ['crystal coin'] = 10000 }
+    local kept, skipped
+    _, kept, skipped = stats.prices(VBOT)
+    eq(kept, 0, 'prices(): a name-keyed table keeps nothing')
+    eq(skipped, 3, '   and REPORTS all three drops')
+    local nt, nerr = stats.decodePrices('{ ["gold coin"] = 1, ["platinum coin"] = 100 }')
+    isNil(nt, 'decodePrices refuses a name-keyed table instead of returning an empty one')
+    check(type(nerr) == 'string' and nerr:find('name%-keyed') ~= nil,
+          '   and names the vBot LootItems shape in the message', nerr)
+    local njson, njerr = stats.decodePrices('{"gold coin": 1, "platinum coin": 100}')
+    isNil(njson, '   the JSON spelling is refused too')
+    check(type(njerr) == 'string', '   with a message', njerr)
+    -- an engine configured that way says so in every snapshot
+    local ns = stats.new{ prices = VBOT }
+    ns:sessionStart(BASE)
+    ns:addLoot(BASE + 1000, 3031, 100)
+    local nsnap = ns:snapshot(BASE + 1000)
+    eq(nsnap.pricesLoaded, 0, 'snapshot reports 0 usable price entries')
+    eq(nsnap.pricesSkipped, 3, '   and 3 dropped ones, so the panel can say "prices not loaded"')
+    eq(nsnap.loot, 0, '   which is why loot is 0: nothing has a price')
+    -- a genuinely EMPTY table is not an error, it is just empty
+    local et, en, es = stats.decodePrices('{}')
+    eq(type(et), 'table', 'an empty price table is still accepted')
+    eq(en, 0, '   with zero entries')
+    eq(es, 0, '   and zero drops')
+    -- a mixed table keeps the numeric ids and counts the rest
+    local mt, mn, ms2 = stats.decodePrices('{ [3031] = 1, ["gold coin"] = 1 }')
+    eq(type(mt) == 'table' and mt[3031], 1, 'a mixed table keeps its numeric ids')
+    eq(mn, 1, '   one kept')
+    eq(ms2, 1, '   one skipped')
 end
 
 --=============================================================================

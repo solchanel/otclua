@@ -88,6 +88,13 @@ cavebot.CONFIG_DEFAULTS = {
     antiLostRopeToolId = 3003,
     stayPathEnabled = true, waypointHud = false,
     smoothWalk = false, avoidFloorChange = true, avoidTileIds = '',
+    -- WORK ITEM W.  Not a vBot key; a .cfg may still override it (config blobs are merged
+    -- over these defaults verbatim).  ON means: at most ONE walk packet outstanding, and the
+    -- next one waits for the server's position update OR the computed step duration,
+    -- whichever is later.  vBot can afford its lookahead because it runs inside the C++
+    -- client, where LocalPlayer::canWalk() refuses a second step while a pre-walk is
+    -- outstanding; a headless client has no such gate and out-paces the server without this.
+    strictPacing = true,
 }
 
 -- actions.lua:139-175
@@ -111,6 +118,8 @@ cavebot.STAYPATH_LOOKBACK  = 12      -- cavebot.lua:37-56
 
 cavebot.STAIRS_COLOR_MIN = 210
 cavebot.STAIRS_COLOR_MAX = 213
+
+cavebot.PZ_STATE = 16384             -- PlayerStates.Pz (src/client/const.h:295)
 
 cavebot.LOCKERS_LIST   = { 3497, 3498, 3499, 3500 }
 cavebot.LOCKER_OFFSETS = { [3497] = { 0, -1 }, [3498] = { 1, 0 },
@@ -238,6 +247,8 @@ function cavebot.new(bot, route, opts)
     -- per-action scratch (all vBot file-locals)
     self.noProgress   = 0         -- buy_supplies.lua
     self.sellAllCap   = 0         -- sell_all.lua
+    self.sellAllNoProgress = 0    -- rounds that sold nothing (REVIEW FIX)
+    self.lastRoomMove = 0         -- actions.lua:39 `lastMoved`, the 200 ms throttle
     self.exaniStartZ  = nil       -- route_tools.lua
     self.posCheck     = { value = nil, count = 0 }
     self.stowFallback = {}
@@ -251,6 +262,10 @@ function cavebot.new(bot, route, opts)
     self.walker.onFloorChangeHook = function(_, info) self:_onFloorChange(info) end
     -- bank transfer scrapes the balance out of an NPC talk (bank.lua:87-91)
     self._talkHandle = self:_busOn('talk', function(d) self:onTalk(d) end)
+    -- actions.lua:38-66 -- the unconditional "There is not enough room." anti-stuck hook.
+    -- It is NOT part of the waypoint loop: it fires off the text message alone whenever
+    -- CaveBot is on (REVIEW FIX; docs/vbot/cavebot.md 2.3, last paragraph).
+    self._roomHandle = self:_busOn('textMessage', function(d) self:onNotEnoughRoom(d) end)
 
     -- antilost state (antilost.lua)
     self.al = { recovering = false, mode = nil, fallSpot = nil, tpId = nil,
@@ -460,14 +475,29 @@ function CB:doWalking()
         return wk:_smoothWalking() ~= nil
     end
     if self.cfg.mapClick then return false end
+    -- Resolve the outstanding step against the server's position FIRST.  Before work item W
+    -- this function reported "not walking" whenever the stored lookahead was exhausted even
+    -- though a step was still in flight; CB:tick() then fell through to the action, which
+    -- re-pathed from the STALE position and re-sent the same direction.  That is what put two
+    -- steps on the wire per server beat and made the character overshoot its waypoint.
+    wk:pollConfirm()
     local n = #wk.expected
     if n == 0 then return false end
+    if wk.cfg.strictPacing then
+        -- One step outstanding, full stop.  Holding here (rather than returning false) is
+        -- what stops CB:tick() from re-pathing while the step is unconfirmed.
+        return true
+    end
     if n >= walkermod.MAX_UNCONFIRMED then
         wk:reset()                 -- walkPath is cleared, so the next line finds nil
         return false
     end
     local dir = wk.walkPath[wk.iter]
-    if dir == nil then return false end
+    if dir == nil then
+        wk:_dbg('[walk] CB:doWalking t=%d lookahead exhausted with %d outstanding -> %s',
+                self.now(), n, 'false (tick falls through to the action)')
+        return false
+    end
     local ok, why = wk:step(dir)
     if ok then
         wk.iter = wk.iter + 1
@@ -652,12 +682,13 @@ function CB:gotoFirstPreviousReachableWaypoint()
         local w = (index >= 1) and self.waypoints[index] or nil
         if w and w.action == 'goto' then
             local dest = cavebot.parseGoto(w.value)
+            -- REVIEW FIX: cavebot.lua:439-445 checks ONLY the floor and the halved
+            -- gotoMaxDistance -- there is no findPath there (unlike
+            -- gotoNextWaypointInRange).  The extra reachability test made the anti-lost
+            -- last resort fail in exactly the situation it exists for.
             if dest and dest.z == pp.z and cheb(pp, dest) <= maxDist / 2 then
-                local dirs = self.path:getPath(pp, dest, maxDist, { ignoreNonPathable = true })
-                if dirs then
-                    self.index = index
-                    return true
-                end
+                self.index = index
+                return true
             end
         end
     end
@@ -1478,7 +1509,12 @@ function CB:_actionGoto(value, retries)
         end
         -- 5) FINAL APPROACH: one confirmed step at a time
         if cheb(dest, pp) <= 3 then
-            if self.walker:isWalking() then self:delay(50); return 'retry' end
+            -- REVIEW FIX: CB:tick calls self:resetWalking() before every action callback,
+            -- which empties walker.expected/pending -- so walker:isWalking() was always
+            -- false here and the guard was dead.  The outstanding-step ledger (stepTo /
+            -- lastSendAt) survives that reset, so test THAT instead: it is what makes the
+            -- block's promise ("overshoot becomes impossible") actually hold.
+            if self:_stepInFlight() then self:delay(50); return 'retry' end
             local sp = self.path:getPath(pp, dest, 10,
                                          { ignoreNonPathable = true, precision = 0 })
             if sp and sp[1] then
@@ -1514,6 +1550,10 @@ function CB:_actionGoto(value, retries)
             self.stats.blocked = self.stats.blocked + 1
             return false
         end
+        -- actions.lua:472 `retries = 0 -- reset retries, we are trying to unclog the
+        -- cavebot`.  `retries` is the callback's own parameter, so steps 10/11/13 below
+        -- MUST see 0 or a plain waypoint is skipped while we fight our way through.
+        retries = 0
     end
 
     -- 8) respect fields first
@@ -1579,6 +1619,87 @@ function CB:_attackBlockingMonster(pp, path)
     return false
 end
 
+--- isInPz() -- PlayerStates.Pz (src/client/const.h:295), the same bit bot/targetbot.lua
+--- and bot/healbot.lua read.  REVIEW FIX: CaveBot had no PZ probe at all.
+function CB:isInPz()
+    local pl = self.state.player
+    local s = pl and pl.states
+    if type(s) ~= 'number' then return false end
+    return floor(s / cavebot.PZ_STATE) % 2 == 1
+end
+
+--- Is one of OUR walk packets still unconfirmed?  vBot's guard here is
+--- `player:isWalking() or player:isPreWalking()` (actions.lua:414), which reads the
+--- CLIENT's own walk state.  CB:tick calls resetWalking() before every action callback,
+--- which empties walker.expected/pending AND the step ledger, so `walker:isWalking()` is
+--- unconditionally false by the time the goto callback runs -- the guard was dead code.
+--- `lastSendAt` is the one thing the reset does not touch, so it is what answers this.
+--- REVIEW FIX.
+function CB:_stepInFlight()
+    local wk = self.walker
+    if not wk or not wk.lastSendAt then return false end
+    local ok, timeout = pcall(wk.confirmTimeoutMs, wk, wk.lastStepDir or 0)
+    if not ok or type(timeout) ~= 'number' then timeout = 1000 end
+    return (self.now() - wk.lastSendAt) < timeout
+end
+
+--- getNearTiles(pos) -- vlib.lua:900-915, the 8 neighbours (never the centre).
+function CB:_nearTiles(pos)
+    local out = {}
+    for dir = 0, 7 do
+        local dd = DELTA[dir]
+        local q = { x = pos.x + dd[1], y = pos.y + dd[2], z = pos.z }
+        local t = self.state:tile(q)
+        if t then out[#out + 1] = t end
+    end
+    return out
+end
+
+--- REVIEW FIX: the unconditional "There is not enough room." anti-stuck hook
+--- (actions.lua:38-66).  Independent of the waypoint loop: on that text message, with
+--- CaveBot on, find an adjacent tile with no creature, walkable and more than 9 items;
+--- outside PZ disintegrate its top thing, inside PZ move that thing to another walkable
+--- neighbour, throttled to one move per 200 ms.
+function CB:onNotEnoughRoom(d)
+    local text = type(d) == 'table' and d.text or d
+    if tostring(text or '') ~= 'There is not enough room.' then return false end
+    if not self:isOn() then return false end
+    local pp = self.state.player and self.state.player.pos
+    if not pp then return false end
+    local inPz = self:isInPz()
+    for _, tile in ipairs(self:_nearTiles(pp)) do
+        local things = tile.things or {}
+        local nItems = 0
+        local hasCreature = false
+        for i = 1, #things do
+            if things[i].kind == 'creature' then hasCreature = true
+            else nItems = nItems + 1 end
+        end
+        if not hasCreature and nItems > 9 and self.world:isWalkable(tile, true) then
+            local top = things[#things]
+            if top then
+                if not inPz then
+                    self:_useWithThing(3197, tile.pos, top)      -- disintegrate
+                    return true
+                end
+                if self.now() < (self.lastRoomMove or 0) + 200 then return false end
+                for _, nb in ipairs(self:_nearTiles(tile.pos)) do
+                    if not samePos(nb.pos, pp) and self.world:isWalkable(nb, true) then
+                        self.lastRoomMove = self.now()
+                        if self.sender then
+                            self.sender:move(tile.pos, top.id or 0,
+                                             self:_stackPosOf(tile, top), nb.pos,
+                                             top.count or 1)
+                        end
+                        return true
+                    end
+                end
+            end
+        end
+    end
+    return false
+end
+
 function CB:_firstCreatureOn(tile)
     for i = 1, #(tile.things or {}) do
         local t = tile.things[i]
@@ -1594,15 +1715,22 @@ end
 --- breakFurniture (actions.lua:69-101).  Never in PZ.  OMISSION from the VERIFIER: the
 --- candidate distance starts at 100 and the comparison is strict `<`.
 function CB:breakFurniture(destPos)
+    -- REVIEW FIX: actions.lua:71 `if isInPz() then return false end`.  The doc-comment
+    -- above already promised it; the guard itself was missing.
+    if self:isInPz() then return false end
     local pp = self.state.player and self.state.player.pos
     if not pp then return false end
     local bestDist, best, bestPos = 100, nil, nil
     for _, tile in ipairs(self:tilesOnFloor(pp.z)) do
-        local top = self.world:getTopUseThing(tile)
+        -- REVIEW FIX: actions.lua:73-83 reads the TILE's top thing and the TILE's own
+        -- walkability, not a "top USE thing" and the item's own NOT_WALKABLE flag.
+        local things = tile.things or {}
+        local top = things[#things]
         if top and top.kind == 'item' then
-            local isWall  = (top.id == 2130)
-            local movable = self.world.f.isNotWalkable(top.id)
-                            and not self:_itemFlag('isNotMoveable', top.id, false)
+            local isWall   = (top.id == 2130)
+            local walkable = self.world:isWalkable(tile, true)
+            local movable  = (not walkable)
+                             and not self:_itemFlag('isNotMoveable', top.id, false)
             if (isWall or movable) and top.id ~= 2986 then
                 local d = cheb(destPos, tile.pos)
                 if d < bestDist then
@@ -1743,7 +1871,10 @@ function CB:_actionPosCheck(value)
         return false
     end
     local pp = self.state.player and self.state.player.pos
-    if pp and pp.z == z and cheb(pp, { x = x, y = y, z = z }) <= dist then return true end
+    if pp and pp.z == z and cheb(pp, { x = x, y = y, z = z }) <= dist then
+        self.posCheck.count = 0                 -- pos_check.lua:48, consecutive failures
+        return true
+    end
 
     self.posCheck.count = self.posCheck.count + 1
     if tostring(label):lower() == 'last' then
@@ -1837,21 +1968,25 @@ function CB:_actionClearTile(value, retries)
         return 'retry'
     end
     if creature and creature.isPlayer then
+        -- REVIEW FIX: clear_tile.lua:88 keeps neighbours `d == 1 and tPos ~= pPos`, i.e.
+        -- it refuses to push the player onto the tile the BOT is standing on.  The old
+        -- `not samePos(q, tPos)` was dead code (DELTA never yields (0,0)) and let the bot
+        -- pick its own position, which the server rejects until retries >= 20.
+        local cands = {}
         for dir = 0, 7 do
             local dd = DELTA[dir]
             local q = { x = tPos.x + dd[1], y = tPos.y + dd[2], z = z }
-            if not samePos(q, tPos) then
+            if not samePos(q, pp) then
                 local qt = self.state:tile(q)
-                if qt and self.world:isWalkable(qt, true) then
-                    if self.sender then
-                        self.sender:move(tPos, 0x63, self:_creatureStackPos(tile, creature.id),
-                                         q, 1)
-                    end
-                    return 'retry'
-                end
+                if qt and self.world:isWalkable(qt, true) then cands[#cands + 1] = q end
             end
         end
-        return false
+        if #cands == 0 then return false end
+        local q = cands[math.random(1, #cands)]      -- upstream picks at random too
+        if self.sender then
+            self.sender:move(tPos, 0x63, self:_creatureStackPos(tile, creature.id), q, 1)
+        end
+        return 'retry'
     end
     if doorsFlag and thing then
         if self.sender then self.sender:use(tPos, thing.id or 0, stack or 0, 0) end
@@ -1873,7 +2008,8 @@ function CB:_actionSupplyCheck(value)
     end
 
     -- position guard (only when x,y,z were given)
-    if #d >= 4 then
+    -- supply_check.lua:68 `if #data == 4 then` -- a 5-field value does NOT activate it.
+    if #d == 4 then
         local pos = { x = tonumber(d[2]), y = tonumber(d[3]), z = tonumber(d[4]) }
         if pos.x and pos.y and pos.z then
             if sup.missedChecks >= 4 then
@@ -1882,7 +2018,9 @@ function CB:_actionSupplyCheck(value)
                 return true
             end
             local pp = self.state.player and self.state.player.pos
-            if not pp or pp.z ~= pos.z or cheb(pp, pos) > 10 then
+            -- supply_check.lua:77 is getDistanceBetween(), i.e. Chebyshev over x/y ONLY:
+            -- z is deliberately NOT part of the test.
+            if not pp or cheb(pp, pos) > 10 then
                 sup.missedChecks = sup.missedChecks + 1
                 -- returns the RESULT of gotoLabel: true if the label exists, false otherwise
                 return self:gotoLabel(label)
@@ -1912,6 +2050,7 @@ function CB:_actionBuySupplies(value, retries)
     local npc = self:creatureByName(npcName)
     if not npc then
         self.log.info('[CaveBot] buysupplies: npc %s not found', tostring(npcName))
+        self.noProgress = 0                     -- buy_supplies.lua:43
         return false
     end
     if waitMs then self:setDelay(waitMs) end
@@ -1932,8 +2071,11 @@ function CB:_actionBuySupplies(value, retries)
     end
 
     local offers = self:npcOffers()
+    -- buy_supplies.lua:70-76 builds possibleItems from NPC.getBuyItems(); an unknown or
+    -- empty offer list means `table.find` never hits, so NOTHING is bought and the action
+    -- reports "bought everything, proceeding".  Never issue blind buyItem packets.
     local function sells(id)
-        if offers == nil then return true end       -- no offer list: try every configured id
+        if offers == nil then return false end
         for _, o in ipairs(offers) do
             if (o.id or o.itemId) == id then return true end
         end
@@ -1980,18 +2122,31 @@ function CB:_actionSellAll(value, retries)
 
     local npc = self:creatureByName(npcName)
     if not npc then return false end
-    if retries > 10 then return false end
+    -- REVIEW FIX: upstream's `retries > 10` guarded a handful of round trips because
+    -- modules.game_npctrade.sellAll() emptied the backpacks in ONE call.  We sell one id
+    -- per invocation, so charging every sale to the same budget capped a whole visit at
+    -- ~11 items.  Count rounds that made NO progress instead (as buy_supplies.lua does).
+    if retries == 0 then self.sellAllNoProgress = 0 end
+    if (self.sellAllNoProgress or 0) > 10 or retries > suppliesmod.MAX_ROUNDS then
+        self.sellAllNoProgress = 0
+        return false
+    end
 
     local cap = self.supplies:freeCap()
     if cap == self.sellAllCap then
         self.sellAllCap = 0
+        self.sellAllNoProgress = 0
         return true
     end
-    self:delay(800)                                  -- sell_all.lua:38, unconditional
-    if not self:reachNPC(npcName) then return 'retry' end
+    self:setDelay(800)                               -- sell_all.lua:38, a PLAIN delay()
+    if not self:reachNPC(npcName) then
+        self.sellAllNoProgress = (self.sellAllNoProgress or 0) + 1
+        return 'retry'
+    end
     if not self:npcTradeOpen() then
         self:conversation('hi', 'trade')
-        self:delay(self:talkDelay() * 2)
+        self:setDelay(self:talkDelay() * 2)          -- sell_all.lua:45, a PLAIN delay()
+        self.sellAllNoProgress = (self.sellAllNoProgress or 0) + 1
         return 'retry'
     end
     self.sellAllCap = cap
@@ -2004,12 +2159,14 @@ function CB:_actionSellAll(value, retries)
                     if self.sender then
                         self.sender:sellItem(it.id, 0, it.count or 1, true)
                     end
-                    if withDelay then self:delay(self:talkDelay()) end
+                    if withDelay then self:setDelay(self:talkDelay()) end
+                    self.sellAllNoProgress = 0
                     return 'retry'
                 end
             end
         end
     end
+    self.sellAllNoProgress = (self.sellAllNoProgress or 0) + 1
     return 'retry'
 end
 
@@ -2232,6 +2389,13 @@ function CB:_actionBank(value, retries)
     local kind = tostring(d[1] or ''):lower()
     if #d < 2 or #d > 4 then return false end
     if kind ~= 'withdraw' and kind ~= 'deposit' and kind ~= 'transfer' then return false end
+    -- bank.lua:32-38: a withdraw whose amount is not a number is rejected before anything
+    -- is said to the NPC.
+    if kind == 'withdraw' and not tonumber(d[3]) then
+        self.log.warn('[CaveBot] bank: incorrect amount value, should be a number, is: %s',
+                      tostring(d[3]))
+        return false
+    end
     if retries > 5 then return false end
     local npcName = d[2]
     if not self:creatureByName(npcName) then return false end
@@ -2271,12 +2435,18 @@ end
 
 function CB:_actionTravel(value, retries)
     local d = split(value)
+    -- travel.lua:6-9 -- without a destination CB:conversation would tostring(nil) and the
+    -- character would say the literal "nil" to the NPC on the NPC channel.
+    if #d < 2 or not d[2] or #tostring(d[2]) == 0 then
+        self.log.warn('[CaveBot] incorrect travel value: %s', tostring(value))
+        return false
+    end
     if retries > 5 then return false end
     local npcName, dest = d[1], d[2]
     if not self:creatureByName(npcName) then return false end
     if not self:reachNPC(npcName) then return 'retry' end
     self:conversation('hi', dest, 'yes')
-    self:delay(self:talkDelay() * 3)
+    self:setDelay(self:talkDelay() * 3)              -- travel.lua:29, a PLAIN delay()
     return true
 end
 

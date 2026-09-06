@@ -25,6 +25,12 @@ PROPERTIES (these are the requirements, restated so they can be checked):
     in place, so even a caller that never advances its clock cannot make the
     engine grow without limit.  Under normal use the sliding window evicts long
     before the cap: 15 min at 1 Hz is ~900 retained samples per series.
+    The breakdown tables are bounded too, at `stats.MAX_BREAKDOWN` (4096) keys
+    each: `killsByName` is keyed by a name the REMOTE SERVER chooses, and
+    `lootItems`/`wasteItems` by ids the server sends.  Past the cap no NEW key is
+    created (existing ones keep accumulating, so `kills`, `loot` and `waste` stay
+    exact) and `snapshot().breakdownTruncated` goes true so the panel can say the
+    list is partial.  Creature names are also clamped to 64 characters.
   * HONEST.  A rate is always (value gained) / (time actually measured), never
     an extrapolation from a full-window assumption.  Below `minSpanMs` of
     measured history (default 60 s) a rate is `nil`, not a wild number: 200 gp
@@ -94,7 +100,10 @@ snapshot(ms) -> table
   balance, gold, moneySource ('gold'|'balance'|nil), windowMs, minSpanMs,
   spanMs (the span each windowed rate was measured over), sessionSpanMs,
   lootItems / wasteItems / killsByName (breakdowns), samplesBySeries,
-  samplesDropped, outOfOrder.
+  samplesDropped, outOfOrder, pricesLoaded / pricesSkipped (how many price
+  entries were usable and how many were dropped -- a non-zero pricesSkipped with
+  pricesLoaded == 0 means a name-keyed table was handed in and EVERY item is
+  worth 0), breakdownTruncated.
 
 `lootItems`, `wasteItems` and `killsByName` are the engine's own tables, handed
 out by reference so that snapshot() stays allocation-light: read them, never
@@ -111,6 +120,17 @@ local M = { _version = '1.0.0' }
 local floor, max, min = math.floor, math.max, math.min
 
 local HOUR_MS = 3600000
+
+-- Hard cap on the per-item / per-monster breakdown tables.  The rings are capped by maxSamples,
+-- but these tables were not, and killsByName's key space is chosen by the REMOTE SERVER -- which
+-- makes it the one place a hostile or buggy server could grow a hub worker without limit
+-- (measured: 100k distinct names -> 100k entries, +8 MB).  Once the cap is reached no NEW key is
+-- created; existing keys keep accumulating, so lootTotal/wasteTotal/kills stay exact and only
+-- the breakdown is partial.  snapshot() then sets breakdownTruncated so the panel can say so.
+local MAX_BREAKDOWN = 4096
+M.MAX_BREAKDOWN = MAX_BREAKDOWN
+-- Creature names come off the wire; clamp the key length as well as the key count.
+local MAX_KEY_CHARS = 64
 
 -- ===========================================================================
 -- ring buffer of (t, a[, b]) -- push O(1), drop-front O(1), memory capped
@@ -200,19 +220,25 @@ function M.itemValue(prices, itemId)
 end
 
 -- Normalise any id->value table (JSON gives string keys, hand-written Lua gives
--- number keys) into { [number id] = number value }.  Junk entries are skipped.
+-- number keys) into { [number id] = number value }.
+-- Returns table, kept, skipped.  `skipped` matters: the user's real analyser keys prices by
+-- lowercase item NAME (`LootItems["gold coin"] = 1`), and every one of those entries is dropped
+-- here.  A silent drop turns the whole money model into a confident 0 gp/h, so the count is
+-- reported and decodePrices() refuses a table that produced nothing but drops.
 function M.prices(tbl)
-    local out, n = {}, 0
+    local out, n, skipped = {}, 0, 0
     if type(tbl) == 'table' then
         for k, v in pairs(tbl) do
             local id, val = tonumber(k), tonumber(v)
             if id and val and id > 0 then
                 out[floor(id)] = val
                 n = n + 1
+            else
+                skipped = skipped + 1
             end
         end
     end
-    return out, n
+    return out, n, skipped
 end
 
 -- Decode a price table from text.  Pure: no file access.  Accepts
@@ -228,11 +254,25 @@ function M.decodePrices(text, decodeJson)
             decodeJson = json.decode
         end
     end
+    -- A table that parsed fine but yielded no numeric item id is an ERROR, not an empty price
+    -- list: it is almost always a name-keyed vBot LootItems table, and returning it silently
+    -- makes every item worth 0 with no warning anywhere in the snapshot.
+    local function finish(res)
+        local t, n, skipped = M.prices(res)
+        if n == 0 and skipped > 0 then
+            return nil, ('prices: %d entries but no numeric item ids -- this looks like a ' ..
+                         'name-keyed table (vBot LootItems); map names to item ids first')
+                        :format(skipped)
+        end
+        return t, n, skipped
+    end
+
     if decodeJson then
         local ok, res = pcall(decodeJson, text)
         if ok and type(res) == 'table' then
-            local t, n = M.prices(res)
-            if n > 0 then return t, n end
+            local t, n, skipped = M.prices(res)
+            if n > 0 then return t, n, skipped end
+            if skipped > 0 then return finish(res) end
         end
     end
 
@@ -245,8 +285,7 @@ function M.decodePrices(text, decodeJson)
     if not ok or type(res) ~= 'table' then
         return nil, 'prices: not a table (' .. tostring(res) .. ')'
     end
-    local t, n = M.prices(res)
-    return t, n
+    return finish(res)
 end
 
 -- ===========================================================================
@@ -254,10 +293,16 @@ end
 -- ===========================================================================
 -- expForLevel(L) = experience needed to BE level L.  expForLevel(2) == 100,
 -- expForLevel(8) == 4200.
+-- ONE exact division, not two.  vBot's form divides twice by 3 and the two roundings compound,
+-- landing one experience point below the true integer at 16 of the first 1000 levels (11, 13,
+-- 17, 26, 41, 52, 65, 101, 127, 161, 202, 254, 319, 401, 638, 802) -- enough for the engine to
+-- report expToLevel = 0 and timeToLevelMs = 0 while a point is still owed.  The numerator
+-- 50L^3 - 300L^2 + 850L - 600 is always divisible by 3 and stays exactly representable as a
+-- double well past level 5000; verified against the two-division form at every L in 1..5000.
 function M.expForLevel(level)
     local L = tonumber(level)
     if not L or L < 1 then return nil end
-    return floor((50 * L * L * L) / 3 - 100 * L * L + (850 * L) / 3 - 200)
+    return floor((50 * L * L * L - 300 * L * L + 850 * L - 600) / 3)
 end
 
 -- ===========================================================================
@@ -284,14 +329,18 @@ function M.new(opts)
     if self.minSpanMs < 0 then self.minSpanMs = 0 end
     if self.minSessionMs < 0 then self.minSessionMs = 0 end
     if self.maxSamples < 4 then self.maxSamples = 4 end
-    self.prices = M.prices(opts.prices)
+    self.prices, self.pricesLoaded, self.pricesSkipped = M.prices(opts.prices)
     self:reset()
     return self
 end
 
+--- Returns the normalised table, how many entries were kept and how many were dropped.  A
+--- non-zero `skipped` with a zero `kept` means the caller handed over a name-keyed table (the
+--- vBot LootItems shape) and EVERY item is now worth 0; snapshot() reports it as pricesSkipped
+--- so the panel can say "prices not loaded" instead of a confident 0 gp/h.
 function Engine:setPrices(tbl)
-    self.prices = M.prices(tbl)
-    return self.prices
+    self.prices, self.pricesLoaded, self.pricesSkipped = M.prices(tbl)
+    return self.prices, self.pricesLoaded, self.pricesSkipped
 end
 
 function Engine:itemValue(itemId)
@@ -317,15 +366,23 @@ function Engine:reset()
     self.moneyRing = ringNew(self.maxSamples)
     self.lootTotal, self.wasteTotal = 0, 0
     self.lootItems, self.wasteItems = {}, {}
+    self.lootItemsN, self.wasteItemsN = 0, 0
 
     -- gold on hand: (t, gold) -- a gauge, so the rate may legitimately be < 0
     self.goldRing  = ringNew(self.maxSamples)
     self.gold      = nil
+    -- SESSION-lifetime count of balance samples.  The money/h gate must not look at the ring's
+    -- retained length: the window trim drives that to 1 as soon as the samples age out, which
+    -- silently switched the panel's headline money/h from the gold gauge to loot-minus-waste
+    -- with no new data and nothing the caller could see.
+    self.goldSamples = 0
 
     -- kills: (t, cumulative kills)
     self.killRing  = ringNew(self.maxSamples)
     self.kills     = 0
     self.killsByName = {}
+    self.killsByNameN = 0
+    self.breakdownTruncated = false
     self.deaths    = 0
     self.lastDeathMs = nil
     return self
@@ -408,14 +465,19 @@ function Engine:_pushMoney(ms)
     self.moneyRing:trim(ms, self.windowMs)
 end
 
-local function bump(tbl, id, count, value)
+--- Accumulate into a breakdown table, bounded.  Returns the new entry count and whether a key
+--- had to be dropped.  An EXISTING key always accumulates -- only new keys are refused past the
+--- cap -- so totals derived elsewhere stay exact.
+local function bump(tbl, n, id, count, value)
     local e = tbl[id]
     if e then
         e.count = e.count + count
         e.value = e.value + value
-    else
-        tbl[id] = { count = count, value = value }
+        return n, false
     end
+    if n >= MAX_BREAKDOWN then return n, true end
+    tbl[id] = { count = count, value = value }
+    return n + 1, false
 end
 
 -- addLoot(ms, itemId, count, unitValue)
@@ -430,7 +492,9 @@ function Engine:addLoot(ms, itemId, count, unitValue)
     if not unit then unit = M.itemValue(self.prices, id) end
     local value = n * unit
     self.lootTotal = self.lootTotal + value
-    bump(self.lootItems, id, n, value)
+    local cut
+    self.lootItemsN, cut = bump(self.lootItems, self.lootItemsN, id, n, value)
+    if cut then self.breakdownTruncated = true end
     self:_pushMoney(ms)
     return self
 end
@@ -444,7 +508,9 @@ function Engine:addWaste(ms, itemId, count, unitValue)
     if not unit then unit = M.itemValue(self.prices, id) end
     local value = n * unit
     self.wasteTotal = self.wasteTotal + value
-    bump(self.wasteItems, id, n, value)
+    local cut
+    self.wasteItemsN, cut = bump(self.wasteItems, self.wasteItemsN, id, n, value)
+    if cut then self.breakdownTruncated = true end
     self:_pushMoney(ms)
     return self
 end
@@ -458,6 +524,7 @@ function Engine:sampleBalance(ms, goldOnHand)
     local g = tonumber(goldOnHand)
     if not ms or not g then return self end
     self.gold = g
+    self.goldSamples = self.goldSamples + 1
     self.goldRing:push(ms, g)
     self.goldRing:trim(ms, self.windowMs)
     return self
@@ -469,8 +536,17 @@ function Engine:addKill(ms, monsterName)
     if not ms then return self end
     self.kills = self.kills + 1
     if type(monsterName) == 'string' and monsterName ~= '' then
-        local k = monsterName:lower()
-        self.killsByName[k] = (self.killsByName[k] or 0) + 1
+        -- The name comes off the wire: clamp its LENGTH as well as the number of distinct keys.
+        local k = monsterName:sub(1, MAX_KEY_CHARS):lower()
+        local cur = self.killsByName[k]
+        if cur then
+            self.killsByName[k] = cur + 1
+        elseif self.killsByNameN < MAX_BREAKDOWN then
+            self.killsByName[k] = 1
+            self.killsByNameN = self.killsByNameN + 1
+        else
+            self.breakdownTruncated = true
+        end
     end
     self.killRing:push(ms, self.kills)
     self.killRing:trim(ms, self.windowMs)
@@ -532,6 +608,9 @@ function Engine:snapshot(ms)
         levelsGained = (self.level and self.levelStart) and (self.level - self.levelStart) or 0,
         gold       = self.gold,
         outOfOrder = self.outOfOrder,
+        pricesLoaded  = self.pricesLoaded or 0,
+        pricesSkipped = self.pricesSkipped or 0,
+        breakdownTruncated = self.breakdownTruncated or false,
         sessionMs  = 0,
         samples    = 0,
         spanMs     = {},
@@ -595,7 +674,11 @@ function Engine:snapshot(ms)
     -- money/h: real cash when the caller samples it, else the vBot balance ----
     local gSpan = spanOf(self.goldRing, ms, self.windowMs)
     snap.spanMs.gold = gSpan
-    if self.goldRing.n >= 2 and gSpan then
+    -- Gate on the SESSION-lifetime sample count, not on how many samples the window happens to
+    -- have retained.  With one retained sample the delta is (self.gold - aAt(0)) == 0, i.e. an
+    -- honest 0 gp/h over the measured span, and moneySource stays 'gold' for the life of the
+    -- session instead of silently swapping to the loot-minus-waste metric as the clock advances.
+    if self.goldSamples >= 2 and gSpan then
         local d = self.gold - self.goldRing:aAt(0)
         snap.moneyPerHour = perHour(d, gSpan, self.minSpanMs)
         if snap.moneyPerHour then snap.moneySource = 'gold' end

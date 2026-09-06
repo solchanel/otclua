@@ -85,6 +85,9 @@ walker.SMOOTH_MIN_GAP_MS     = 50
 walker.SMOOTH_MAX_WINDOW     = 3
 walker.STEP_FALLBACK_MS      = 200      -- walking.lua:217-223
 walker.SERVER_BEAT_MS        = 50       -- game.h:533
+walker.CAMERA_PAD_MS         = 10       -- creature.cpp:1146-1150 (isCameraFollowing padding)
+walker.CONFIRM_GRACE_MS      = 100      -- localplayer.cpp:148-155 prewalk invalidation
+walker.CONFIRM_MAX_MS        = 1000     -- walk.lua:80-149 dropped-confirmation fallback
 -- antilost.lua:5-11,149-151,303
 walker.GIVE_UP_ATTEMPTS      = 200
 walker.RETRY_DELAY           = 200
@@ -101,6 +104,13 @@ local CFG_DEFAULTS = {
     walkDelay = 10, ping = 100, mapClick = false, mapClickDelay = 100, useDelay = 400,
     smoothWalk = false, avoidFloorChange = true, avoidTileIds = '',
     skipBlocked = false, ignoreFields = false, wptDistance = 5,
+    -- work item W.  FALSE here keeps the module's default identical to vBot's documented
+    -- single-step lookahead (which is what docs/vbot/cavebot.md 3.2 and test/bot_f2_path.lua
+    -- describe).  bot/cavebot.lua turns it ON for every real route, because vBot's lookahead
+    -- is only safe inside the C++ client, where LocalPlayer::canWalk() is a SECOND gate that
+    -- refuses a step while a pre-walk is outstanding.  A headless client has no such gate:
+    -- the walker IS the gate, so it must hold at one outstanding step.
+    strictPacing = false,
 }
 walker.CONFIG_DEFAULTS = CFG_DEFAULTS
 
@@ -152,7 +162,7 @@ function walker.new(client, opts)
     self.floorChangesSinceReset = 0
     self.handles = nil
     self.stats = { sent = 0, confirmed = 0, refused = 0, cancels = 0, repaths = 0,
-                   voids = 0, floorChanges = 0 }
+                   voids = 0, floorChanges = 0, lost = 0, resyncs = 0 }
     return self
 end
 
@@ -222,6 +232,23 @@ function W:pingMs()
 end
 
 -- ---------------------------------------------------------------------------
+-- WALK TRACING (work item W).  Everything here is behind the client's `debug` level, so a
+-- normal run pays one table lookup per step.  `--log-level=debug --log-file=PATH` produces
+-- the packet-interval evidence the live-findings report quotes.
+-- ---------------------------------------------------------------------------
+function W:_dbg(fmt, ...)
+    local lg = self.log
+    if not (lg and lg.debug) then return end
+    lg.debug(fmt, ...)
+end
+
+local function posStr(p)
+    if not p then return 'nil' end
+    return string.format('%d,%d,%d', p.x or -1, p.y or -1, p.z or -1)
+end
+walker.posStr = posStr
+
+-- ---------------------------------------------------------------------------
 -- Creature::getStepDuration (creature.cpp:1106-1160) reduced for a headless local player.
 -- ---------------------------------------------------------------------------
 function W:groundSpeedTowards(dir)
@@ -236,9 +263,57 @@ function W:groundSpeedTowards(dir)
     return s
 end
 
+-- The local player's movement speed.  `state.player.speed` is what the offline fixtures set;
+-- LIVE the wire only ever carries the speed on the local player's CREATURE record (0x8F
+-- CreatureSpeed and the creature block of every map description, proto/parser.lua:525/1665),
+-- and nothing mirrors it onto state.player -- so before work item W `state.player.speed` was
+-- 0 for the whole session and every step was timed with the 200 ms fallback.  Resolve both.
+-- Returns speed, source ('player' | 'creature' | nil).
+function W:playerSpeed()
+    local st = self.state
+    local pl = st.player
+    local s = pl and pl.speed
+    if type(s) == 'number' and s > 0 then return s, 'player' end
+    local id = pl and pl.id
+    local c = (id and id ~= 0 and st.creatures) and st.creatures[id] or nil
+    s = c and c.speed
+    if type(s) == 'number' and s > 0 then return s, 'creature' end
+    return nil, nil
+end
+
+-- GameNewSpeedLaw: Creature::hasSpeedFormula() is `feature on AND speedA,B,C all non-zero`
+-- (creature.cpp:1103).  The three doubles arrive in 0x17 LoginSuccess; main.lua copies them
+-- onto the state.  Returns nil when the formula does not apply.
+function W:speedFormula()
+    local st = self.state
+    local a, b, c = st.speedA, st.speedB, st.speedC
+    if type(a) ~= 'number' or type(b) ~= 'number' or type(c) ~= 'number' then return nil end
+    if a == 0 or b == 0 or c == 0 then return nil end
+    return a, b, c
+end
+
+-- Creature::setSpeed's m_calculatedStepSpeed (creature.cpp:964-971).  This is the divisor
+-- getStepDuration uses whenever hasSpeedFormula(); the RAW wire speed is not.  On Gunzodus
+-- (A=1550.36 B=500 C=-9720.01, speed 129) it is 271, giving a 400 ms step -- exactly the
+-- cadence the server was measured to grant.  Dividing by the raw 129 would give 800 ms.
+-- Returns divisor, source ('player'|'creature'), usedFormula.
+function W:stepSpeed()
+    local speed, src = self:playerSpeed()
+    if not speed then return nil end
+    local a, b, c = self:speedFormula()
+    if not a then return speed, src, false end
+    local s = speed * 2
+    if not (s > -b) then return 1, src, true end        -- creature.cpp:967 `speed > -speedB`
+    local arg = s / 2 + b
+    if arg <= 0 then return 1, src, true end            -- log() would not be finite
+    local calc = floor(a * math.log(arg) + c + 0.5)
+    if calc < 1 then calc = 1 end
+    return calc, src, true
+end
+
 function W:stepDuration(dir)
     local st = self.state
-    local speed = st.player and st.player.speed
+    local speed = self:stepSpeed()
     if type(speed) ~= 'number' or speed <= 0 then return walker.STEP_FALLBACK_MS end
     local groundSpeed = self:groundSpeedTowards(dir) or 150
     local beat = st.serverBeat or walker.SERVER_BEAT_MS
@@ -252,6 +327,29 @@ function W:stepDuration(dir)
     ms = ms - 10
     if ms < 1 then ms = 1 end
     return ms
+end
+
+--- The interval a HEADLESS client must actually leave between two walk packets.
+---
+--- `stepDuration` reproduces what vBot's `player:getStepDuration(false, dir)` returns, which
+--- already carries this fork's unconditional `-10 ms` (creature.cpp:1155-1157).  What it does
+--- NOT carry is the other half of the same patch: `duration += 10 * max(1, preWalkingSize)`,
+--- applied when `isCameraFollowing() && isLocalPlayer()` (creature.cpp:1146-1150).  In the C++
+--- client the local player always satisfies both, so for ONE outstanding pre-walk the +10 and
+--- the -10 cancel and the real gate is the un-corrected duration.  A headless client is the
+--- local player by definition, so it must apply the padding too -- otherwise every step is
+--- issued 10 ms early and the error accumulates.
+function W:paceDuration(dir)
+    local d = self:stepDuration(dir)
+    local outstanding = #self.expected + #self.pending
+    return d + walker.CAMERA_PAD_MS * max(1, outstanding)
+end
+
+--- How long to wait for the server to confirm one step before declaring it lost.
+--- localplayer.cpp:148-155 arms the prewalk invalidation at min(max(step, ping) + 100, 1000).
+function W:confirmTimeoutMs(dir)
+    return min(max(self:stepDuration(dir), self:pingMs()) + walker.CONFIRM_GRACE_MS,
+               walker.CONFIRM_MAX_MS)
 end
 
 -- ---------------------------------------------------------------------------
@@ -268,8 +366,25 @@ function W:reset(quiet)
     self.pending     = {}
     self.pendingAuto = false
     self.smoothDest  = nil
+    self.stepFrom    = nil                       -- work item W: the outstanding step record
+    self.stepTo      = nil
     if not quiet then self.stats.repaths = self.stats.repaths + 1 end
     return self
+end
+
+--- Work item W, requirement 4.  Drop every prediction and take the server's position as the
+--- truth.  There is no client-side pre-walk in this fork of the state (state.player.pos is
+--- only ever written from the wire), so "resync" means: forget the in-flight ledger and the
+--- stored plan, so the next re-path starts from state.player.pos rather than from
+--- projectedPos().  Recorded on `serverPos` so callers/tests can see what we snapped to.
+function W:resyncToServer(why)
+    local pp = self.state.player and self.state.player.pos
+    self.serverPos = pp and { x = pp.x, y = pp.y, z = pp.z } or nil
+    self:reset(true)
+    self.lastResync = { at = self.now(), why = why, pos = self.serverPos }
+    self.stats.resyncs = (self.stats.resyncs or 0) + 1
+    self:_dbg('[walk] RESYNC t=%d why=%s -> %s', self.now(), tostring(why), posStr(self.serverPos))
+    return self.serverPos
 end
 W.resetWalking = W.reset
 
@@ -321,11 +436,98 @@ function W:step(dir)
     self.refusals = 0
     self.stats.sent = self.stats.sent + 1
     local t = self.now()
+    local prevSend = self.lastSendAt
+    -- The confirmation record (work item W).  positionChange is NOT emitted for every server
+    -- move -- game/state.lua:moveCreature mirrors the local player's position silently and
+    -- proto/parser.lua:setCentral then finds old == new and stays quiet -- so the ledger must
+    -- also be resolvable by POLLING state.player.pos against where we stood when we sent.
+    local pp0 = self.state.player and self.state.player.pos
+    local d0  = DELTA[dir]
+    self.stepFrom = pp0 and { x = pp0.x, y = pp0.y, z = pp0.z } or nil
+    self.stepTo   = (pp0 and d0) and { x = pp0.x + d0[1], y = pp0.y + d0[2], z = pp0.z } or nil
     self.expected[#self.expected + 1] = dir
     self.lastSendAt  = t
+    -- Legacy (vBot-faithful) mode paces on `stepDuration` verbatim, which is what
+    -- docs/vbot/cavebot.md 3.2 and test/bot_f2_path.lua pin.  Strict mode adds the
+    -- camera-following padding the C++ local player always gets (see W:paceDuration).
+    --
+    -- REVIEW FIX: this MUST be computed while `lastStepDir` still holds the PREVIOUS
+    -- step's direction.  docs/vbot/cavebot.md's VERIFIER (creature.cpp:1155 + creature.h:264)
+    -- says the diagonal x3 multiplier is selected by the creature's LAST step direction,
+    -- and `dir` only chooses which tile's ground speed is read.  Assigning lastStepDir
+    -- first made the multiplier follow `dir`, defeating the whole `local ref` block in
+    -- W:stepDuration.
+    local dur = self.cfg.strictPacing and self:paceDuration(dir) or self:stepDuration(dir)
     self.lastStepDir = dir
-    self:delay((self.cfg.walkDelay or 0) + self:stepDuration(dir))
+    self:delay((self.cfg.walkDelay or 0) + dur)
+
+    -- ---- walk trace (work item W) -------------------------------------------------
+    if self.log and self.log.debug then
+        local st = self.state
+        local pp = st.player and st.player.pos
+        local d  = DELTA[dir]
+        local pred = pp and { x = pp.x + d[1], y = pp.y + d[2], z = pp.z } or nil
+        local rawSpeed = st.player and st.player.speed
+        local resolved, src = self:playerSpeed()
+        self:_dbg('[walk] SEND t=%d dir=%d from=%s pred=%s dur=%d gap=%s '
+                  .. '| speed=%s(raw=%s src=%s) ground=%s beat=%s lastDir=%s '
+                  .. '| outstanding=%d(expected=%d pending=%d) readyIn=%d ping=%s',
+                  t, dir, posStr(pp), posStr(pred), dur,
+                  prevSend and tostring(t - prevSend) or 'first',
+                  tostring(resolved), tostring(rawSpeed), tostring(src),
+                  tostring(self:groundSpeedTowards(dir)),
+                  tostring(st.serverBeat), tostring(self.lastStepDirBefore),
+                  #self.expected + #self.pending, #self.expected, #self.pending,
+                  max(0, floor(self.readyAt - t)), tostring(self:pingMs()))
+    end
+    self.lastStepDirBefore = dir
     return true
+end
+
+-- ---------------------------------------------------------------------------
+-- confirmation polling (work item W)
+-- ---------------------------------------------------------------------------
+--- Resolve the outstanding step against state.player.pos.  This is the load-bearing half of
+--- the confirmation: `positionChange` fires for only SOME server moves (see W:step), so a
+--- pacer that waits on the event alone stalls, and one that does not wait at all floods.
+---
+--- Returns 'idle' | 'pending' | 'confirmed' | 'void' | 'lost'.
+function W:pollConfirm()
+    if #self.expected == 0 then return 'idle' end
+    local from = self.stepFrom
+    local pp = self.state.player and self.state.player.pos
+    if not (from and pp) then return 'pending' end
+
+    if pp.x == from.x and pp.y == from.y and pp.z == from.z then
+        -- still standing where we were when the packet went out
+        local sentAt = self.lastSendAt or 0
+        local dir = self.expected[1]
+        if self.now() - sentAt >= self:confirmTimeoutMs(dir) then
+            self.stats.lost = (self.stats.lost or 0) + 1
+            self:_dbg('[walk] LOST t=%d dir=%s waited=%d from=%s -- dropping the step',
+                      self.now(), tostring(dir), floor(self.now() - sentAt), posStr(from))
+            self:resyncToServer('confirm-timeout')
+            return 'lost'
+        end
+        return 'pending'
+    end
+
+    local to = self.stepTo
+    if to and pp.x == to.x and pp.y == to.y and pp.z == to.z then
+        table.remove(self.expected, 1)
+        self.stats.confirmed = self.stats.confirmed + 1
+        self.lastConfirmAt = self.now()
+        self.stepFrom, self.stepTo = nil, nil
+        if #self.expected == 0 then return 'confirmed' end
+        return 'confirmed'
+    end
+
+    -- We moved, but not to the tile we predicted: a push, a teleport, a floor change, or the
+    -- server executing more steps than we believe are outstanding.  Never keep walking from a
+    -- prediction that has already been proven wrong.
+    self.stats.voids = self.stats.voids + 1
+    self:resyncToServer('unexpected-move')
+    return 'void'
 end
 
 -- CaveBot.doWalking (walking.lua:307-333): at most ONE send per call, and only while a
@@ -333,8 +535,13 @@ end
 -- otherwise 'walking' or 'blocked'.
 function W:_doWalking()
     if self.cfg.mapClick then return nil end
+    self:pollConfirm()
     local n = #self.expected
     if n == 0 then return nil end
+    -- STRICT PACING (work item W): exactly one step may be outstanding.  Hold until
+    -- pollConfirm() resolves it -- the server's position update -- or until the paced delay
+    -- expires, whichever is LATER (the delay is already armed by W:step).
+    if self.cfg.strictPacing then return 'walking' end
     if n >= walker.MAX_UNCONFIRMED then
         self:reset()                                     -- drop the plan, the caller re-paths
         return nil
@@ -530,6 +737,8 @@ function W:onPositionChange(data)
     local oldPos = data and (data.oldPos or data.old)
     if not newPos then return end
     local now = self.now()
+    local prevMoveAt = self.lastMoveAt
+    self.lastMoveAt = now
 
     local dir = INVALID_DIR
     if oldPos and newPos.z == oldPos.z then
@@ -538,6 +747,18 @@ function W:onPositionChange(data)
             local row = DIR[dx]
             dir = (row and row[dy]) or INVALID_DIR
         end
+    end
+
+    if self.log and self.log.debug then
+        self:_dbg('[walk] MOVE t=%d %s -> %s dir=%s sinceSend=%s sinceMove=%s '
+                  .. '| outstanding=%d(expected=%s pending=%d) match=%s',
+                  now, posStr(oldPos), posStr(newPos),
+                  dir == INVALID_DIR and 'INVALID' or tostring(dir),
+                  self.lastSendAt and tostring(now - self.lastSendAt) or 'n/a',
+                  prevMoveAt and tostring(now - prevMoveAt) or 'first',
+                  #self.expected + #self.pending,
+                  tostring(self.expected[1]), #self.pending,
+                  tostring(self.expected[1] ~= nil and self.expected[1] == dir))
     end
 
     if #self.pending > 0 then
@@ -554,10 +775,16 @@ function W:onPositionChange(data)
         end
     end
 
-    if self.expected[1] ~= nil and self.expected[1] == dir then
+    if self.cfg.strictPacing then
+        -- Strict mode judges the step by WHERE WE ENDED UP, not by the direction of the last
+        -- observed delta.  A move in the right direction that lands on the wrong tile is not
+        -- a confirmation -- it is a desync, and the answer is to resync and re-path.
+        self:pollConfirm()
+    elseif self.expected[1] ~= nil and self.expected[1] == dir then
         table.remove(self.expected, 1)
         self.lastConfirmAt = now
         self.stats.confirmed = self.stats.confirmed + 1
+        if #self.expected == 0 then self.stepFrom, self.stepTo = nil, nil end
     end
 
     if oldPos and newPos.z ~= oldPos.z then
@@ -569,8 +796,17 @@ end
 -- 200 ms (localplayer.cpp:178-183; the spec body's 300/700/1200 ladder is wrong -- VERIFIER).
 function W:onWalkCancel(data)
     self.stats.cancels = self.stats.cancels + 1
-    self.lastCancel = { direction = data and data.direction, at = self.now() }
-    self:reset()
+    local now = self.now()
+    self:_dbg('[walk] CANCEL t=%d dir=%s serverPos=%s outstanding=%d sinceSend=%s',
+              now, tostring(data and data.direction),
+              posStr(self.state.player and self.state.player.pos),
+              #self.expected + #self.pending,
+              self.lastSendAt and tostring(now - self.lastSendAt) or 'n/a')
+    self.lastCancel = { direction = data and data.direction, at = now }
+    -- Requirement 4: drop the outstanding step and continue from the SERVER's position, not
+    -- from the tile we predicted; then back off the flat 200 ms.
+    self:resyncToServer('walk-cancel')
+    self.stats.repaths = self.stats.repaths + 1
     self:delay(walker.WALK_CANCEL_RETRY_MS)
     self.lastReason = 'walk-cancel'
     if self.onWalkCancelHook then pcall(self.onWalkCancelHook, self, data) end
@@ -656,6 +892,9 @@ function W:status()
         planIndex   = self.iter,
         readyIn     = max(0, floor(self.readyAt - self.now())),
         refusals    = self.refusals,
+        strictPacing = self.cfg.strictPacing and true or false,
+        stepFrom    = self.stepFrom,
+        stepTo      = self.stepTo,
         lastReason  = self.lastReason,
         lastStepDir = self.lastStepDir,
         lastFloorChange = self.lastFloorChange,

@@ -18,6 +18,11 @@
 -- Verified against RFC 4231 test cases 1-7 and cross-checked against Python's hmac module -- see
 -- test/cryptosuite.lua.  Cases 1-7 cover keys shorter than, equal to and longer than the 64-byte
 -- block (cases 6 and 7 use a 131-byte key, which forces the hash-the-key path).
+--
+-- HAZARD.  When `key` is a user password (the pbkdf2 path), padBlocks below builds TWO 64-byte
+-- derivatives of it as ordinary Lua strings -- interned, immutable, never wiped, and impossible
+-- to scrub.  Read the HAZARDS block at the top of lib/pbkdf2.lua before logging, dumping or
+-- core-dumping anything that has been near this module.
 
 local sha2 = require('lib.sha2')
 local bit  = require('bit')

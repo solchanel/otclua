@@ -5,3 +5,4 @@ capture-*
 scratch/
 scratch-profile/
 live-*.log
+test/.tmp/

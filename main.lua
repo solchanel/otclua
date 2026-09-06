@@ -64,6 +64,8 @@ Runtime
   --log-file=PATH          append every log line to PATH as well
   --capture=PATH           append every inbound payload as a .cam '<' record
   --ping=MS                keepalive interval in ms             (default: 10000)
+  --exit-after=SECONDS     disconnect cleanly and exit 0 after N seconds in game
+                           (live testing: bounds a run without killing the socket)
 
 Bot layer (vBot 4.8 behaviour: HealBot, AttackBot, CaveBot, TargetBot)
   --bot                    enable the bot layer once the game has started
@@ -74,6 +76,10 @@ Bot layer (vBot 4.8 behaviour: HealBot, AttackBot, CaveBot, TargetBot)
   --cavebot=NAME           cavebot_configs/<NAME>.cfg -- selects it AND enables CaveBot
   --targetbot=NAME         targetbot_configs/<NAME>.json -- selects it AND enables it
   --bot-status-interval=MS one-line bot status at info level (default 5000, 0 = off)
+  --minimap=PATH           OTMM minimap to use as the pathfinder's knowledge of the
+                           world outside the aware area.  Defaults to the reference
+                           client's profiles/minimap.otmm when that file exists.
+                           Read-only, never written.  --minimap=off disables it.
 
 Modes
   --dry-run                offline: no sockets, no HTTPS; exercises the whole
@@ -117,9 +123,10 @@ local function parseArgs(argv)
         or name == 'character' or name == 'world' or name == 'host'
         or name == 'assets' or name == 'log-level' or name == 'log-file'
         or name == 'capture' or name == 'port' or name == 'ping'
+        or name == 'exit-after'
         or name == 'content-revision' or name == 'replay' or name == 'login-url'
         or name == 'bot-profile' or name == 'bot-vprofile' or name == 'cavebot'
-        or name == 'targetbot' or name == 'bot-status-interval'
+        or name == 'targetbot' or name == 'bot-status-interval' or name == 'minimap'
         or name == 'session-key' then
             v, err = valueOf(name, inline)
             if not v then return nil, err end
@@ -144,6 +151,7 @@ local function parseArgs(argv)
         elseif name == 'login-url' then cfg.loginUrl = v
         elseif name == 'session-key' then cfg.sessionKey = v
         elseif name == 'ping'      then cfg.pingMs = tonumber(v) or 10000
+        elseif name == 'exit-after' then cfg.exitAfter = tonumber(v)
         elseif name == 'replay'    then cfg.replay = v
         elseif name == 'dry-run'   then cfg.dryRun = true
         elseif name == 'bot'       then cfg.bot = true
@@ -152,6 +160,7 @@ local function parseArgs(argv)
         elseif name == 'cavebot'   then cfg.cavebot = v; cfg.bot = true
         elseif name == 'targetbot' then cfg.targetbot = v; cfg.bot = true
         elseif name == 'bot-status-interval' then cfg.botStatusMs = tonumber(v)
+        elseif name == 'minimap'   then cfg.minimap = v
         elseif name == 'selftest'  then cfg.selftest = true
         elseif name == 'help'      then cfg.help = true
         else return nil, ('unknown flag --%s (try --help)'):format(name)
@@ -185,6 +194,7 @@ local LC = {
     sender    = nil,
     config    = nil,
     dir       = SCRIPT_DIR,
+    minimap   = nil,          -- lib/minimap.lua instance (work item M), or nil
     exitCode  = 0,
 }
 _G.LC = LC
@@ -197,6 +207,14 @@ local function shutdown(code)
     LC.exitCode = code or LC.exitCode or 0
     if LC.stopBot then pcall(LC.stopBot) end   -- saves the bot storage
     if LC.pingTimer then pcall(sched.cancel, LC.pingTimer); LC.pingTimer = nil end
+    -- Ask the server to end the session (0x14 LeaveGame) before dropping the socket.  A bare
+    -- TCP close leaves the character "online" for the server's logout timeout, and the NEXT
+    -- login on the same account is then answered with `session ended (reason 0)` -- which is
+    -- exactly the failure the walk-pacing work item kept having to disambiguate from a real
+    -- kick.  Best effort: it is fine for this to be refused (in combat, etc.).
+    if LC.inGame and LC.sender and LC.transport and not LC.transport.dead then
+        pcall(function() LC.sender:logout() end)
+    end
     if LC.transport then pcall(function() LC.transport:close() end) end
     if LC.captureFile then pcall(function() LC.captureFile:close() end); LC.captureFile = nil end
     pcall(sched.stop)
@@ -277,7 +295,7 @@ local function botStatusLine()
         local t = tb.target
         parts[#parts + 1] = ('target %s%s  danger %s'):format(
             t and tostring(t.name) or 'none',
-            (t and t.hpPercent) and (' (' .. tostring(t.hpPercent) .. '%%)') or '',
+            (t and t.hpPercent) and (' (' .. tostring(t.hpPercent) .. '%)') or '',
             tostring(tb.danger or 0))
     end
 
@@ -290,6 +308,57 @@ local function botStatusLine()
     log.info('bot: %s', table.concat(parts, ' | '))
 end
 
+-- ====================================================== persisted minimap
+-- Work item M: the pathfinder's knowledge of the world OUTSIDE the aware area.  The client
+-- only knows tiles the server has described, so a cavebot waypoint more than a screen away
+-- has no path at all (docs/live-findings.md, bug 3).  `Map::findEveryPath` solves that by
+-- consulting the persisted minimap for every neighbour outside the aware range, and
+-- lib/minimap.lua is the reader for exactly that file.  READ-ONLY: it is slurped and closed,
+-- never held open (the reference client publishes with an atomic rename, which any open
+-- handle would break).
+local function loadMinimap(cfg)
+    if cfg.minimap == 'off' or cfg.minimap == 'none' or cfg.minimap == '' then
+        log.info('minimap: disabled (--minimap=%s); the pathfinder sees only the aware area',
+                 tostring(cfg.minimap))
+        return nil
+    end
+
+    local okmod, minimap = pcall(require, 'lib.minimap')
+    if not okmod then
+        log.warn('minimap: lib/minimap.lua is unavailable (%s)', tostring(minimap))
+        return nil
+    end
+
+    local file = cfg.minimap
+    if not file then
+        file = minimap.findDefault(SCRIPT_DIR)
+        if not file then
+            log.info('minimap: no minimap.otmm found; the pathfinder sees only the aware area')
+            return nil
+        end
+    end
+
+    local mm, err = minimap.load(file)
+    if not mm then
+        -- never fatal: a missing or damaged minimap only costs long-distance pathing
+        log.warn('%s', tostring(err))
+        return nil
+    end
+
+    local st = mm:stats()
+    local floors = {}
+    for z = 0, minimap.MAP_MAX_Z do
+        if st.floors[z] then floors[#floors + 1] = ('%d:%d'):format(z, st.floors[z]) end
+    end
+    log.info('minimap: %s -- %d blocks loaded (%d tile slots) from %d bytes in %.0f ms%s '
+             .. '| blocks per floor %s',
+             file, st.blocks, st.tiles, st.fileSize, st.loadMs,
+             st.damaged and (', DAMAGED: %d unusable, %d resync(s), %d salvaged')
+                            :format(st.blocksDamaged, st.resyncs, st.blocksSalvaged) or '',
+             table.concat(floors, ' '))
+    return mm
+end
+
 local function startBot(cfg)
     if not cfg.bot or LC.bot then return end
     local okmod, botmod = pcall(require, 'bot.init')
@@ -298,9 +367,14 @@ local function startBot(cfg)
         return
     end
     local dir = cfg.botProfile or defaultBotProfile()
+    if LC.minimap == nil and not cfg._minimapTried then
+        cfg._minimapTried = true
+        LC.minimap = loadMinimap(cfg)
+    end
     local okb, b = pcall(botmod.new, LC, {
         profileDir = dir,
         vprofile   = cfg.botVProfile or 1,
+        known      = LC.minimap,
         cavebot    = cfg.cavebot,
         targetbot  = cfg.targetbot,
         -- --dry-run must never write into the user's real vBot profile.
@@ -311,12 +385,16 @@ local function startBot(cfg)
         return
     end
     LC.bot = b
+    b.inGame = true                          -- the HealBot / AttackBot death+offline gate
     log.info('bot: profile %s (vprofile %d)%s%s', dir, cfg.botVProfile or 1,
              cfg.cavebot and (', cavebot ' .. cfg.cavebot) or '',
              cfg.targetbot and (', targetbot ' .. cfg.targetbot) or '')
     b:wireModules{
         cavebot   = cfg.cavebot,
         targetbot = cfg.targetbot,
+        -- bot/init.lua hands this to world.new as `opts.known`: the pathfinder's knowledge of
+        -- everything outside the aware area (bot/world.lua:classifyForPath).
+        known     = LC.minimap,
         enableCavebot   = cfg.cavebot   and true or nil,
         enableTargetbot = cfg.targetbot and true or nil,
     }
@@ -332,11 +410,13 @@ end
 local function stopBot()
     local b = LC.bot
     if not b then return end
+    b.inGame = false
     if LC.botStatusTimer then pcall(sched.cancel, LC.botStatusTimer); LC.botStatusTimer = nil end
     pcall(function() b:unwireModules() end)
     pcall(function() b:stop() end)          -- stop() saves storage
     LC.bot = nil
 end
+LC.loadMinimap = function() return loadMinimap(LC.config or {}) end
 LC.stopBot  = stopBot
 LC.startBot = function() return startBot(LC.config or {}) end
 
@@ -442,6 +522,16 @@ local function buildGame(cfg, t)
     end
     events.on('gameStart', function() armPing('game started') end)
     events.on('login', function(d)
+        -- 0x17 LoginSuccess carries serverBeat + the GameNewSpeedLaw constants.  The parser
+        -- keeps them on itself; the walker's step timing needs them on the STATE, because
+        -- Creature::getStepDuration divides by m_calculatedStepSpeed (derived from A/B/C)
+        -- rather than by the raw wire speed whenever all three are non-zero.
+        if LC.state and d then
+            LC.state.speedA, LC.state.speedB, LC.state.speedC = d.speedA, d.speedB, d.speedC
+        end
+        log.debug('[walk] login serverBeat=%s speedA=%s speedB=%s speedC=%s',
+                  tostring(d and d.serverBeat), tostring(d and d.speedA),
+                  tostring(d and d.speedB), tostring(d and d.speedC))
         armPing(('login success (player id %s)'):format(tostring(d and d.playerId)))
     end)
 
@@ -696,6 +786,16 @@ local function runLive(cfg)
 
     local ok, cerr = t:connect()
     if not ok then return 3, ('connect failed: %s'):format(tostring(cerr)) end
+
+    -- Bounded live run: shut down the same way a Ctrl-C would, so the bot storage is saved
+    -- and the game socket is closed instead of being killed from outside.
+    if cfg.exitAfter and cfg.exitAfter > 0 then
+        log.info('--exit-after=%s: this run will disconnect on its own', tostring(cfg.exitAfter))
+        sched.after(math.floor(cfg.exitAfter * 1000), function()
+            log.info('--exit-after elapsed -- disconnecting')
+            shutdown(0)
+        end)
+    end
 
     -- 4. loop ----------------------------------------------------------------
     sched.run()

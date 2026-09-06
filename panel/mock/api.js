@@ -1044,24 +1044,31 @@ var H = {
 /* ------------------------- the transport ------------------------ */
 
 function latency(cmd) {
+  if (API.latencyMs !== null) return API.latencyMs;
   if (cmd === 'instance.exec') return 120 + rnd() * 500;
   if (cmd.indexOf('admin.audit') === 0) return 60 + rnd() * 180;
   if (cmd === 'proxy.test') return 300 + rnd() * 1400;
   return 35 + rnd() * 130;
 }
 
-window.HubMock = {
+function dispatch(cmd, args) {
+  var fn = H[cmd];
+  if (!fn) return { ok: false, error: { code: 'unknown-command', message: 'no such command: ' + cmd } };
+  try { return { ok: true, result: fn(args || {}) }; }
+  catch (e) { return { ok: false, error: { code: e.code || 'internal', message: e.message || String(e) } }; }
+}
+
+var API = {
+  /* Simulated round-trip time. null = the per-command profile in latency();
+     set HubMock.latencyMs = 0 to answer on a microtask instead, which is what
+     automated tests want (a hidden browser tab throttles setTimeout hard). */
+  latencyMs: null,
+
   rpc: function (cmd, args) {
+    var d = latency(cmd);
+    if (!d) return Promise.resolve().then(function () { return dispatch(cmd, args); });
     return new Promise(function (resolve) {
-      setTimeout(function () {
-        var fn = H[cmd];
-        if (!fn) { resolve({ ok: false, error: { code: 'unknown-command', message: 'no such command: ' + cmd } }); return; }
-        try {
-          resolve({ ok: true, result: fn(args || {}) });
-        } catch (e) {
-          resolve({ ok: false, error: { code: e.code || 'internal', message: e.message || String(e) } });
-        }
-      }, latency(cmd));
+      setTimeout(function () { resolve(dispatch(cmd, args)); }, d);
     });
   },
 
@@ -1077,7 +1084,10 @@ window.HubMock = {
   },
 
   /* handy in the browser console while developing the UI */
-  _db: DB
+  _db: DB,
+  _tick: tick
 };
+
+window.HubMock = API;
 
 })();

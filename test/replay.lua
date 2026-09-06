@@ -204,8 +204,8 @@ local function replayFile(path, opts)
 end
 
 -- ======================================================= synthetic capture
--- No 1530 recording exists yet (docs/offline-testbench.md: the shipped sample is
--- protocol 1098), so --self builds one from the same fixtures the selftest uses,
+-- The repo now ships two REAL 1530 recordings (test/fixtures-*.cam); --self replays
+-- both of those AND builds a synthetic capture from the same fixtures the selftest uses,
 -- driving them through the REAL framing code so the payloads are exactly what a
 -- live transport would hand the parser.
 local function buildSyntheticCapture()
@@ -326,6 +326,14 @@ local function main(argv)
                 if r.dir == '<' then n = n + 1 end end return n end)(), camPath, lcapPath))
         files[#files + 1] = camPath
         files[#files + 1] = lcapPath
+        -- ...and every REAL 1530 corpus recorded off the live server with --capture.
+        -- These are the ones that matter: they carry the map row slices, the creature
+        -- moves and the opcode mix no hand-built fixture reproduces.
+        for _, name in ipairs({ 'test/fixtures-first-session.cam', 'test/fixtures-v-session.cam' }) do
+            local p = ROOT .. '/' .. name
+            local fh = io.open(p, 'r')
+            if fh then fh:close(); files[#files + 1] = p end
+        end
     end
 
     for _, path in ipairs(files) do

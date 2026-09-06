@@ -44,6 +44,30 @@ Facts a reimplementer must not lose (all verified against map.cpp):
   * hasMargin is set by KEY PRESENCE of the literal keys "marginMin"/"marginMax" only; the
     aliases minMargin/maxMargin drive the Lua ring scan but NOT the C++ +4 extension (VERIFIER).
 
+MINIMAP FALLBACK (work item M)
+------------------------------
+`Map::findEveryPath` classifies a neighbour from the live tile store ONLY while
+`g_map.isAwareOfPosition(neighbor)` holds; outside the aware area -- and only when
+`allowOnlyVisibleTiles` is off -- it reads the PERSISTED MINIMAP instead (map.cpp:1415-1424):
+was-seen, not-walkable, not-pathable, colour and `MinimapTile::getSpeed()` (byte * 10), with
+"blocked implies seen" applied on top.  That is the whole reason a cavebot waypoint 26 tiles
+away can be pathed at all (docs/live-findings.md, bug 3): the client has never been told
+those tiles, but it explored them in an earlier session and wrote them to minimap.otmm.
+
+This port keeps that split exactly where the C++ has it -- inside
+`world:classifyForPath` -- so nothing in the search below changes:
+
+  * a tile the LIVE STATE knows is classified from the live tile and the minimap is never
+    consulted for it, however much the two disagree;
+  * a minimap tile with WasSeen and no blocking flag is pathable, at its recorded speed;
+  * a minimap tile with NO WasSeen is only usable when the caller passes `allowUnseen`;
+  * the 210-213 stair band is unchanged -- `hasStairs = notPathable AND 210 <= colour <= 213`
+    reads the MINIMAP colour outside the aware area, which is where the anti-lost logic's
+    hole/stair avoidance gets its evidence from in the first place.
+
+The source is `world.known`; `path.new(client, nil, { known = mm })` installs one, and
+main.lua's `--minimap=PATH` threads the reader through bot/init.lua.
+
 maxComplexity: `findEveryPath` has no node cap in C++ (only maxDistance); BOT.md requires one,
 so this port adds a cutoff on the number of CLASSIFIED CELLS.  On overrun the search stops and
 the field is flagged `truncated`; `getPath` still returns a path if the destination was already
@@ -246,10 +270,18 @@ path._Field = Field
 -- ---------------------------------------------------------------------------
 -- construction
 -- ---------------------------------------------------------------------------
-function path.new(client, w)
+-- path.new(client [, world] [, opts])
+--   opts.known / opts.minimap  a lib/minimap.lua instance (or anything with
+--       `:get(pos) -> flags, colorByte, speedByte`) used for tiles OUTSIDE the aware area.
+--       Only consulted when no `world` is passed in, since the world owns that source; when
+--       neither is given, `client.minimap` is picked up.  See the "minimap fallback" note
+--       above.
+function path.new(client, w, opts)
+    opts = (type(opts) == 'table') and opts or {}
     local self = setmetatable({}, P)
     self.client = client
-    self.world  = w or worldmod.new(client)
+    self.world  = w or worldmod.new(client, {
+        known = opts.known or opts.minimap or (client and client.minimap) or nil })
     self.log    = client and client.log
     self.maxComplexity = DEFAULT_COMPLEXITY
     self.A = nil
@@ -319,7 +351,12 @@ function P:findEveryPath(start, maxDistance, params)
     local mdf, mdfPos, mdfRange = params.maxDistanceFrom, nil, nil
     if type(mdf) == 'table' then
         mdfPos, mdfRange = mdf[1] or mdf.pos, tonumber(mdf[2] or mdf.range)
-        if type(mdfPos) ~= 'table' or not mdfRange then mdfPos = nil end
+        -- REVIEW FIX: map.cpp:1427 gates the whole test on `maxDistanceFrom &&
+        -- maxDistanceFromPos.isValid()`, and maxDistanceFrom is an int -- so a range of 0
+        -- means "no limit".  In Lua 0 is truthy, so `not mdfRange` let a 0 range through
+        -- and every neighbour past distance 0 was classified blocked (an empty field and
+        -- a spurious no-path).
+        if type(mdfPos) ~= 'table' or not mdfRange or mdfRange == 0 then mdfPos = nil end
     end
 
     local side = 2 * maxDistance + 1

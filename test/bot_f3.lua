@@ -685,10 +685,18 @@ do
 
     -- packets
     sentPackets = {}
+    -- REVIEW FIX: a formula the client's spell list knows goes out as an AIMED spell
+    -- (SpellAimTarget = 3), because 15.25+ spells carry an aim byte and the server
+    -- rejects them when it is "none".  bot/shared.lua:328-338 has the same rule.
     a.say('exura gran')
-    eq(sentPackets[1][1], 'talk', 'say() goes out as a talk packet')
-    eq(sentPackets[1][2], 1, 'say() uses MessageSay (1)')
-    eq(sentPackets[1][5], 'exura gran', 'say() carries the text')
+    eq(sentPackets[1][1], 'talkSpell', 'say(<known formula>) goes out as an aimed spell')
+    eq(sentPackets[1][2], 'exura gran', 'say(<known formula>) carries the words')
+    eq(sentPackets[1][3], 3, 'say(<known formula>) uses SpellAimTarget (3)')
+    sentPackets = {}
+    a.say('hello there')
+    eq(sentPackets[1][1], 'talk', 'say(<plain text>) is still a talk packet')
+    eq(sentPackets[1][2], 1, 'say(<plain text>) uses MessageSay (1)')
+    eq(sentPackets[1][5], 'hello there', 'say(<plain text>) carries the text')
     a.yell('hi');        eq(sentPackets[2][2], 3, 'yell() uses MessageYell (3)')
     a.talkNpc('hi');     eq(sentPackets[3][2], 11, 'talkNpc() uses MessageNpcTo (11)')
     a.talkPrivate('Bob', 'hi')
@@ -700,7 +708,16 @@ do
     a.walk(1);   eq(sentPackets[6][1], 'walk', 'walk()')
     a.turn(2);   eq(sentPackets[7][1], 'turn', 'turn()')
     a.attack({ id = 42 }); eq(sentPackets[8][2], 42, 'attack(creature)')
-    a.cancelAttack();      eq(sentPackets[9][1], 'cancelAttackAndFollow', 'cancelAttack()')
+    -- REVIEW FIX: g_game.cancelAttack is attack(nullptr) -> 0xA1 sendAttack(0, seq),
+    -- NOT 0xBE (which also drops the follow target and stops the server-side auto-walk).
+    a.cancelAttack()
+    eq(sentPackets[9][1], 'attack', 'cancelAttack() sends 0xA1 attack(0), not 0xBE')
+    eq(sentPackets[9][2], 0, 'cancelAttack() targets creature id 0')
+    a.cancelFollow()
+    eq(sentPackets[10][1], 'follow', 'cancelFollow() sends 0xA2 follow(0)')
+    eq(sentPackets[10][2], 0, 'cancelFollow() targets creature id 0')
+    a.cancelAttackAndFollow()
+    eq(sentPackets[11][1], 'cancelAttackAndFollow', 'cancelAttackAndFollow() still sends 0xBE')
 
     -- findItem / itemAmount over inventory + containers
     c.state.player.inventory[6] = { kind = 'item', id = 3031, count = 55 }
@@ -733,10 +750,21 @@ do
                               pos = { x = 100, y = 100, z = 8 } }
     eq(#a.getSpectators(), 3, 'getSpectators is single-floor by default')
     eq(#a.getSpectators(true), 4, 'getSpectators(true) is multifloor')
-    eq(#a.getMonsters(), 1, 'getMonsters()')
-    eq(#a.getMonsters(2), 0, 'getMonsters(range) filters by Chebyshev distance')
-    eq(#a.getPlayers(), 1, 'getPlayers()')
-    eq(#a.getNpcs(), 1, 'getNpcs()')
+    -- REVIEW FIX: vlib.lua:652-760 -- all three return a COUNT, not a list.
+    eq(a.getMonsters(), 1, 'getMonsters() returns a NUMBER')
+    eq(a.getMonsters(2), 0, 'getMonsters(range) filters by Chebyshev distance')
+    eq(a.getPlayers(), 1, 'getPlayers() returns a NUMBER')
+    eq(a.getNpcs(), 1, 'getNpcs() returns a NUMBER')
+    check(a.getMonsters(2) > 0 == false, 'a ported `getMonsters(n) > 0` snippet does not throw')
+    -- the list forms live on under explicit names
+    eq(#a.getMonsterList(), 1, 'getMonsterList() is the list form')
+    eq(#a.getPlayerList(), 1, 'getPlayerList() is the list form')
+    eq(#a.getNpcList(), 1, 'getNpcList() is the list form')
+    -- summons (type 3/4) are excluded from getMonsters, as vBot does
+    c.state.creatures[11] = { id = 11, name = 'Fire Elemental', isMonster = true, type = 4,
+                              pos = { x = 101, y = 101, z = 7 } }
+    eq(a.getMonsters(), 1, 'getMonsters() excludes summons (getType() < 3)')
+    c.state.creatures[11] = nil
     check(a.getCreatureById(7) ~= nil, 'getCreatureById()')
     check(a.getCreatureById(10) == nil, 'getCreatureById is single-floor by default')
 
@@ -751,13 +779,27 @@ do
     advance(1500); b:tick()
     check(a.canCast('exori'), 'canCast() clears once the cast() delay elapsed')
 
-    -- cooldown tables fed by the client's own events
-    c.events.emit('talk', { name = 'Tester', text = 'Exura Gran' })
+    -- cooldown tables fed by the client's own events.
+    -- REVIEW FIX: getSpellData now scans data/spells1530.lua FIRST (vlib.lua:333-360) and
+    -- only then the runtime-learned customCooldowns -- so a KNOWN formula resolves from
+    -- the static table (and the learner deliberately skips it), while an UNKNOWN one is
+    -- still attributed through the talk echo.
+    do
+        local known = a.getSpellData('exura gran')
+        check(type(known) == 'table', 'getSpellData reads the static spell table')
+        eq(known.mana, 70, 'getSpellData("exura gran").mana comes from data/spells1530.lua')
+        eq(known.level, 20, 'getSpellData("exura gran").level')
+        local savedMana = c.state.player.mana
+        c.state.player.mana = 10
+        eq(a.canCast('exura gran'), false, 'canCast() honours the static mana cost')
+        c.state.player.mana = savedMana
+    end
+    c.events.emit('talk', { name = 'Tester', text = 'Zzz Custom Formula' })
     c.events.emit('spellCooldown', { spellId = 77, delay = 2000 })
     check(a.isCooldownIconActive(77), 'spellCooldown feeds the icon table')
-    check(a.getSpellData('exura gran') ~= false,
+    check(a.getSpellData('zzz custom formula') ~= false,
           'the talk echo attributed the cooldown to the spell words')
-    check(a.getSpellCoolDown('exura gran'), 'getSpellCoolDown() sees the icon')
+    check(a.getSpellCoolDown('zzz custom formula'), 'getSpellCoolDown() sees the icon')
     check(type(a.modules.game_cooldown.isCooldownIconActive) == 'function',
           'modules.game_cooldown is exposed (VERIFIER: vlib reaches it that way)')
 
@@ -766,13 +808,13 @@ do
         local Wm = {}; Wm.__index = Wm
         function Wm:monsters(pos, range) self.calledWith = { pos, range }; return { 'a', 'b' } end
         b.world = setmetatable({}, Wm)
-        eq(#a.getMonsters(3), 2, 'getMonsters delegates to a colon-style bot.world')
+        eq(#a.getMonsterList(3), 2, 'getMonsterList delegates to a colon-style bot.world')
         check(b.world.calledWith ~= nil and b.world.calledWith[2] == 3,
               'the colon binding passed self correctly (self.calledWith was set)')
         b.world = { monsters = function(pos, range) return { 'x' } end }
-        eq(#a.getMonsters(3), 1, 'getMonsters also accepts a dot-style bot.world')
+        eq(#a.getMonsterList(3), 1, 'getMonsterList also accepts a dot-style bot.world')
         b.world = nil
-        eq(#a.getMonsters(), 1, 'and falls back to the built-in scan when unset')
+        eq(#a.getMonsterList(), 1, 'and falls back to the built-in scan when unset')
     end
 
     -- the two documented no-ops

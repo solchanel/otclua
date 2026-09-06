@@ -135,10 +135,16 @@ function attackbot.new(b, cfg, opts)
 
     -- AB:842: `ek` is evaluated ONCE at chunk load, so the quadrant grids are
     -- frozen at the vocation the client reported then (VERIFIER addition).
-    local p = self.state and self.state.player
-    local voc = (p and p.vocation) or 0
-    self.ek = (voc == 1 or voc == 11)
-    self.quadrant = self.ek and PAT.quadrant.knight or PAT.quadrant.other
+    -- REVIEW FIX: vBot's chunk loads AFTER login, so "the vocation the client
+    -- reported then" is the REAL one.  We are constructed on `gameStart`, before
+    -- 0x9F PlayerDataBasic arrives, so freezing here would freeze on the
+    -- state.lua default of 0 and every knight would get the 11x11 grids.  Latch
+    -- ONCE, on the first tick that sees a non-zero vocation, then stay frozen --
+    -- which is what the VERIFIER's "no per-tick recomputation" asks for.
+    self._quadLatched = false
+    self.ek = false
+    self.quadrant = PAT.quadrant.other
+    self:quadrantGrids()
 
     self.runeDelayTimers = {}       -- [itemId] = absolute ms
     self.runeCooldowns   = {}       -- [itemId] = last fire ms  (CustomCooldown mode)
@@ -230,6 +236,46 @@ function A:now() return self.bot.now or self.bot.clock() end
 function A:player() return self.state and self.state.player or nil end
 function A:ppos()  local p = self:player(); return p and p.pos or nil end
 
+--- REVIEW FIX (facing).  `player:getDirection()` in vBot is the SERVER-side facing.
+--- In luaclient the wire only ever writes it onto `state.creatures[<playerId>]`
+--- (proto/parser.lua applyCreature, markers 0x61/0x62/0x64 and the type-99 turn);
+--- `state.player.direction` is a separate field touched only by 0xB5 walkCancel.
+--- Always read the creature record first, and fall back to the player table.
+function A:facing()
+    local p = self:player()
+    if not p then return 0 end
+    local cs = self.state and self.state.creatures
+    local c  = cs and p.id and cs[p.id] or nil
+    local d  = c and c.direction
+    if type(d) ~= 'number' then d = p.direction end
+    return d or 0
+end
+
+--- REVIEW FIX (AB:842).  The knight-vs-other quadrant grids, latched on the first
+--- non-zero vocation and frozen thereafter.  Returns the 4-entry grid table.
+function A:quadrantGrids()
+    if not self._quadLatched then
+        local p = self:player()
+        local voc = (p and p.vocation) or 0
+        if voc ~= 0 then
+            self._quadLatched = true
+            self.ek = (voc == 1 or voc == 11)
+            self.quadrant = self.ek and PAT.quadrant.knight or PAT.quadrant.other
+        end
+    end
+    return self.quadrant or PAT.quadrant.other
+end
+
+--- Write an optimistic facing to BOTH records (the C++ client updates the local
+--- creature immediately when it sends a turn).
+function A:setFacing(dir)
+    local p = self:player()
+    if p then p.direction = dir end
+    local cs = self.state and self.state.creatures
+    local c  = cs and p and p.id and cs[p.id] or nil
+    if c then c.direction = dir end
+end
+
 local function chebyshev(a, b) return max(abs(a.x - b.x), abs(a.y - b.y)) end
 attackbot.distance = chebyshev
 
@@ -271,6 +317,20 @@ end
 --- includes them, so never use it here (attackbot.md Pitfalls).
 local function isRealMonster(c) return c ~= nil and c.type == 1 end
 attackbot.isRealMonster = isRealMonster
+
+--- REVIEW FIX (direction scanners).  vBot's TWO direction scanners -- getWaveBestDir
+--- (AB:1256) and getMonkBestDir (AB:1326) -- use a BARE `spec:isMonster()` with no
+--- `getType() < 3` term, unlike getMonstersInArea / the chain branch / the compass
+--- scan.  `Creature::isMonster()` is class-derived: protocolgameparse.cpp:4317-4322
+--- builds a Monster for CreatureTypeMonster(1), SummonOwn(3), SummonOther(4) and
+--- Hidden(5).  Use THIS predicate in those two functions only.
+local function isClassMonster(c)
+    if c == nil then return false end
+    local ty = c.type
+    if ty == nil then return c.isMonster == true end
+    return ty == 1 or ty == 3 or ty == 4 or ty == 5
+end
+attackbot.isClassMonster = isClassMonster
 
 --- isPartyMember(): shield in {1,3,4,5,6,7,8,9,10} (gamelib/player.lua:621-626).
 local PARTY_SHIELDS = { [1] = true, [3] = true, [4] = true, [5] = true, [6] = true,
@@ -476,7 +536,7 @@ function A:getWaveBestDir(letterGrid, minHp, maxHp, safeGrid, names)
     end
 
     local me = self:player()
-    local cur = (me and me.direction) or 0
+    local cur = self:facing()
     local bestCount, bestDir, counts = -1, 0, {}
     for d = 0, 3 do
         local n = 0
@@ -484,7 +544,7 @@ function A:getWaveBestDir(letterGrid, minHp, maxHp, safeGrid, names)
         for i = 1, #specs do
             local c = specs[i]
             local hp = c.healthPercent or 100
-            if (not me or c.id ~= me.id) and isRealMonster(c)
+            if (not me or c.id ~= me.id) and isClassMonster(c)
                and hp >= minHp and hp <= maxHp
                and inList(t, tostring(c.name or ''):lower())
                and self:isSightClear(my, c.pos) then
@@ -508,7 +568,7 @@ function A:getMonkBestDir(patternId, minHp, maxHp, safeGrid, names)
     local dirs = PAT.monkDirPatterns[patternId]
     if not dirs then return -1, 0 end
     local me = self:player()
-    local cur = (me and me.direction) or 0
+    local cur = self:facing()
     local bestCount, bestDir = -1, 0
     for d = 0, 3 do
         local blocked = false
@@ -524,7 +584,7 @@ function A:getMonkBestDir(patternId, minHp, maxHp, safeGrid, names)
             for i = 1, #specs do
                 local c = specs[i]
                 local hp = c.healthPercent or 100
-                if (not me or c.id ~= me.id) and isRealMonster(c)
+                if (not me or c.id ~= me.id) and isClassMonster(c)
                    and hp >= minHp and hp <= maxHp
                    and inList(t, tostring(c.name or ''):lower())
                    and self:isSightClear(my, c.pos) then
@@ -541,7 +601,7 @@ end
 function A:directionToPos(from, to)
     local dx, dy = to.x - from.x, to.y - from.y
     if dx == 0 and dy == 0 then
-        local me = self:player(); return (me and me.direction) or 0
+        return self:facing()
     end
     if abs(dx) >= abs(dy) then return dx > 0 and 1 or 3 end
     return dy > 0 and 2 or 0
@@ -697,11 +757,10 @@ end
 --- the local direction immediately, so the cast goes out with the new facing
 --- already applied: turn packet first, cast packet second, same tick, no delay.
 function A:autoTurnAndFire(neededDir, fireFn)
-    local me = self:player()
-    if me and me.direction == neededDir then fireFn(); return true end
+    if self:facing() == neededDir then fireFn(); return true end
     if self:profile().Rotate then
         if self.sender and self.sender.turn then self.sender:turn(neededDir) end
-        if me then me.direction = neededDir end
+        self:setFacing(neededDir)
         self.counts.turns = self.counts.turns + 1
         self.lastTurn = neededDir
         fireFn()
@@ -745,10 +804,11 @@ function A:tick()
     -- ---- compass quadrant scan (AB:2735-2759).  Only `bestSide` is consumed,
     -- and only by pattern 8; `bestDir` is computed and never used in vBot.
     local me = self:ppos()
+    local grids = self:quadrantGrids()
     local q, bestSide = {}, 0
     for d = 0, 3 do
         local n = 0
-        local specs = self:spectatorsByPattern(me, self.quadrant[d], 8)
+        local specs = self:spectatorsByPattern(me, grids[d], 8)
         for i = 1, #specs do
             local c = specs[i]
             if c.id ~= self:player().id and isRealMonster(c) then n = n + 1 end
@@ -965,8 +1025,7 @@ function A:_dispatch(entry, tg, bestSide, executeCooldown, isRune)
         if isWave then
             local wc, wd, counts = self:getWaveBestDir(grids[1], minHp, maxHp, safe,
                                                        entry.monsters)
-            local me = self:player()
-            local facing = counts[(me and me.direction) or 0] or 0
+            local facing = counts[self:facing()] or 0
             if self:countGate(entry, facing) then
                 if self:guardsPass() then fire(); return 'fired' end
             elseif self:countGate(entry, wc) and p.Rotate and self:guardsPass() then
@@ -1037,6 +1096,14 @@ function A:_hookEvents()
     shared.evOn(ev, 'creatureDisappear', function(d)
         local id = d and (d.id or (d.creature and d.creature.id))
         if id and self.bot._attacking == id then self.bot._attacking = nil end
+    end)
+    -- REVIEW FIX: `player.isDead` is set one way by 0x28 and cleared only by a whole
+    -- new state; demonstrably-alive health clears it so `playable()` cannot latch off.
+    shared.evOn(ev, 'healthChange', function(d)
+        if d and (d.health or 0) > 0 then
+            local p = self:player()
+            if p then p.isDead = false end
+        end
     end)
 end
 

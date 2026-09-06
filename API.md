@@ -189,6 +189,13 @@ without the `on` prefix, lowerCamel: `gameStart`, `login`, `pending`, `talk`, `t
 `spellGroupCooldown`, `channelList`, `openChannel`, `closeChannel`, `mapDescription`, `tileUpdate`,
 `awareRangeChange`, `attackCancel`, `distanceEffect`, `magicEffect`, `animatedText`, `staticText`.
 
+`positionChange` is emitted **exactly once per local-player move**, from the 0x6D handler (and
+from the position-authoritative 0x64 / 0x4B, plus `Map::setCentralPosition`'s teleport fixup when
+we are off the map). The map row slices 0x65-0x68 and the floor changes 0xBE/0xBF move the
+**camera only** — `P:setCentral` does not write `state.player.pos`, exactly as the C++ does not.
+Before work item V both handlers advanced the position, so every step reported two tiles and the
+row slice wrote its column one tile off; see `docs/live-findings.md`, bug 4.
+
 ## proto/sender.lua
 Every builder returns the body string on success, or `nil, err` when the transport refused the
 frame (dead transport / failed socket write).  A refused frame is not counted in `sender.sent`,
@@ -234,6 +241,13 @@ st.map           -- tiles keyed "x,y,z" -> {things={ {kind='item'|'creature', id
 st.containers    -- [id] = {id, name, capacity, hasPages, firstIndex, size, items={}}
 st.channels      -- [id] = name
 st.world         -- {name, awareRange={left,top,right,bottom}, worldTime}
+st.serverBeat    -- ms, from 0x17 LoginSuccess.  bot/walker.lua rounds every step duration to it
+st.ping          -- ms round trip, written by main.lua from the 0x1E pong of our own keepalive
+                 --   (nil until the first pong; every reader must have a fallback)
+st.npcTrade      -- {open=bool, items={{id, subType, name, weight, buyPrice, sellPrice}, ...}}
+                 --   from 0x7A OpenNpcTrade, cleared by 0x7C.  bot/cavebot.lua buysupplies/sellall
+st.inventoryCounts -- [itemId*256 + tier] = amount, from 0xC0.  The only way to count items in a
+                 --   CLOSED backpack (bot/supplies.lua:itemAmount)
 st:tile(pos) st:setTile(pos, tile) st:cleanTile(pos) st:getCreature(id) st:walkableAt(pos)
 st:setCentralPosition(pos)  -- Map::setCentralPosition: records the centre and evicts every
                             -- tile outside the aware range (GameKeepUnawareTiles is never on).
@@ -250,15 +264,22 @@ The map keeps only what the server sends (aware range around the player); `clean
 
 ## main.lua
 ```lua
-_G.LC = { log=, sched=, state=, transport=, parser=, sender=, config=, events= }
+_G.LC = { log=, sched=, state=, transport=, parser=, sender=, config=, events=, items=,
+          sys=, dir=, bot= }        -- `bot` only while the bot layer is running
 ```
 CLI flags: `--account=`, `--password=`, `--character=`, `--world=`, `--token=`, `--host=`,
 `--assets=<dir with items1530.bin>`, `--log-level=`, `--log-file=`, `--dry-run` (offline: no
-sockets, used by tests), `--selftest` (run test/selftest.lua and exit).
+sockets, used by tests), `--selftest` (run test/selftest.lua and exit), and the bot flags
+`--bot`, `--bot-profile=`, `--bot-vprofile=`, `--cavebot=`, `--targetbot=`,
+`--bot-status-interval=` (see BOT.md).
 `LC.events.on(name, fn)` / `LC.events.emit(name, data)` is the single event bus the parser feeds.
 
 Boot: parse flags → load items → HTTP login → pick world+character → transport connect → challenge →
 login packet → XTEA on → enterGame → parse loop → log `player: hp/mana/level/pos` on change.
+With `--bot`, the bot layer is constructed and started on the `gameStart` / `login` event
+(`bot.new(LC, ...)` then `b:wireModules{...}` then `b:start()`), logs a one-line status every
+`--bot-status-interval` ms, and is stopped -- which persists its storage -- from `shutdown()`,
+so a disconnect, a `SessionEnd` and a fatal all save. The contract is [`BOT.md`](BOT.md).
 
 ## Testing (test/)
 * `selftest.lua`: XTEA vectors, adler32, RSA against a known ciphertext, inflate round-trip, buffer

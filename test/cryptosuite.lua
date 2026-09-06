@@ -450,7 +450,9 @@ end
 
 suite('authsecret / record encryption')
 do
-    local box = authsecret.fromKey(string.rep('\x5a', 32))
+    -- Deterministic but NOT constant: fromKey() refuses a master secret of 32 identical bytes
+    -- (an all-zero / placeholder / sparse-restore key file), so a string.rep() key is out.
+    local box = authsecret.fromKey(sha2.sha256('authsecret suite master key A'))
     local rec = box:encrypt('a game account password', 'account:7:password')
     check(box:isRecord(rec), 'record is recognised')
     check(rec:match('^sbx%$1%$[%w%-_]+%$[%w%-_]+%$[%w%-_]+$') ~= nil,
@@ -461,7 +463,7 @@ do
     check(box:decrypt(rec, 'account:8:password') == nil, 'wrong aad fails to authenticate')
     check(box:decrypt(rec) == nil, 'missing aad fails to authenticate')
 
-    local other = authsecret.fromKey(string.rep('\x5b', 32))
+    local other = authsecret.fromKey(sha2.sha256('authsecret suite master key B'))
     check(other:decrypt(rec, 'account:7:password') == nil, 'a different master key cannot read it')
 
     -- Flip one ciphertext character (not the last, so base64 stays canonical).
@@ -508,8 +510,15 @@ suite('authsecret / master key file')
 do
     local path = sys.tempDir() .. '/lc_authsecret_test_' .. tostring(sys.randomU32()) .. '.key'
     os.remove(path)
-    local box, created = authsecret.open(path)
-    check(box ~= nil, 'open() creates a missing key file')
+    -- A missing key file is NOT "first run": open() refuses unless the caller says so.
+    local none, nerr = authsecret.open(path)
+    check(none == nil, 'open() refuses to mint a master secret without allowCreate')
+    check(type(nerr) == 'string' and nerr:find('refusing to mint', 1, true) ~= nil,
+          'open() explains why it refused', nerr)
+    check(io.open(path, 'rb') == nil, 'and it wrote no key file while refusing')
+
+    local box, created = authsecret.open(path, { allowCreate = true })
+    check(box ~= nil, 'open(allowCreate) creates a missing key file')
     eq(created, true, 'open() reports that it created the file')
 
     local f = io.open(path, 'rb')
@@ -517,7 +526,7 @@ do
     if f then f:close() end
     eq(raw and #raw, 32, 'key file holds exactly 32 raw bytes')
 
-    local box2, created2 = authsecret.open(path)
+    local box2, created2 = authsecret.open(path, { allowCreate = true })
     eq(created2, false, 'the second open() loads the existing file')
     local rec = box:encrypt('roundtrip through the file', 'aad')
     eq(box2:decrypt(rec, 'aad'), 'roundtrip through the file', 'the reloaded box decrypts')
@@ -535,10 +544,241 @@ do
     check(io.open(path, 'rb') == nil, 'test key files cleaned up')
 end
 
+-- ==================================================== hardening regressions
+-- Each check here corresponds to a specific defect that shipped once; the comment says what the
+-- old behaviour was, so a future edit that reintroduces it fails loudly rather than quietly.
+
+suite('pbkdf2 / hardening')
+do
+    -- The saltLen >= 8 floor used to guard ONLY the generated-salt path.  An explicit opts.salt
+    -- was type-checked and never length-checked, so hash(pw, {salt=''}) minted
+    -- 'pbkdf2$sha256$N$$<hash>' -- a completely unsalted credential that parse() then REFUSED,
+    -- i.e. an account that could never log in again and reported "wrong password" for it.
+    for _, bad in ipairs{ '', 'x', 'seven!!' } do
+        local ok, err = pcall(pbkdf2.hash, 'pw', { salt = bad, iterations = 10 })
+        check(not ok, ('hash{salt=%q} (%d bytes) is refused'):format(bad, #bad))
+        check(type(err) == 'string' and err:find('salt', 1, true) ~= nil,
+              '   with a message naming the salt', err)
+    end
+    check(pcall(pbkdf2.hash, 'pw', { salt = ('12345678'), iterations = 10 }),
+          'an 8-byte explicit salt (the floor) is accepted')
+    check(not pcall(pbkdf2.hash, 'pw', { saltLen = 7 }), 'saltLen = 7 is still refused')
+    check(not pcall(pbkdf2.hash, 'pw', { salt = 12345678 }), 'a non-string salt is refused')
+
+    -- hash() and parse() must agree on the SAME floor, or hash() can emit a string verify()
+    -- can never read.  Every salt hash() accepts must round-trip.
+    local h8 = pbkdf2.hash('pw', { salt = '12345678', iterations = 10 })
+    check(pbkdf2.verify('pw', h8), 'a hash at the floor verifies (hash and parse agree)')
+    check(not pbkdf2.verify('pw', 'pbkdf2$sha256$10$c2hvcnQ=$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' ..
+                                  'AAAAAAAAAAA='),
+          'a stored string with a 5-byte salt is rejected, not silently derived from')
+    eq(select(2, pbkdf2.verify('pw', 'pbkdf2$sha256$10$$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' ..
+                                     'AAAAAAA=')), 'salt too short',
+       'an empty-salt stored string is refused with a clear reason')
+
+    -- Non-integer parameters used to be accepted and then recorded with '%d', so the stored
+    -- iteration count did not describe the work actually done (and '%d' on a non-integer raises
+    -- on some LuaJIT builds).
+    check(not pcall(pbkdf2.hash, 'pw', { iterations = 1000.5 }),
+          'a non-integer iteration count is refused')
+    check(not pcall(pbkdf2.hash, 'pw', { saltLen = 16.5 }), 'a non-integer saltLen is refused')
+    check(not pcall(pbkdf2.hash, 'pw', { dkLen = 32.5 }), 'a non-integer dkLen is refused')
+    check(pcall(pbkdf2.hash, 'pw', { iterations = 10 }), 'an integer count is still fine')
+
+    -- MAX_ITERATIONS is the ceiling a STORED STRING can dictate, and verify() runs it
+    -- synchronously on a single-threaded hub.  At the old 5,000,000 it was ~6.9 s of whole-
+    -- process stall per login attempt from one hand-edited users.json row.
+    check(pbkdf2.MAX_ITERATIONS <= 4 * pbkdf2.DEFAULT_ITERATIONS,
+          'MAX_ITERATIONS is at most 4x the default', pbkdf2.MAX_ITERATIONS)
+    local overCeiling = ('pbkdf2$sha256$%d$MTIzNDU2Nzg5MDEyMzQ1Ng==$%s')
+                        :format(pbkdf2.MAX_ITERATIONS + 1, base64.encode(('\0'):rep(32)))
+    local t0 = os.clock()
+    local okOver, whyOver = pbkdf2.verify('pw', overCeiling)
+    local overMs = (os.clock() - t0) * 1000
+    check(not okOver, 'a stored string above MAX_ITERATIONS is refused')
+    eq(whyOver, 'bad iteration count', '   with a clear reason')
+    check(overMs < 50, '   and refused WITHOUT running the derivation', ('%.1f ms'):format(overMs))
+    check(pbkdf2.params(('pbkdf2$sha256$5000000$MTIzNDU2Nzg5MDEyMzQ1Ng==$%s')
+                        :format(base64.encode(('\0'):rep(32)))) == nil,
+          'the old 5,000,000 ceiling is no longer accepted out of a stored string')
+
+    -- The login path must cost the same whether or not the account exists.  verify() alone
+    -- returns in ~0 ms for an unparsable stored string and ~275 ms for a real one, which told an
+    -- unauthenticated caller which usernames exist from response time alone.
+    local real = pbkdf2.hash('the real password')
+    local function ms(fn, ...)
+        local c0 = os.clock()
+        local r = fn(...)
+        return (os.clock() - c0) * 1000, r
+    end
+    local realMs, realOk = ms(pbkdf2.verifyOrDummy, 'the real password', real)
+    local wrongMs, wrongOk = ms(pbkdf2.verifyOrDummy, 'not it', real)
+    local missMs, missOk = ms(pbkdf2.verifyOrDummy, 'anything', nil)
+    local junkMs, junkOk = ms(pbkdf2.verifyOrDummy, 'anything', '')
+    check(realOk == true, 'verifyOrDummy accepts the right password')
+    check(wrongOk == false, 'verifyOrDummy rejects the wrong password')
+    check(missOk == false, 'verifyOrDummy rejects a nil stored string')
+    check(junkOk == false, 'verifyOrDummy rejects an unparsable stored string')
+    -- The unknown-user path must be within a factor of 2 of the real one, not 550,000x faster.
+    local slowest = math.max(realMs, wrongMs)
+    check(missMs > slowest / 2,
+          'an ABSENT account costs about as much as a real one (no timing oracle)',
+          ('real %.1f ms, wrong %.1f ms, missing %.1f ms'):format(realMs, wrongMs, missMs))
+    check(junkMs > slowest / 2,
+          'a CORRUPT stored string costs about as much too',
+          ('real %.1f ms, junk %.1f ms'):format(realMs, junkMs))
+    note(('verifyOrDummy: real %.0f ms, wrong-password %.0f ms, unknown-user %.0f ms, ' ..
+          'corrupt-row %.0f ms'):format(realMs, wrongMs, missMs, junkMs))
+    -- ... and the stand-in must never be a password anyone could log in with
+    check(not pbkdf2.verify('', pbkdf2.dummyStored()), 'the dummy stored string matches nothing')
+    check(pbkdf2.params(pbkdf2.dummyStored()) ~= nil, 'the dummy stored string is well formed')
+    eq(pbkdf2.params(pbkdf2.dummyStored()).iterations, pbkdf2.DEFAULT_ITERATIONS,
+       'the dummy costs exactly what a freshly created account costs')
+end
+
+suite('authsecret / hardening')
+do
+    local master = sha2.sha256('authsecret hardening master')
+
+    -- The two sub-keys used to be plain fields on the box table, so json.encode(box) emitted
+    -- both 256-bit keys verbatim -- and PANEL.md pushes log lines to every panel session.
+    local box = authsecret.fromKey(master)
+    local fields = {}
+    for k in pairs(box) do fields[#fields + 1] = tostring(k) end
+    eq(#fields, 0, 'the box exposes no fields at all', table.concat(fields, ', '))
+    local okJson, json = pcall(require, 'lib.json')
+    if okJson then
+        local enc = json.encode(box)
+        check(not enc:find('kenc', 1, true) and not enc:find('kmac', 1, true),
+              'json.encode(box) contains no key material', enc)
+        local kenc = hmac.sha256(master, 'luaclient/authsecret/v1/enc\1')
+        check(not enc:find(kenc, 1, true), '   not even by value')
+    end
+    check(tostring(box):find(box:fingerprint(), 1, true) ~= nil,
+          'tostring(box) is the fingerprint, not a table address', tostring(box))
+
+    -- A master secret of 32 identical bytes is a placeholder or a corrupted/sparse file.
+    -- The length check alone accepted 32 zero bytes without a word.
+    for _, b in ipairs{ '\0', '\255', 'a' } do
+        check(not pcall(authsecret.fromKey, b:rep(32)),
+              ('fromKey refuses 32 x 0x%02x'):format(b:byte()))
+    end
+    check(pcall(authsecret.fromKey, master), 'a real 32-byte key is still accepted')
+
+    -- isRecord used to test a 4-byte prefix, so a cleartext password beginning "sbx$" was
+    -- reported as already encrypted and the obvious migration idiom skipped it.
+    check(not box:isRecord('sbx$notreally'),
+          'a plaintext beginning "sbx$" is NOT reported as a record')
+    check(not box:isRecord('sbx$9$a$b$c'), 'an unknown record version is not "ours"')
+    check(not box:isRecord('sbx$1$a$b'), 'a record with too few fields is refused')
+    check(not box:isRecord('sbx$1$a$b$c$d'), 'a record with too many fields is refused')
+    check(not box:isRecord(''), 'the empty string is not a record')
+    check(not box:isRecord(nil), 'nil is not a record')
+    check(box:isRecord(box:encrypt('x', 'aad')), 'a real record still is one')
+
+    -- The MAC's domain label must come from M.VERSION, not a literal three functions away.
+    -- Recompute the tag here from the public constants; if the label ever drifts this fails.
+    local rec = box:encrypt('bind me to the version', 'account:1:password')
+    local nB, cB, tB = rec:match('^sbx%$1%$([^%$]+)%$([^%$]+)%$([^%$]+)$')
+    local nonce, ct, tag = base64.urldecode(nB), base64.urldecode(cB), base64.urldecode(tB)
+    local kmac = hmac.sha256(master, 'luaclient/authsecret/v1/mac\1')
+    local aad = 'account:1:password'
+    local u32be = string.char(0, 0, 0, #aad)          -- aad is well under 256 bytes
+    local want = hmac.sha256(kmac, 'sbx' .. authsecret.VERSION .. nonce .. u32be .. aad .. ct)
+    eq(tohex(tag), tohex(want), "the MAC label is 'sbx' .. authsecret.VERSION, by construction")
+
+    -- readFile used to return a bare nil when io.open SUCCEEDED but the read did not (a
+    -- directory on Linux), so load() and open() returned nil, nil -- a failure with no message.
+    local dirBox, dirErr = authsecret.load(sys.tempDir())
+    check(dirBox == nil, 'load() on a directory fails')
+    check(type(dirErr) == 'string' and #dirErr > 0,
+          '   with a real message, never a bare nil', tostring(dirErr))
+    check(type(dirErr) == 'string' and dirErr:find(sys.tempDir(), 1, true) ~= nil,
+          '   that names the path', tostring(dirErr))
+
+    -- A key file whose write did not fully land must never be paired with the full in-memory
+    -- key: create() used to discard f:write/f:close errors, return a working box, and leave a
+    -- truncated file that the NEXT start correctly refuses -- with nothing able to decrypt the
+    -- records written in between.  The read-back guard is the backstop; patch the read side to
+    -- prove it fires.
+    local kpath = sys.tempDir() .. '/lc_readback_' .. tostring(sys.randomU32()) .. '.key'
+    os.remove(kpath)
+    local realOpen = io.open
+    io.open = function(p, mode)                              -- luacheck: ignore
+        local f = realOpen(p, mode)
+        if f and p == kpath and mode == 'rb' then
+            local realRead = f.read
+            return setmetatable({}, { __index = {
+                read = function(_, fmt) return (realRead(f, fmt) or ''):sub(1, 20) end,
+                close = function() return f:close() end,
+            } })
+        end
+        return f
+    end
+    local truncBox, truncErr = authsecret.create(kpath)
+    io.open = realOpen                                       -- luacheck: ignore
+    check(truncBox == nil, 'create() refuses when the key on disk does not match what it wrote')
+    check(type(truncErr) == 'string' and truncErr:find('readback', 1, true) ~= nil,
+          '   and says so', tostring(truncErr))
+    check(realOpen(kpath, 'rb') == nil, '   and leaves no half-written key file behind')
+    os.remove(kpath)
+
+    -- POSIX: the key file must really be 0600.  chmod600 used to report whether the FFI CALL
+    -- returned, not whether chmod(2) succeeded.
+    if not sys.isWindows then
+        local mpath = sys.tempDir() .. '/lc_mode_' .. tostring(sys.randomU32()) .. '.key'
+        os.remove(mpath)
+        local mbox = authsecret.create(mpath)
+        check(mbox ~= nil, 'create() makes a key file on POSIX')
+        local ph = io.popen(("stat -c %%a '%s' 2>/dev/null"):format(mpath), 'r')
+        local mode = ph and ph:read('*l')
+        if ph then ph:close() end
+        if mode and mode:match('^%d+$') then
+            eq(mode:sub(-3), '600', 'the key file is mode 0600')
+        else
+            note('POSIX mode check skipped: stat(1) gave no answer')
+            check(true, 'POSIX mode check skipped (not a failure)')
+        end
+        os.remove(mpath)
+    else
+        check(true, 'POSIX mode check not applicable on Windows')
+    end
+end
+
 -- ==================================================== cross-check vs Python
 suite('cross-check against Python hashlib/hmac/base64')
 do
-    local tmp = sys.tempDir()
+    -- The generated script and its input file used to live in the SHARED temp directory
+    -- ($TMPDIR / %TEMP%) and were then executed through io.popen, i.e. through `sh -c` or
+    -- `cmd.exe /c`.  On Linux /tmp is world-writable, so another local user could win the name
+    -- race or pre-place a symlink and have their code run as the developer; and `cmd.exe`
+    -- searches the CURRENT DIRECTORY before PATH, so a python.exe dropped in the repo root was
+    -- executed by the test suite.  Both files now live inside the repo, and the interpreter is
+    -- an ABSOLUTE path that is never resolved from the working directory.
+    local tmp = ROOT .. '/test/.tmp'
+    do
+        local okFfi, ffi = pcall(require, 'ffi')
+        if okFfi then
+            if sys.isWindows then
+                pcall(ffi.cdef, 'int CreateDirectoryA(const char *path, void *sa);')
+                pcall(function() return ffi.C.CreateDirectoryA(tmp, nil) end)
+            else
+                pcall(ffi.cdef, 'int mkdir(const char *path, unsigned int mode);')
+                pcall(function() return ffi.C.mkdir(tmp, 448) end)          -- 0700
+            end
+        end
+    end
+    -- If the directory could not be made, skip rather than fall back to a shared temp dir.
+    do
+        local probe = io.open(tmp .. '/.writable', 'wb')
+        if probe then probe:close(); os.remove(tmp .. '/.writable') end
+        if not probe then
+            note('cross-check SKIPPED: cannot create ' .. tmp)
+            check(true, 'python cross-check skipped (no private temp dir)')
+            tmp = nil
+        end
+    end
+    if tmp then
     local tag = tostring(sys.randomU32())
     local scriptPath = tmp .. '/lc_crosscheck_' .. tag .. '.py'
     local reqPath    = tmp .. '/lc_crosscheck_' .. tag .. '.txt'
@@ -608,7 +848,11 @@ sys.stdout.write('\n'.join(out) + '\n')
     if rf then rf:write(table.concat(reqs, '\n'), '\n'); rf:close() end
 
     local function run(exe)
-        local cmd = ('%s "%s" "%s"'):format(exe, scriptPath, reqPath)
+        -- cmd.exe strips the outer quotes when a command line both starts and ends with one, so
+        -- a quoted absolute interpreter path needs the documented extra wrapping pair.  sh does
+        -- not, and would choke on it.
+        local cmd = ('"%s" "%s" "%s"'):format(exe, scriptPath, reqPath)
+        if sys.isWindows then cmd = '"' .. cmd .. '"' end
         local p = io.popen(cmd, 'r')
         if not p then return nil end
         local out = p:read('*a')
@@ -619,15 +863,66 @@ sys.stdout.write('\n'.join(out) + '\n')
         return (#lines == #expect) and lines or nil
     end
 
-    -- On Windows `python3` is often a Microsoft Store stub that prints nothing, so try the
-    -- name that actually works there first; on Linux `python` may not exist at all.
-    local lines
-    if sys.isWindows then lines = run('python') or run('python3')
-    else                  lines = run('python3') or run('python') end
+    --- Resolve an interpreter to an ABSOLUTE path without letting the working directory choose
+    --- it.  `cmd.exe /c python` searches the current directory FIRST, so a python.exe (or a
+    --- python.bat, or a where.bat) dropped in a repo checkout would otherwise be executed by
+    --- whoever runs the tests.  The resolver itself is therefore addressed absolutely, and any
+    --- answer that is relative, or that lives under this repo, is rejected.
+    local function resolve(name)
+        local probe
+        if sys.isWindows then
+            local sysroot = os.getenv('SystemRoot') or os.getenv('WINDIR')
+            if not sysroot then return nil end
+            probe = ('"%s\\System32\\where.exe" %s 2>NUL'):format(sysroot, name)
+        else
+            probe = ("/usr/bin/env sh -c 'command -v %s' 2>/dev/null"):format(name)
+        end
+        local p = io.popen(probe, 'r')
+        if not p then return nil end
+        local out = p:read('*a') or ''
+        p:close()
+        for line in out:gmatch('[^\r\n]+') do
+            local path = line:gsub('^%s+', ''):gsub('%s+$', '')
+            local absolute = sys.isWindows and path:match('^%a:[\\/]') ~= nil
+                                            or path:sub(1, 1) == '/'
+            if path ~= '' and absolute then
+                -- Refuse outright if ANY file of that name sits in the working directory or the
+                -- repo root: that is the shim cmd.exe would have preferred, and running the
+                -- cross-check at all in that situation is not worth the risk.  Skipping is a
+                -- note, not a failure.
+                local base = path:gsub('\\', '/'):match('([^/]+)$') or path
+                local shim = io.open(base, 'rb') or io.open(ROOT .. '/' .. base, 'rb')
+                if shim then
+                    shim:close()
+                    note(('cross-check REFUSED: a file named %q sits in the working directory ' ..
+                          'or repo root; not resolving an interpreter here'):format(base))
+                    return nil
+                end
+                return path
+            end
+        end
+        return nil
+    end
+
+    -- An explicit override always wins, and is used verbatim -- set LUACLIENT_PYTHON to an
+    -- absolute interpreter path to pin the cross-check on a machine where resolution fails.
+    local exe = sys.getEnv('LUACLIENT_PYTHON')
+    if not exe or exe == '' then
+        -- On Windows `python3` is often a Microsoft Store stub that prints nothing, so try the
+        -- name that actually works there first; on Linux `python` may not exist at all.
+        if sys.isWindows then exe = resolve('python') or resolve('python3')
+        else                  exe = resolve('python3') or resolve('python') end
+    end
+    -- Every check below runs inside a pcall so the generated files are removed even if one of
+    -- them raises; the failure is then re-reported through the normal check() path.
+    local body = function()
+    local lines = exe and run(exe) or nil
     if not lines then
-        note('cross-check SKIPPED: no working python3/python interpreter found on PATH')
+        note('cross-check SKIPPED: no absolute python3/python interpreter resolved ' ..
+             '(set LUACLIENT_PYTHON to one to enable it)')
         check(true, 'python cross-check skipped (not a failure)')
     else
+        note('python cross-check interpreter: ' .. exe)
         local bad = 0
         for i, e in ipairs(expect) do
             if lines[i] ~= e[2] then
@@ -639,6 +934,8 @@ sys.stdout.write('\n'.join(out) + '\n')
         if bad == 0 then
             check(true, ('%d random cases agree with Python (sha256, sha224, hmac, pbkdf2, base64)')
                   :format(#expect))
+            note(('python cross-check ran: %d random cases matched hashlib/hmac/base64')
+                 :format(#expect))
         end
         -- And the other direction: our decoder on Python's output must give back the bytes we
         -- asked Python to encode.
@@ -655,9 +952,15 @@ sys.stdout.write('\n'.join(out) + '\n')
         end
         check(decodeOk, 'our decoder reproduces the bytes behind every Python-encoded string')
     end
+    end
 
+    local okBody, bodyErr = pcall(body)
     os.remove(scriptPath)
     os.remove(reqPath)
+    check(okBody, 'the cross-check ran to completion', bodyErr)
+    check(io.open(scriptPath, 'rb') == nil, 'the generated script is removed, pass or fail')
+    check(io.open(reqPath, 'rb') == nil, '   and so is its input file')
+    end
 end
 
 -- =================================================================== report

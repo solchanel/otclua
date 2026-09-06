@@ -120,6 +120,25 @@ runSuite('buildConnect (byte-exact vs connection.cpp:293)', function()
     check(red2:find('Basic <redacted>', 1, true) ~= nil, 'redacted copy says <redacted>')
     eq(proxy.redact(req2), red2, 'proxy.redact() reproduces the redacted copy')
 
+    -- proxy.redact is a documented public helper for ARBITRARY request text, so it must never
+    -- destroy a line it was supposed to show.  `%s` matches CR and LF: with `%s+` after the
+    -- scheme token an empty credential blob let the greedy match swallow the line terminator
+    -- and eat the NEXT header, which vanished from the log.
+    local empty = 'Proxy-Authorization: Basic \r\nHost: h:1\r\nX-Keep: yes\r\n\r\n'
+    local redEmpty = proxy.redact(empty)
+    check(redEmpty:find('Host: h:1', 1, true) ~= nil,
+          'redact() with an empty credential blob keeps the following header', vis(redEmpty))
+    check(redEmpty:find('X-Keep: yes', 1, true) ~= nil, '   and every header after that too')
+    check(redEmpty:find('<redacted>', 1, true) ~= nil, '   while still masking the blob')
+    -- the same for a header with no scheme token at all
+    local bare = 'Proxy-Authorization: Ym9iOnMz\r\nHost: h:1\r\n\r\n'
+    local redBare = proxy.redact(bare)
+    check(not redBare:find('Ym9iOnMz', 1, true), 'a scheme-less credential is masked too')
+    check(redBare:find('Host: h:1', 1, true) ~= nil, '   without eating the next header')
+    -- and redact() is idempotent: running it twice changes nothing
+    eq(proxy.redact(redEmpty), redEmpty, 'redact() is idempotent')
+    eq(proxy.redact(red2), red2, '   for a built request too')
+
     -- hasAuth() == !user.empty(): a password with no user sends NO header.
     local req3 = proxy.buildConnect{ host = 'h', port = 1, user = '', pass = 'lonely' }
     check(not req3:find('Proxy%-Authorization'), 'password without a user emits no header (hasAuth)')
@@ -236,10 +255,26 @@ runSuite('state machine: 200 (whole, byte-at-a-time, every split)', function()
     end
     eq(bad, 0, 'all ' .. (#RESP + 1) .. ' two-chunk splits of the header block connect identically')
 
-    -- feeding after the tunnel opened is a programming error, not silent corruption
+    -- feed() is TOTAL: the documented usage loop in docs/proxy.md is unconditional, and the
+    -- ordinary case (200 in one segment, first tunnel bytes in the next) must not raise.
+    -- Late bytes are appended to leftover and handed back, never dropped, never thrown on.
     local hs3 = newHS()
     hs3:feed(RESP)
-    check(not pcall(function() hs3:feed('x') end), 'feed() after connected raises')
+    eq(hs3.leftover, '', 'nothing after the header block yet')
+    local okLate, stLate, leftLate = pcall(function()
+        local a, b = hs3:feed('GAME')
+        return { a, b }
+    end)
+    check(okLate, 'feed() after connected does not raise')
+    stLate = okLate and stLate[1] or nil
+    leftLate = okLate and (select(2, hs3:feed(''))) or nil
+    eq(stLate, proxy.CONNECTED, 'feed() after connected re-reports connected')
+    eq(hs3.leftover, 'GAME', 'late bytes are appended to leftover, not dropped')
+    eq(leftLate, 'GAME', '   and returned again on the next call')
+    hs3:feed('MORE')
+    eq(hs3.leftover, 'GAMEMORE', 'a second late chunk appends too')
+    eq(select(1, hs3:feed(nil)), proxy.CONNECTED, 'feed(nil) after connected is harmless')
+    eq(select(1, hs3:tick(1)), proxy.CONNECTED, 'tick() after connected still reports connected')
 end)
 
 runSuite('state machine: trailing bytes become leftover', function()
@@ -336,6 +371,25 @@ runSuite('state machine: 407 reports the realm', function()
     hs3:feed('HTTP/1.1 407 Nope\r\nProxy-Authenticate: Basic realm=corp\r\n\r\n')
     eq(hs3.realm, 'corp', 'unquoted realm token parsed')
 
+    -- authSchemes is PLURAL: every scheme the proxy offers, not just the first.  Truncating to
+    -- schemes[1] hid from the operator that Digest or NTLM would also be accepted -- exactly
+    -- the diagnostic docs/proxy.md says the reference throws away and this module recovers.
+    -- The split is quote-aware, so a comma inside a realm is part of the value, not a separator.
+    local function schemesOf(v)
+        local h = newHS()
+        h:feed('HTTP/1.1 407 x\r\nProxy-Authenticate: ' .. v .. '\r\n\r\n')
+        return table.concat(h.authSchemes or {}, '|'), h.realm
+    end
+    eq(schemesOf('Basic realm="r", Digest realm="d", NTLM'), 'Basic|Digest|NTLM',
+       'all three offered schemes are reported')
+    eq(schemesOf('Basic'), 'Basic', 'a single bare scheme still works')
+    eq(schemesOf('Basic realm="corp"'), 'Basic', 'realm parameters are not mistaken for schemes')
+    eq(select(2, schemesOf('Basic realm="a,b", NTLM')), 'a,b',
+       'a comma INSIDE a quoted realm stays part of the realm')
+    eq(schemesOf('Basic realm="a,b", NTLM'), 'Basic|NTLM',
+       '   and does not split the challenge list')
+    eq(schemesOf('Negotiate, Negotiate'), 'Negotiate', 'repeats are de-duplicated')
+
     -- a 403 is a plain rejection, not an auth problem
     local hs4 = newHS()
     local _, m4, k4 = hs4:feed('HTTP/1.1 403 Forbidden\r\n\r\n')
@@ -356,6 +410,14 @@ runSuite('state machine: malformed, oversized, EOF, timeout, 1xx', function()
         { 'HTTP/1.1 20x OK\r\n\r\n',       'three-digit code required' },
         { 'HTTP/1.1\r\n\r\n',              'status line without a code' },
         { '\1\2\3\4\5\6\7\8\r\n\r\n',      'binary garbage' },
+        -- The 3-digit code must be anchored at BOTH ends.  Without the trailing anchor the
+        -- reason phrase absorbed the rest of the token: "2000 OK" parsed as 200 and opened a
+        -- tunnel onto a dead pipe, and "4070 Nope" was reported as 407 'auth-required'.
+        { 'HTTP/1.1 2000 OK\r\n\r\n',      'a 4-digit code is not 200' },
+        { 'HTTP/1.1 200OK\r\n\r\n',        'no delimiter after the code' },
+        { 'HTTP/1.1 2007\r\n\r\n',         'code run together with a digit' },
+        { 'HTTP/1.1 299junk\r\n\r\n',      'code run together with a word' },
+        { 'HTTP/1.1 4070 Nope\r\n\r\n',    'a 4-digit code is not 407 either' },
     }
     for _, c in ipairs(cases) do
         local hs = newHS()
@@ -379,6 +441,30 @@ runSuite('state machine: malformed, oversized, EOF, timeout, 1xx', function()
     local ok9 = newHS{ maxHeaderBytes = 0 }
     eq(select(1, ok9:feed('HTTP/1.1 200 OK\r\nX: ' .. string.rep('a', 100000) .. '\r\n\r\n')),
        proxy.CONNECTED, 'maxHeaderBytes = 0 disables the cap')
+
+    -- The cap must hold when the WHOLE oversized block arrives in ONE chunk: enforced only
+    -- after the parse loop it was never reached, and 4 MB sailed past a 32 KiB cap.
+    local one = newHS{ maxHeaderBytes = 32768 }
+    local stB, _, kB = one:feed('HTTP/1.1 200 OK\r\nX-Pad: '
+                                .. string.rep('a', 4 * 1024 * 1024) .. '\r\n\r\n')
+    eq(stB, proxy.ERROR, 'a 4 MB header block in ONE chunk is refused')
+    eq(kB, 'too-large', '   with kind = too-large')
+    -- ... and a legitimate 200 followed by a huge tunnel payload in the same segment is NOT
+    -- refused: the cap is about the header block, not about how much arrived with it.
+    local pay = newHS{ maxHeaderBytes = 32768 }
+    local stP, leftP = pay:feed('HTTP/1.1 200 OK\r\n\r\n' .. string.rep('z', 4 * 1024 * 1024))
+    eq(stP, proxy.CONNECTED, 'a small header block plus a 4 MB tunnel payload still connects')
+    eq(#leftP, 4 * 1024 * 1024, '   and every payload byte comes back as leftover')
+    -- the same block delivered one byte at a time must reach the same verdict
+    local drip = newHS{ maxHeaderBytes = 256 }
+    local stD, kD
+    local blob = 'HTTP/1.1 200 OK\r\nX-Pad: ' .. string.rep('a', 400) .. '\r\n\r\n'
+    for i = 1, #blob do
+        stD, _, kD = drip:feed(blob:sub(i, i))
+        if stD ~= proxy.NEED_MORE then break end
+    end
+    eq(stD, proxy.ERROR, 'byte-at-a-time delivery hits the same cap')
+    eq(kD, 'too-large', '   with the same kind')
 
     -- peer closed mid-handshake
     local hs2 = newHS()
@@ -418,6 +504,25 @@ runSuite('state machine: malformed, oversized, EOF, timeout, 1xx', function()
     local st7, _, k7 = hs7:feed('HTTP/1.1 100 Continue\r\n\r\n')
     eq(st7, proxy.ERROR, "interim = 'error' rejects 1xx like the reference")
     eq(k7, 'rejected', "interim = 'error' kind")
+
+    -- A 1xx flood must be BOUNDED.  The skip branch resets self.buf, so maxHeaderBytes can
+    -- never fire on it, and a feed-only transport (one that never runs tick()'s watchdog)
+    -- would otherwise spin forever: 200k interim responses used to still say 'need-more'.
+    local hs8 = newHS()
+    local ONE = 'HTTP/1.1 100 Continue\r\n\r\n'
+    local st8, k8
+    for _ = 1, 1000 do
+        st8, _, k8 = hs8:feed(ONE)
+        if st8 ~= proxy.NEED_MORE then break end
+    end
+    eq(st8, proxy.ERROR, 'a 1xx flood is refused instead of looping forever')
+    eq(k8, 'malformed', '   with kind = malformed')
+    eq(hs8.interimCount, proxy.MAX_INTERIM + 1, '   after exactly MAX_INTERIM skips')
+    -- ... while a handful of interim responses is still tolerated, as RFC 9110 requires
+    local hs9 = newHS()
+    local st9, a9 = hs9:feed(string.rep(ONE, proxy.MAX_INTERIM) .. 'HTTP/1.1 200 OK\r\n\r\nT')
+    eq(st9, proxy.CONNECTED, 'MAX_INTERIM interim responses followed by a 200 still connects')
+    eq(a9, 'T', '   with the right leftover')
 end)
 
 runSuite('state machine: no credential ever leaks into text', function()

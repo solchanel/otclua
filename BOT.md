@@ -1,8 +1,8 @@
 # luaclient bot layer — module contract (authoritative for implementers)
 
 > **STATUS: BUILT.** Every module below exists and is exercised offline by
-> `test/botsuite.lua`, which `--selftest` runs on Windows and Debian (1783 bot assertions,
-> 2184 in total, 0 failed as of 2026-09-06). Where the as-built code had to deviate from the
+> `test/botsuite.lua`, which `--selftest` runs on Windows and Debian (2120 bot assertions,
+> 2521 in total, 0 failed as of 2026-09-06). Where the as-built code had to deviate from the
 > contract, the deviation is recorded in **[As built — contract changes](#as-built--contract-changes)**
 > at the end of this file. That section is normative for anyone writing new bot code.
 
@@ -347,3 +347,47 @@ and nothing writes to the user's vBot profile.
 The bot starts on the `gameStart` / `login` event, stops on every shutdown path (which is
 where its storage is persisted), and `--dry-run --bot` builds, wires, ticks and stops it
 offline against a read-only profile.
+
+### 15. Review fixes (2026-09-06) — where they changed the contract
+
+A bot-layer review found and this pass fixed a set of behaviour divergences from vBot.
+Most are internal, but these five change something a caller can see. Every one of them is
+pinned by the `REVIEW: …` sections of `test/botsuite.lua`, which fail against the pre-fix
+code and pass against the current one.
+
+1. **`getMonsters` / `getPlayers` / `getNpcs` return a COUNT, not a list.** That is what
+   vBot does (`vlib.lua:652-760`) and what every real call site compares against
+   (`config.closeLureAmount <= getMonsters(1)`), so a ported snippet used through a
+   `function:` waypoint no longer throws. `getMonsters` excludes summons, `getPlayers`
+   excludes the local player, party members and `emblem == 1`, and `multifloor` is honoured.
+   The old list forms live on as **`getMonsterList` / `getPlayerList` / `getNpcList`**.
+2. **`ctx.cap()` is now an alias of `ctx.freecap()`**, and both read
+   `state.player.freeCapacity` (0xA0). `state.player.capacity` is TOTAL capacity from the
+   0xA1 skill-stats block, and is only the fallback when 0xA0 has not arrived.
+   `bot/supplies.lua`'s `S:freeCap()` follows the same rule. `maxcap`/`capmax` are unchanged.
+3. **`ctx.cancelAttack()` sends 0xA1 `attack(0)` and `ctx.cancelFollow()` sends 0xA2
+   `follow(0)`**, as `g_game.cancelAttack` / `cancelFollow` do. 0xBE, which also drops the
+   other target and stops the server-side auto-walk, is reachable only through
+   `ctx.cancelAttackAndFollow()`.
+4. **`bot/api.lua` no longer keeps its own cooldown cache.** `getSpellData`,
+   `getSpellCoolDown`, `canCast`, `isCooldownIconActive` and `isGroupCooldownIconActive`
+   all read `bot/shared.lua`, so the sandbox, HealBot and AttackBot share one view and the
+   static `data/spells1530.lua` table is consulted first (vlib.lua:333-360). `ctx.storage`
+   is served through the ctx metatable, and `Bot:reloadStorage()` now mutates the storage
+   table in place, so no captured reference is ever orphaned.
+5. **`Bot:stop()` calls `Bot:unwireModules()`**, so a fatal tick error really does leave a
+   stopped bot with no live event hooks. `main.lua`'s explicit call is still harmless.
+
+New deviation switch: `healbot.new(..., { vbotBurstInfinity = true })` reproduces vBot's
+division by zero in `burstDamageValue()` (`math.ceil(d / 0)` → `inf` when two damage
+messages land in the same tick). The default fails closed and returns 0.
+
+New public helpers other modules may use: `A:facing()` / `A:setFacing(dir)` /
+`A:quadrantGrids()`, `TB:facing()` / `TB:avoidTileIds()`, `CB:isInPz()` /
+`CB:onNotEnoughRoom(msg)`. **Never read `state.player.direction` directly** — the wire only
+writes the player's facing onto `state.creatures[<playerId>]`.
+
+Not reproduced (documented omission): vBot's `isFriend` also treats
+`vBot.BotServerMembers` as friends. luaclient has no BotServer roster, so `TB:isFriend`
+covers the friend list, the local player and — with `storage.playerList.groupMembers` set —
+party members, and nothing else.

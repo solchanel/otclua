@@ -501,6 +501,12 @@ function Bot:stop()
         local mod = self.modules[name]
         if mod and mod.onBotStop then pcall(mod.onBotStop, mod) end
     end
+    -- REVIEW FIX: unwireModules() documents itself as "called from stop()", but stop()
+    -- never called it.  main.lua's normal shutdown calls it explicitly; the FATAL path in
+    -- Bot:start's tick wrapper calls stop() directly, and without this the walker's
+    -- walkCancel hook and TargetBot's event hooks stayed live on a "stopped" bot.
+    -- unwireModules is idempotent (both branches pcall optional methods).
+    pcall(self.unwireModules, self)
     self:saveStorage()
     self:info('stopped')
     return true
@@ -536,9 +542,20 @@ function Bot:saveStorage()
     return true
 end
 
+--- REVIEW FIX: mutate the EXISTING table instead of replacing it.  bot/api.lua's sandbox
+--- `storage`, bot/targetbot.lua and bot/loot.lua all capture `bot.storage` by reference;
+--- swapping the table left them writing to an orphan that saveStorage() never persists.
 function Bot:reloadStorage()
     local st, err = self.config:loadStorage()
     if st == nil then return nil, err end
+    local cur = self.storage
+    if type(cur) == 'table' and cur ~= st then
+        for k in pairs(cur) do cur[k] = nil end
+        for k, v in pairs(st) do cur[k] = v end
+        local sh = config.shapeOf and config.shapeOf(st)
+        if sh and config.setShape then config.setShape(cur, sh.kind, sh.order) end
+        st = cur
+    end
     self.storage = st
     if type(self.storage._macros)  ~= 'table' then self.storage._macros  = {} end
     if type(self.storage._configs) ~= 'table' then self.storage._configs = {} end

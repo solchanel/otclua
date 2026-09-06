@@ -21,6 +21,7 @@ Pathfinder support (used by bot/path.lua, all first-class behaviour):
 
     w:classifyForPath(pos, allowOnlyVisibleTiles)
         -> wasSeen, hasCreature, notWalkable, notPathable, mapColor, speed
+    w:knownAt(pos) -> flags, colorByte, speedByte   -- the persisted minimap, work item M
     w:isFloorChangeTile(pos, avoidIds) -> bool, why
     w:groundSpeed(tile) / w:minimapColor(tile) / w:elevationCount(tile)
     w:getTopUseThing(tile)
@@ -137,13 +138,41 @@ local REQUIRED = {
     'groundSpeed', 'minimapColor', 'elevation', 'lensHelp',
 }
 
-local function resolveItems(items)
+--- Wrap a resolved accessor in the id guard game/state.lua applies to every one of its
+--- own calls (state.lua:626-641).  REVIEW FIX: proto/items.lua defines every accessor
+--- unconditionally and RAISES for an unloaded table or an out-of-range id
+--- (proto/items.lua:447-457), and an error escaping world:classifyForPath propagates out
+--- of the CaveBot macro, which bot/init.lua then retries every 10 ms forever.
+--- This is exactly game/state.lua:632's `exact and type(id) == 'number' and id >= 1 and
+--- id <= items.MAX_ID` test, which is the complete precondition proto/items.lua's checkId
+--- enforces -- so no pcall is needed and the pathfinder's hot loop keeps its speed.
+local function guard(fn, dflt, maxId)
+    return function(id, ...)
+        if type(id) ~= 'number' or id < 1 or id ~= floor(id) then return dflt end
+        if maxId and maxId > 0 and id > maxId then return dflt end
+        return fn(id, ...)
+    end
+end
+
+local GUARD_DEFAULT = {
+    isGround = true, isGroundBorder = false, isOnBottom = false, isOnTop = false,
+    isNotWalkable = false, isNotPathable = false, isBlockProjectile = false,
+    isForceUse = false, isSplash = false,
+    groundSpeed = 100, minimapColor = 0, elevation = 0, lensHelp = 0,
+}
+
+local function resolveItems(items_)
     local api, missing = {}, {}
+    -- REVIEW FIX: `type(fn) == 'function'` is true even when the item table was never
+    -- loaded, so world.new used to report itemDataLevel = 'full' and every classifier
+    -- raised on the first call.  An unloaded table means NO metadata at all.
+    local loaded = (items_ ~= nil) and (items_.loaded ~= false)
+    local maxId = loaded and tonumber(items_ and items_.MAX_ID) or nil
     for i = 1, #REQUIRED do
         local name = REQUIRED[i]
-        local fn = items and items[name]
+        local fn = loaded and items_ and items_[name] or nil
         if type(fn) == 'function' then
-            api[name] = fn
+            api[name] = guard(fn, GUARD_DEFAULT[name], maxId)
         else
             missing[#missing + 1] = name
         end
@@ -203,7 +232,14 @@ function world.new(client, opts)
             table.concat(missing, ', '))
     end
 
-    self.known = opts.known           -- optional persistent minimap substitute
+    -- Work item M: knowledge of the world OUTSIDE the aware area.  `opts.known` is anything
+    -- with `:get(pos) -> flags, colorByte, speedByte`; lib/minimap.lua (the reader for the
+    -- reference client's profiles/minimap.otmm) is the real one, and main.lua threads it in
+    -- through bot/init.lua.  `client.minimap` is picked up automatically so a world built
+    -- without opts (bot/path.lua, bot/walker.lua, ...) still sees it.
+    self.known = opts.known
+    if self.known == nil and client then self.known = client.minimap end
+    self.knownFailed = false
     return self
 end
 
@@ -212,10 +248,22 @@ end
 world.KNOWN_WAS_SEEN, world.KNOWN_NOT_PATHABLE = 1, 2
 world.KNOWN_NOT_WALKABLE, world.KNOWN_EMPTY    = 4, 8
 
+-- Fails OPEN and fails ONCE.  classifyForPath is called tens of thousands of times per
+-- search from inside a CaveBot macro, and an error escaping it is retried every 10 ms
+-- forever by bot/init.lua -- so a minimap source that raises is reported once and then
+-- ignored for the rest of the session, exactly as if no minimap had been loaded.
 function world:knownAt(pos)
     local k = self.known
-    if not k then return 0, 255, 10 end
-    local f, c, s = k:get(pos)
+    if not k or self.knownFailed then return 0, 255, 10 end
+    local ok, f, c, s = pcall(k.get, k, pos)
+    if not ok then
+        self.knownFailed = true
+        if self.log and self.log.warn then
+            self.log.warn('bot/world: the minimap source raised (%s); pathing falls back to '
+                .. 'the aware area only', tostring(f))
+        end
+        return 0, 255, 10
+    end
     return f or 0, c or 255, s or 10
 end
 
@@ -452,6 +500,13 @@ end
 --   aware branch (1406-1414): a MISSING tile keeps the defaults (unlike variant B!)
 --   minimap branch (1415-1424), skipped when allowOnlyVisibleTiles:
 --     blocked (not walkable OR not pathable) IMPLIES wasSeen (1421-1422); speed = byte * 10
+--
+-- The minimap branch reads `self.known` (work item M) -- normally the lib/minimap.lua reader
+-- over the reference client's profiles/minimap.otmm.  The LIVE MAP ALWAYS WINS: the minimap
+-- is consulted only when state:isAwareOf(pos) is false, so a tile the server has described
+-- classifies exactly as it did before this fallback existed, even when the two disagree.
+-- With no minimap loaded, knownAt answers the null tile (0, 255, 10) and every outside tile
+-- is `not wasSeen` -- i.e. blocked unless allowUnseen, which is the pre-work-item-M behaviour.
 -- ---------------------------------------------------------------------------
 function world:classifyForPath(pos, allowOnlyVisibleTiles)
     local wasSeen, hasCreature = false, false
@@ -611,9 +666,19 @@ end
 -- ---------------------------------------------------------------------------
 -- spectators
 -- ---------------------------------------------------------------------------
+--- REVIEW FIX: Map::getSpectatorsInRangeEx (src/client/map.cpp:658-668) derives the z span
+--- from `getFirstAwareFloor()` / `getLastAwareFloor()`, and both read `m_centralPosition.z`
+--- (map.cpp:815-829) -- NOT the query centre's z.  Taking it from the query centre made a
+--- multi-floor spectator query centred off the player's floor return a different creature
+--- set entirely.  The C++ minZRange/maxZRange are uint8_t and wrap when the centre is
+--- above the first aware floor; we clamp deliberately instead.
 local function awareFloors(st, z, multifloor)
     if not multifloor then return z, z end
-    return st.firstAwareFloor(z), st.lastAwareFloor(z)
+    local cz = (st.central and st.central.z)
+               or (st.player and st.player.pos and st.player.pos.z) or z
+    local z0, z1 = st.firstAwareFloor(cz), st.lastAwareFloor(cz)
+    if z0 > z1 then z0, z1 = z1, z0 end          -- the uint8_t wrap, clamped
+    return z0, z1
 end
 
 -- spectatorsInAwareRange (functions/map.lua:8-37): the aware rectangle around `pos`;
@@ -706,7 +771,15 @@ function world:spectatorsByPattern(centre, gridStr, direction)
     return out
 end
 
-local function isMonster(c) return c.isMonster == true end
+--- REVIEW FIX: game/state.lua sets isMonster for types 1/3/4, but vBot's
+--- getMonstersInArea excludes summons on every branch (`spec:getType() < 3`,
+--- AB:2559/2571) -- and bot/world.lua:countInArea is the helper BOT.md tells new code to
+--- use.  Pass opts.includeSummons to get the loose form back.
+local function isMonster(c, includeSummons)
+    if c.isMonster ~= true then return false end
+    if includeSummons then return true end
+    return c.type == nil or c.type < 3
+end
 local function isPlayerC(c) return c.isPlayer == true end
 
 function world:monsters(pos, range)
@@ -769,7 +842,8 @@ function world:countInArea(centerPos, pattern, dir, opts)
     for i = 1, #specs do
         local c = specs[i]
         local hp = c.healthPercent or 100
-        if c.id ~= myId and isMonster(c) and hp >= minHp and hp <= maxHp then
+        if c.id ~= myId and isMonster(c, opts.includeSummons)
+           and hp >= minHp and hp <= maxHp then
             local nameOk = true
             if names and #names > 0 then
                 nameOk = false

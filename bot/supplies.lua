@@ -293,17 +293,27 @@ function S:lootPouchPages()
     if not c then return nil end
     local capacity = num(c.capacity, 0)
     if capacity <= 0 then return nil end
-    local size = num(c.size, nil)
-    if size == nil then size = #(c.items or {}) end
+    -- supply_check.lua:47-50: `local size = c:getSize() or 0; if size <= 0 then size =
+    -- c:getItemsCount() or 0 end`.  0 is what the server reports for containers it does
+    -- not paginate, which is the common case -- so fall back on <= 0, not on nil.
+    local size = num(c.size, 0)
+    if size <= 0 then size = #(c.items or {}) end
     return ceil(size / capacity)
 end
 
 -- ---------------------------------------------------------------------------
 -- player probes
 -- ---------------------------------------------------------------------------
+--- REVIEW FIX: vBot's freecap() is `player:getFreeCapacity()`.  proto/parser.lua:1773
+--- (0xA0) stores that as `player.freeCapacity`; `player.capacity` is TOTAL capacity and
+--- only exists when the 0xA1 F_CHARACTER_SKILL_STATS block was sent (otherwise 0).
+--- Using total broke branch 10 (capacity refill) and _actionSellAll's whole termination
+--- test, which detects "nothing more sold" by watching free capacity stop changing.
 function S:freeCap()
     local p = self.state and self.state.player
-    return num(p and p.capacity, 0)
+    if not p then return 0 end
+    if type(p.freeCapacity) == 'number' then return p.freeCapacity end
+    return num(p.capacity, 0)                    -- last-resort fallback only
 end
 
 function S:stamina()
@@ -403,7 +413,9 @@ function S:checkRound(opts)
         return 'capacity'
     end
     -- 11 -------------------------------------------------------------------- loot pouch
-    if ad.lootPouch.enabled then
+    -- supply_check.lua:97 -- `pouchCfg.enabled and pouchLimit > 0 and lootPouchPages()`:
+    -- a lootPouchValue of 0 (or absent / non-numeric) DISABLES the check entirely.
+    if ad.lootPouch.enabled and num(ad.lootPouch.value, 0) > 0 then
         local pages = self:lootPouchPages()
         if pages and pages >= ad.lootPouch.value then return 'lootPouch' end
     end
@@ -414,6 +426,9 @@ end
 --- Round bookkeeping, kept here so cavebot.lua stays a pure dispatcher.
 function S:roundCompleted()
     self.supplyRetries = self.supplyRetries + 1
+    -- supply_check.lua:29 -- setCaveBotData() ends with `missedChecks = 0` on BOTH paths,
+    -- so missedChecks counts only CONSECUTIVE out-of-position supply checks.
+    self.missedChecks  = 0
     self.stats.rounds  = self.stats.rounds + 1
     return self.supplyRetries
 end

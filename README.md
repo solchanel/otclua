@@ -14,13 +14,21 @@ The byte-level truth for every wire detail lives in [`docs/`](docs/); the module
 file is written against is [`API.md`](API.md). In each doc the **`## VERIFIER (Corrections)`
 section overrides the spec body above it**.
 
-**Current status (measured 2026-09-06, both OSes):** `--selftest` **2184 passed / 0 failed** on
-Windows 11 x64 and on Debian 13 x64 (WSL2) — 401 client assertions plus 1783 in the bot layer
-(`test/botsuite.lua`, which also embeds the six per-module suites). The offline end-to-end test — the real `main.lua`
-logging into `test/fakeserver.lua` over a real loopback socket — is **37 checks / 0 failed** on
-both. The live HTTPS login is verified against `www.gunzodus.net` with an invalid account on
-both: it prints the server's own message and exits **2**. **No real authenticated game session
-has ever been established** — that needs credentials. See [Status](#status).
+**Current status (measured 2026-09-06, both OSes):** `--selftest` **2521 passed / 0 failed** on
+Windows 11 x64 and on Debian 13 x64 (WSL2) — 401 client assertions plus 2120 in the bot layer
+(`test/botsuite.lua`, which also embeds the six per-module suites). The offline end-to-end test —
+the real `main.lua` logging into `test/fakeserver.lua` over a real loopback socket — is
+**37 checks / 0 failed** on both, and `test/replay.lua` consumes every byte of both committed live
+corpora on both.
+
+**It plays on the live server.** On GunzodusBR (protocol 1530) the client logs in, enters the
+game, keeps the session alive indefinitely, and the bot layer walks a CaveBot route read
+unchanged from a real vBot 4.8 profile: a 195-second session sent **450 walk packets and got 450
+server moves, 1:1, with never more than one step in flight and zero resyncs**, looping its route
+about 22 times with no disconnect. With the reference client's `minimap.otmm` loaded it also
+paths to waypoints far outside the aware area. What it has **not** done live is fight, loot, buy
+supplies or change floor. See [Status](#status) and
+[`docs/live-findings.md`](docs/live-findings.md).
 
 ---
 
@@ -275,15 +283,15 @@ never modify it.
 
 `test/botsuite.lua` (folded into `--selftest`) builds a synthetic world on the real
 `game/state.lua`, with the real `assets/items1530.bin` metadata and an ASCII map compiled into
-tiles, and drives the whole stack through `bot:tick()`. **1783 assertions, 0 failed, on Windows
-and Debian**, of which 127 are the integration tests in `botsuite.lua` itself and the rest come
+tiles, and drives the whole stack through `bot:tick()`. **2120 assertions, 0 failed, on Windows
+and Debian**, of which 451 are the integration tests in `botsuite.lua` itself and the rest come
 from the six embedded per-module suites:
 
 | Suite | Assertions | Covers |
 |---|---|---|
 | `test/f1_metadata.lua` | 446 | the v2 item table and the tile flag cache |
 | `test/bot_f2_path.lua` | 174 | the pathfinder and the walker |
-| `test/bot_f3.lua` | 259 | the bot core (macros, schedule, delay, storage) and `bot/api.lua` |
+| `test/bot_f3.lua` | 275 | the bot core (macros, schedule, delay, storage) and `bot/api.lua` |
 | `test/bot_m1.lua` | 295 | HealBot + AttackBot against the user's real JSON |
 | `test/bot_m2_cavebot.lua` | 220 | CaveBot + supplies against the user's real routes |
 | `test/bot_m3_target.lua` | 259 | TargetBot selection/combat and the looting machine |
@@ -299,10 +307,22 @@ json-encoding cleanly; and storage round-tripping without dropping unknown field
 
 Every one of those runs offline. There is no network in the bot test path at all.
 
-### Not proven — no live session has ever run the bot
+### Proven live
 
-* **Nothing in the bot layer has ever driven a real character.** Every packet it would send has
-  been asserted against a capturing fake sender, never accepted by a server.
+CaveBot and the walker have driven the real character on GunzodusBR: a 195-second session that
+sent 450 walk packets and got 450 server moves (1:1, all landing on the predicted tile, never
+more than one step in flight), looping a four-waypoint route about 22 times, plus a second
+session that walked a 21-tile corridor end to end ten times using the reference client's
+`minimap.otmm` for tiles outside the aware area. Both routes were read from a vBot profile
+directory in the user's own format. `docs/live-findings.md` has the logs.
+
+### Not proven — the bot has walked live, but never fought
+
+* **HealBot, AttackBot and TargetBot have never acted against a real server.** Every packet they
+  would send has been asserted against a capturing fake sender only: no spell, rune, attack or
+  loot has ever gone out on a live socket, and no live spell cooldown has been observed.
+* **No live floor change**, so none of the user's real (multi-floor) hunting routes has been run
+  end to end.
 * **The refill family** (`buysupplies`, `sellall`, `depositor`, `bank`, `travel`) is implemented
   but only lightly exercised: the depot reach/open state machine has no synthetic fixture.
 * **`stowdeposit`, `forge`, `imbuing`, `tasker`, `rushlure` and the withdraw family** are
@@ -400,29 +420,51 @@ plus `LC.bot` while the bot layer is running. The bot contract lives in [`BOT.md
   Windows and on Debian.
 
 * **Bot layer** — the whole vBot 4.8 behaviour set, driven end to end through `bot:tick()`
-  against a synthetic world in `test/botsuite.lua` (1783 assertions on both OSes), consuming the
+  against a synthetic world in `test/botsuite.lua` (2120 assertions on both OSes), consuming the
   user's real `HealBot.json` / `AttackBot.json` / `Supplies.json` / `cavebot_configs/*.cfg` /
   `targetbot_configs/*.json` unchanged. See [Bot layer](#bot-layer).
 
+### Works, and has been proven against the live server
+
+* **A full authenticated session.** HTTPS login → world preamble → challenge → 151-byte login
+  packet → pending → both enter-game frames → `login success (player id 268814903)`. The RSA
+  block, the `u16 2` gunz marker, the `"261"` extended-data literal, the FNV-1a hwid and content
+  revision `42196` are all accepted by the real server. Opcode 28 is the right pong: the
+  keepalive has held sessions open for minutes at a stretch.
+* **The parser, at scale, on real data.** Two committed corpora recorded with `--capture=`
+  (`test/fixtures-first-session.cam`, `test/fixtures-v-session.cam` — 1,262 records, 100 KB,
+  2,061 opcodes, including a full map description, 438 map row slices and 517 creature moves) are
+  replayed byte-exactly by `test/replay.lua`.
+* **Walking, correctly paced.** 450 walk packets → 450 server moves in 195 s, every one landing on
+  the tile the walker predicted, never more than one step in flight, 410-420 ms apart. Step
+  duration comes from the creature's speed through `hasSpeedFormula()`, not from a fallback.
+* **CaveBot running a route from the user's own profile format**, looping ~22 times in one
+  session, with `gotolabel` jumps and zero anti-lost, blocked or no-path events.
+* **Long-distance pathing over the reference client's `minimap.otmm`** — a 21-tile corridor
+  walked end to end ten times with both waypoints outside the aware area. The same route with
+  `--minimap=off` cannot start, which is what proves the minimap is doing the work.
+* **A clean logout** (0x14 `LeaveGame`) on every shutdown path, so a run leaves no ghost session
+  behind.
+
+`docs/live-findings.md` has the logs, the numbers and the four bugs the live sessions found — all
+four now closed.
+
 ### Not proven, and honest about it
 
-* **No real authenticated session has ever been established.** Everything past the HTTPS reply
-  has only been exercised against fixtures and a fake server. In particular the server may reject
-  the login packet for reasons no offline test can see: the `u16 2` gunz marker and the `"261"`
-  extended-data literal inside the RSA block are marked UNVERIFIED in the docs, the hwid is an
-  FNV-1a of the account name rather than the real volume fingerprint the original binary sends,
-  and the content revision falls back to `42196`.
-* **Opcode 28 for the pong is flagged UNVERIFIED** in the reference source. If the keepalive is
-  what drops the session, try 30 (`proto/sender.lua:pingBack`).
+* **The client has never fought anything.** HealBot, AttackBot and TargetBot are complete and
+  covered offline, but no spell, rune or attack has ever been sent to the live server, no corpse
+  has been looted live, and no live spell cooldown (0xA4/0xA5) has ever been observed. Every live
+  session so far ran in an empty corridor with `danger 0`.
+* **No live floor change.** Every live session stayed on one floor. Stairs, ladders, ropes, holes
+  and the surface → underground `0x6C` path are offline-only, so no *real* hunting route (they are
+  all multi-floor) has been run end to end.
+* **Supplies, refill, banking and depositing are untested live** — no NPC trade, bank or depot
+  window has ever been opened against the real server.
+* **Anti-lost recovery has never triggered live**, because nothing has yet gone wrong to trigger
+  it.
 * **Inbound compression has never been seen from Gunzodus.** Both modes are implemented and
   tested against zlib-produced blobs, but whether the server ever sets bit 31 — and which mode it
   would use — is unknown.
-* **No 1530 `.cam` corpus.** The replay path is proven on captures this repo generates. Record a
-  real one with `--capture=` on the first successful login; that is the single highest-value
-  artefact for validating the parser against the live server.
-* **Map parsing at scale is untested against real data.** Tile descriptions, floor changes and
-  creature appearances are implemented and unit-tested with hand-built packets, but no full map
-  description from the live server has ever been parsed.
 * **2FA (`--token`)** is byte-verified against the reference JSON only; it has not been exercised
   against an account with an authenticator.
 * **TLS certificate and hostname verification are disabled** on the login POST, deliberately, to

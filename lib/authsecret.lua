@@ -50,22 +50,41 @@
 --  * No constant-time guarantee below the Lua level.  The tag compare accumulates instead of
 --    returning early, but a tracing JIT, the GC and the CPU caches make real constant time
 --    unattainable in pure Lua.  Plaintexts and keys live in immutable Lua strings that cannot be
---    wiped and may be copied by the collector.
---  * File permissions are enforced on POSIX only (chmod 0600 via FFI).  On Windows the file
---    inherits the data directory's ACL -- keep the hub's data dir out of shared locations.
+--    wiped and may be copied by the collector -- see the HAZARDS block at the top of
+--    lib/pbkdf2.lua for what that means for core dumps, swap and logging.  In particular: never
+--    hand a box or a plaintext to a serialiser or a log formatter.
+--  * File permissions are enforced on POSIX only (chmod 0600 via FFI), and the chmod's return
+--    value is now checked -- a filesystem where chmod fails (a fixed-mode bind mount, CIFS) is a
+--    hard error, not a silent 0644.  On Linux the key file is created with open(2)
+--    O_CREAT|O_EXCL|O_NOFOLLOW and mode 0600 in ONE call, so the path cannot be swapped or
+--    symlinked between the stat, the create and the chmod.  Elsewhere (Windows, other POSIX)
+--    creation falls back to io.open + chmod + read-back, which is not atomic: the key file must
+--    live in a directory only the hub user can write.  On Windows it simply inherits the data
+--    directory's ACL -- keep the hub's data dir out of shared locations.
+--  * The master secret is checked for the one degenerate shape a length test cannot see: a file
+--    of 32 identical bytes (all-zero placeholders, `dd if=/dev/zero`, a sparse-restore hole) is
+--    refused.  That is a corruption check, not a randomness test -- nothing here can tell CSPRNG
+--    output from any other 32 bytes.
 --  * The "1" in the record is a version for the whole suite (KDF + cipher + MAC + encoding).  A
---    future v2 can be added next to it; decrypt() rejects anything it does not know.
+--    future v2 can be added next to it; decrypt() rejects anything it does not know.  When it
+--    arrives, bump the HKDF info strings in fromKey() to .../v2/enc and .../v2/mac as well, so
+--    cross-version substitution is impossible even if a label is wrong.
 --
 -- ============================================================================================
 -- API
 -- ============================================================================================
---   authsecret.open(path)          -> box | nil, err   -- load `path`, creating it if absent
+--   authsecret.open(path [, opts])  -> box, created | nil, err
+--        Loads `path`.  A MISSING key file is an ERROR unless opts.allowCreate is true: minting
+--        a fresh master secret over a data dir that already holds `sbx$` records makes every one
+--        of them undecryptable, and the failure looks exactly like tampering.  The hub must pass
+--        allowCreate only when it has checked that accounts.json / proxies.json hold no record.
 --   authsecret.load(path)          -> box | nil, err   -- load, error if absent
 --   authsecret.create(path)        -> box | nil, err   -- create, error if it already exists
 --   authsecret.fromKey(master32)   -> box              -- for tests / an externally managed key
 --   box:encrypt(plaintext [, aad]) -> record string
 --   box:decrypt(record [, aad])    -> plaintext | nil, err
---   box:isRecord(s)                -> boolean          -- looks like one of our records
+--   box:isRecord(s)                -> boolean   -- a well-formed record OF THIS VERSION (shape
+--                                                  only: authenticity needs decrypt())
 --   box:rewrap(record, aad, newAad) -> record | nil, err
 --   authsecret.chacha20(key32, nonce12, counter, data) -> keystream-XORed data (RFC 8439 2.4)
 --   authsecret.chacha20Block(key32, nonce12, counter)  -> the raw 64-byte block (RFC 8439 2.3)
@@ -225,39 +244,114 @@ function M.chacha20(key, nonce, counter, data)
 end
 
 -- ============================================================ key file access
-local chmod600
+-- `chmod600` reports whether chmod(2) ACTUALLY SUCCEEDED, not merely whether the FFI call
+-- returned: a chmod that fails with EPERM (fixed-mode bind mount, ACL-backed or CIFS filesystem)
+-- must not be mistaken for a 0600 file.  `posixCreate600`, where it exists, removes the
+-- stat/create/chmod race entirely by asking the kernel for exclusive creation at mode 0600.
+local chmod600, posixCreate600
 do
   local ok, ffi = pcall(require, 'ffi')
   if ok and ffi.os ~= 'Windows' then
     pcall(ffi.cdef, 'int chmod(const char *path, unsigned int mode);')
     chmod600 = function(path)
-      local good = pcall(function() return ffi.C.chmod(path, 384) end)   -- 0600
-      return good
+      local called, rc = pcall(function() return ffi.C.chmod(path, 384) end)   -- 0600
+      return called and tonumber(rc) == 0
+    end
+    if ffi.os == 'Linux' then
+      -- The O_* values below are the Linux asm-generic ones; other POSIX kernels number them
+      -- differently, so this fast path is deliberately Linux-only.
+      local cdefOk = pcall(ffi.cdef, [[
+        int open(const char *path, int flags, unsigned int mode);
+        long write(int fd, const void *buf, unsigned long count);
+        int close(int fd);
+        int fsync(int fd);
+      ]])
+      if cdefOk then
+        local O_WRONLY, O_CREAT, O_EXCL, O_NOFOLLOW = 1, 64, 128, 131072
+        posixCreate600 = function(path, data)
+          local fd = ffi.C.open(path, bit.bor(O_WRONLY, O_CREAT, O_EXCL, O_NOFOLLOW), 384)
+          fd = tonumber(fd)
+          if not fd or fd < 0 then
+            return nil, 'cannot create ' .. tostring(path) ..
+                        ' exclusively at mode 0600 (it may already exist, or be a symlink)'
+          end
+          local off, n = 0, #data
+          while off < n do
+            local w = tonumber(ffi.C.write(fd, ffi.cast('const char *', data) + off, n - off))
+            if not w or w <= 0 then
+              ffi.C.close(fd)
+              return nil, 'short write to ' .. tostring(path)
+            end
+            off = off + w
+          end
+          ffi.C.fsync(fd)
+          if tonumber(ffi.C.close(fd)) ~= 0 then
+            return nil, 'cannot close ' .. tostring(path)
+          end
+          return true
+        end
+      end
     end
   else
     chmod600 = function() return false end
   end
 end
 
+--- Read a whole file.  io.open() succeeding does NOT mean the read succeeds -- io.open on a
+--- directory succeeds on Linux and read('*a') then returns nil -- so give that its own message
+--- rather than propagating a bare nil up through load() and open().
 local function readFile(path)
   local f, err = io.open(path, 'rb')
   if not f then return nil, err or ('cannot open ' .. tostring(path)) end
-  local data = f:read('*a')
+  local data, rerr = f:read('*a')
   f:close()
+  if type(data) ~= 'string' then
+    return nil, sformat('cannot read %s: %s', tostring(path),
+                        tostring(rerr or 'not a regular file'))
+  end
   return data
 end
 
---- Create `path` with 0600 BEFORE any secret byte is written to it, then write the key.
+--- Create `path` at mode 0600 and write the key.  Fails LOUDLY and leaves no file behind:
+--- Lua buffers writes, so ENOSPC/EDQUOT/EIO usually surfaces at close(), and a discarded close
+--- error means a truncated key on disk while the caller encrypts under the full key in RAM --
+--- every record written in that session would be unrecoverable after the next restart.
 local function writeKeyFile(path, key)
-  local f, err = io.open(path, 'wb')
-  if not f then return nil, 'cannot create ' .. tostring(path) .. ': ' .. tostring(err) end
-  f:close()
-  chmod600(path)                       -- tighten while the file is still empty
-  f, err = io.open(path, 'wb')
-  if not f then return nil, 'cannot write ' .. tostring(path) .. ': ' .. tostring(err) end
-  f:write(key)
-  f:close()
-  chmod600(path)
+  if posixCreate600 then
+    local ok, err = posixCreate600(path, key)
+    if not ok then return nil, err end
+  else
+    local f, err = io.open(path, 'wb')
+    if not f then return nil, 'cannot create ' .. tostring(path) .. ': ' .. tostring(err) end
+    f:close()
+    if not chmod600(path) and not sys.isWindows then
+      os.remove(path)
+      return nil, 'cannot set mode 0600 on ' .. tostring(path) ..
+                  ' -- refusing to write a master secret this filesystem cannot protect'
+    end
+    f, err = io.open(path, 'wb')
+    if not f then
+      os.remove(path)
+      return nil, 'cannot write ' .. tostring(path) .. ': ' .. tostring(err) end
+    local wrote, werr = f:write(key)
+    local closed, cerr = f:close()
+    if not wrote or not closed then
+      os.remove(path)
+      return nil, 'cannot write ' .. tostring(path) .. ': ' .. tostring(werr or cerr or 'unknown')
+    end
+    if not chmod600(path) and not sys.isWindows then
+      os.remove(path)
+      return nil, 'cannot set mode 0600 on ' .. tostring(path)
+    end
+  end
+  -- Read it back before anyone encrypts under this key: a partially written file must never be
+  -- paired with the full in-memory key.
+  local back = readFile(path)
+  if back ~= key then
+    os.remove(path)
+    return nil, 'key file readback mismatch for ' .. tostring(path) ..
+                ' (the write did not land; nothing has been encrypted under it)'
+  end
   return true
 end
 
@@ -265,15 +359,40 @@ end
 local Box = {}
 Box.__index = Box
 
+-- The two sub-keys are held OUT of the box table, in a weak-keyed side table, so the box itself
+-- has no fields at all: json.encode(box) is `{}`, pairs(box) yields nothing, and a stray
+-- log.debug('box=%s', ...) cannot publish 512 bits of key material to every panel session.
+-- Weak keys mean this table never keeps a box alive; a box always keeps its own entry alive.
+local KEYS = setmetatable({}, { __mode = 'k' })
+
+Box.__tostring = function(self)
+  return 'authsecret.box<' .. self:fingerprint() .. '>'
+end
+
+--- A master secret of 32 identical bytes is a placeholder or a corrupted/sparse file, never
+--- CSPRNG output.  This is the one degenerate shape the length check cannot see.
+local function constantByte(data)
+  local b1 = sbyte(data, 1)
+  for i = 2, #data do if sbyte(data, i) ~= b1 then return nil end end
+  return b1
+end
+
 --- Build a box from a 32-byte master secret.
 function M.fromKey(master)
   if type(master) ~= 'string' or #master ~= M.KEY_SIZE then
     error('authsecret: master secret must be exactly 32 bytes', 2)
   end
-  return setmetatable({
-    kenc = hmac.sha256(master, 'luaclient/authsecret/v1/enc\1'),
-    kmac = hmac.sha256(master, 'luaclient/authsecret/v1/mac\1'),
-  }, Box)
+  local c = constantByte(master)
+  if c then
+    error(sformat('authsecret: master secret is a constant byte (0x%02x) -- refusing; ' ..
+                  'the key is a placeholder or corrupt', c), 2)
+  end
+  local self = setmetatable({}, Box)
+  KEYS[self] = {
+    enc = hmac.sha256(master, 'luaclient/authsecret/v1/enc\1'),
+    mac = hmac.sha256(master, 'luaclient/authsecret/v1/mac\1'),
+  }
+  return self
 end
 
 function M.load(path)
@@ -282,6 +401,11 @@ function M.load(path)
   if #data ~= M.KEY_SIZE then
     return nil, sformat('%s: master secret must be exactly %d bytes, found %d',
                         tostring(path), M.KEY_SIZE, #data)
+  end
+  local c = constantByte(data)
+  if c then
+    return nil, sformat('%s: master secret is a constant byte (0x%02x) -- refusing; ' ..
+                        'the file is corrupt or a placeholder', tostring(path), c)
   end
   return M.fromKey(data)
 end
@@ -295,9 +419,18 @@ function M.create(path)
   return M.fromKey(key)
 end
 
---- Load `path`, generating a fresh master secret if it is not there yet.
+--- Load `path`.  A MISSING key file is an error unless opts.allowCreate is true.
 --- Second return value is true when a new key was created.
-function M.open(path)
+---
+--- Minting a new master secret is never a safe default: a lost, renamed, mis-mounted or
+--- wrong-cwd secret.key would otherwise be treated as "first run", and every stored password in
+--- the data dir would then fail with 'authentication failed' -- the exact error tampering
+--- produces, so the operator cannot tell data loss from an attack.  Worse, any code path that
+--- re-encrypts on save would overwrite the original ciphertexts under the new key.  The caller
+--- must therefore look at the surrounding state (does accounts.json / proxies.json hold any
+--- `sbx$` record?) and pass allowCreate only for a genuinely empty data directory.
+function M.open(path, opts)
+  opts = opts or {}
   local f = io.open(path, 'rb')
   if f then
     f:close()
@@ -305,15 +438,24 @@ function M.open(path)
     if not box then return nil, err end
     return box, false
   end
+  if not opts.allowCreate then
+    return nil, tostring(path) .. ' is missing; refusing to mint a new master secret ' ..
+                '(every password already stored would become undecryptable). Restore the key ' ..
+                'file, or pass allowCreate=true for a genuinely empty data directory.'
+  end
   local box, err = M.create(path)
   if not box then return nil, err end
   return box, true
 end
 
+-- The domain label inside the MAC must be the version the record CARRIES, so a future v2 cannot
+-- be authenticated under a v1 label by leaving a hardcoded string behind.
+local MAC_LABEL = 'sbx' .. M.VERSION
+
 local function macInput(nonce, aad, ct)
   local n = #aad
   return concat{
-    'sbx1', nonce,
+    MAC_LABEL, nonce,
     schar(band(rshift(n, 24), 0xff), band(rshift(n, 16), 0xff),
           band(rshift(n, 8), 0xff),  band(n, 0xff)),
     aad, ct,
@@ -325,16 +467,25 @@ function Box:encrypt(plaintext, aad)
   if type(plaintext) ~= 'string' then error('authsecret: plaintext must be a string', 2) end
   aad = aad or ''
   if type(aad) ~= 'string' then error('authsecret: aad must be a string', 2) end
+  local k     = KEYS[self]
   local nonce = sys.randomBytes(M.NONCE_SIZE)
-  local ct    = M.chacha20(self.kenc, nonce, 1, plaintext)
-  local tag   = hmac.sha256(self.kmac, macInput(nonce, aad, ct))
+  local ct    = M.chacha20(k.enc, nonce, 1, plaintext)
+  local tag   = hmac.sha256(k.mac, macInput(nonce, aad, ct))
   return M.PREFIX .. base64.urlencode(nonce) .. '$' ..
                      base64.urlencode(ct)    .. '$' ..
                      base64.urlencode(tag)
 end
 
+--- A SHAPE test: the whole grammar and the version, not a 4-byte prefix.  It says nothing about
+--- authenticity -- a caller that needs to know a record is genuine must call decrypt().
+--- The prefix test it replaces reported a cleartext password beginning with "sbx$" as already
+--- encrypted, which made the obvious migration idiom
+---     if not box:isRecord(v) then v = box:encrypt(v) end
+--- silently skip exactly the plaintexts it was meant to protect.
 function Box:isRecord(s)
-  return type(s) == 'string' and ssub(s, 1, 4) == 'sbx$'
+  if type(s) ~= 'string' then return false end
+  local ver = s:match('^sbx%$([^%$]+)%$[^%$]*%$[^%$]*%$[^%$]*$')
+  return ver == M.VERSION
 end
 
 --- Decrypt.  Returns nil, err for anything that is not an authentic record for this key+aad.
@@ -352,11 +503,12 @@ function Box:decrypt(record, aad)
   if #nonce ~= M.NONCE_SIZE then return nil, 'authsecret: bad nonce length' end
   if #tag ~= M.TAG_SIZE then return nil, 'authsecret: bad tag length' end
 
-  local want = hmac.sha256(self.kmac, macInput(nonce, aad, ct))
+  local k    = KEYS[self]
+  local want = hmac.sha256(k.mac, macInput(nonce, aad, ct))
   if not hmac.equals(want, tag) then
     return nil, 'authsecret: authentication failed'      -- wrong key, wrong aad, or tampering
   end
-  return M.chacha20(self.kenc, nonce, 1, ct)
+  return M.chacha20(k.enc, nonce, 1, ct)
 end
 
 --- Re-encrypt an existing record under a different aad (e.g. after a record id changed).
@@ -368,7 +520,7 @@ end
 
 --- Diagnostics only: never returns key material.
 function Box:fingerprint()
-  return sha2.tohex(hmac.sha256(self.kmac, 'luaclient/authsecret/v1/fingerprint')):sub(1, 16)
+  return sha2.tohex(hmac.sha256(KEYS[self].mac, 'luaclient/authsecret/v1/fingerprint')):sub(1, 16)
 end
 
 return M

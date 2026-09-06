@@ -354,8 +354,12 @@ function targetbot.new(b, config, opts)
     self.stats = { ticks = 0, attacks = 0, steps = 0, aborts = 0,
                    lureAllowances = 0, repositions = 0, spells = 0, runes = 0 }
 
-    self.avoidIds = worldmod.parseIdList(
-        (opts.walkerConfig and opts.walkerConfig.avoidTileIds) or self.walker.cfg.avoidTileIds)
+    -- REVIEW FIX: resolved per call in TB:avoidTileIds() (memoised on the raw string), so
+    -- an edited CaveBot avoidTileIds takes effect immediately, as cavebot/walking.lua:132-166
+    -- does.  Kept as a field only for status()/tests.
+    self._avoidRaw = (opts.walkerConfig and opts.walkerConfig.avoidTileIds)
+                     or self.walker.cfg.avoidTileIds
+    self.avoidIds  = worldmod.parseIdList(self._avoidRaw)
 
     self.loot = lootmod.new{
         client = client, world = self.world, path = self.path,
@@ -542,6 +546,24 @@ function TB:attach()
     if bus then
         self.handles = {
             busOn(bus, 'creatureDisappear', function(c) self:onCreatureDisappear(c) end),
+            -- REVIEW FIX: `lastPos` used to be written ONLY by the spectator scan inside
+            -- TB:tick(), so the corpse hint handed to the looter was up to one full 100 ms
+            -- tick stale and completely absent whenever tick() returned early (any
+            -- TargetBot.delay, e.g. cavebot/stand_lure.lua:137).  vBot reads
+            -- creature:getPosition() live (looting.lua:318).  These two events fire from
+            -- the parser regardless of macro delay.
+            busOn(bus, 'creatureAppear', function(c)
+                if c and c.id and c.pos then
+                    self.lastPos[c.id] = { x = c.pos.x, y = c.pos.y, z = c.pos.z }
+                end
+            end),
+            busOn(bus, 'creatureMove', function(d)
+                local c = d and d.creature
+                local to = d and d.to
+                if c and c.id and to then
+                    self.lastPos[c.id] = { x = to.x, y = to.y, z = to.z }
+                end
+            end),
             busOn(bus, 'containerOpen',     function(c) self.loot:onContainerOpen(c) end),
             busOn(bus, 'containerClose',    function(c) self.loot:onContainerClose(c) end),
             busOn(bus, 'textMessage',       function(m) self.loot:onTextMessage(m) end),
@@ -594,6 +616,18 @@ function TB:disableLuring() self.lureEnabled = false end
 function TB:target()
     if not self.attackingId then return nil end
     return self.state.creatures[self.attackingId]
+end
+
+--- The player's SERVER-side facing.  REVIEW FIX: the wire only ever writes it onto
+--- state.creatures[<playerId>] (proto/parser.lua applyCreature); state.player.direction is
+--- a separate field that only 0xB5 walkCancel touches.
+function TB:facing()
+    local p = self.state.player
+    if not p then return 0 end
+    local c = p.id and self.state.creatures and self.state.creatures[p.id] or nil
+    local d = c and c.direction
+    if type(d) ~= 'number' then d = p.direction end
+    return d or 0
 end
 
 function TB:isInPz()
@@ -668,11 +702,49 @@ function TB:countMonstersWithin(range)
     return n
 end
 
+--- Creature::isPartyMember(): shield in {1,3,4,5,6,7,8,9,10} (gamelib/player.lua:621-626).
+local PARTY_SHIELDS = { [1] = true, [3] = true, [4] = true, [5] = true, [6] = true,
+                        [7] = true, [8] = true, [9] = true, [10] = true }
+local function isPartyMember(c) return PARTY_SHIELDS[(c and c.shield) or 0] == true end
+targetbot.isPartyMember = isPartyMember
+
+--- The CaveBot avoid list, resolved on every call so a config edit takes effect at once
+--- (cavebot/walking.lua:132-166 does the same).  Memoised on the raw string.
+function TB:avoidTileIds()
+    local raw = (self.walker and self.walker.cfg and self.walker.cfg.avoidTileIds)
+                or self._avoidRaw
+    if raw ~= self._avoidRaw or self.avoidIds == nil then
+        self._avoidRaw = raw
+        self.avoidIds  = worldmod.parseIdList(raw)
+    end
+    return self.avoidIds
+end
+
+--- isFriend(name) -- vBot/vlib.lua:419-450.  REVIEW FIX: besides storage.playerList
+--- .friendList, vBot also treats the LOCAL PLAYER as a friend, and -- when
+--- storage.playerList.groupMembers is set -- every party member.  This feeds the mode-3
+--- `rpSafe` player scan in calculatePriority, whose only effect is to CANCEL the attack,
+--- so a party member standing in the 7x7 used to make the port drop its target while
+--- vBot kept fighting.  (vBot.BotServerMembers has no equivalent here -- there is no
+--- BotServer roster in luaclient; see the deviation list.)
 function TB:isFriend(name)
+    if name == nil then return false end
+    local me = self.state.player
+    if me and me.name and tostring(name) == tostring(me.name) then return true end
     local pl = self.storage and self.storage.playerList
-    local list = type(pl) == 'table' and pl.friendList or nil
-    if type(list) ~= 'table' then return false end
-    for i = 1, #list do if list[i] == name then return true end end
+    if type(pl) ~= 'table' then return false end
+    local list = pl.friendList
+    if type(list) == 'table' then
+        for i = 1, #list do if list[i] == name then return true end end
+    end
+    if pl.groupMembers then
+        for _, c in pairs(self.state.creatures or {}) do
+            if c.isPlayer and tostring(c.name or '') == tostring(name)
+               and isPartyMember(c) then
+                return true
+            end
+        end
+    end
     return false
 end
 
@@ -857,7 +929,7 @@ function TB:walk()
     if not dirs or #dirs == 0 then return end
 
     if self:avoidFloorChangeEnabled() then
-        local bad, why = self.world:wouldStepChangeFloor(pos, dirs[1], self.avoidIds)
+        local bad, why = self.world:wouldStepChangeFloor(pos, dirs[1], self:avoidTileIds())
         if bad then
             self:_once('avoid-floor-change',
                        '[TargetBot][AvoidFloorChange]: not stepping onto %s while chasing',
@@ -1061,6 +1133,9 @@ function TB:cavebotGoTo(pos, precision)
     local cb = self.bot and self.bot.modules and self.bot.modules.cavebot
     self.lastGoTo = { pos = copyPos(pos), precision = precision or 0 }
     if not cb then return nil end
+    -- REVIEW FIX: bot/cavebot.lua defines `CB:goTo` (lower-case g); `cb.GoTo` was nil, so
+    -- this branch never fired and every rePosition silently fell through to walkTo.
+    if cb.goTo then return cb:goTo(pos, precision or 0) end
     if cb.GoTo then return cb:GoTo(pos, precision or 0) end
     if cb.walkTo then
         return cb:walkTo(pos, 20, { ignoreCreatures = true, precision = precision or 0 })
@@ -1229,7 +1304,7 @@ function TB:creatureWalk(c, cfg, targets)
             cands = { { x = pos.x, y = pos.y - 1, z = pos.z },
                       { x = pos.x + 1, y = pos.y, z = pos.z } }
         else
-            local dir = pl.direction
+            local dir = self:facing()
             if     diffx ==  1 and dir ~= 1 then self:turn(1)
             elseif diffx == -1 and dir ~= 3 then self:turn(3)
             elseif diffy ==  1 and dir ~= 2 then self:turn(2)

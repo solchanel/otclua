@@ -42,6 +42,13 @@ if not ok_bit then bit = nil end
 local ok_sys, sys = pcall(require, 'lib.sys')
 local realMs = (ok_sys and sys and sys.nowMs) or function() return os.clock() * 1000 end
 
+-- bot/shared.lua owns the ONE spell-cooldown cache and the static spell table; the sandbox
+-- must read the SAME one HealBot/AttackBot do (REVIEW FIX -- api.lua used to keep its own,
+-- customCooldowns-only copy and never consulted data/spells1530.lua at all).
+local shared = require('bot.shared')
+local ok_spells, SPELLDB = pcall(require, 'data.spells1530')
+if not ok_spells or type(SPELLDB) ~= 'table' then SPELLDB = {} end
+
 -- ---------------------------------------------------------------------------
 -- constants restated for the sandbox (functions/const.lua:3-10, 12-18, 20-33 --
 -- the VERIFIER points out that a port restating only the directions leaves
@@ -112,6 +119,11 @@ function api.new(b)
         return ret
     end
 
+    -- Attach the shared cooldown object EAGERLY, so its 0xA4/0xA5/talk hooks are on the
+    -- bus from bot construction -- the sandbox must see the same cache HealBot/AttackBot
+    -- do (REVIEW FIX).
+    local SH = shared.attach(b)
+
     local function st()     return b.state end
     local function player() local s = b.state; return s and s.player or nil end
     local function snd()    return b.sender end
@@ -119,11 +131,14 @@ function api.new(b)
     -- live `now` / `time`; everything else is a plain field lookup
     setmetatable(ctx, { __index = function(_, k)
         if k == 'now' or k == 'time' then return b.now end
+        -- REVIEW FIX: `storage` must be read through the bot, not captured once.  A
+        -- Bot:reloadStorage() used to leave every script writing to an orphaned table
+        -- that saveStorage() never persists.
+        if k == 'storage' then return b.storage end
         return nil
     end })
 
     ctx.bot     = b
-    ctx.storage = b.storage
     ctx.nowMs   = function() return b.now end
     ctx.realMs  = realMs
 
@@ -199,11 +214,31 @@ function api.new(b)
     ctx.vocation = ctx.voc
     ctx.bless  = function() local p = player(); return p and p.blessings or 0 end
     ctx.blessings = ctx.bless
-    ctx.direction = function() local p = player(); return p and p.direction or 0 end
+    -- REVIEW FIX: the wire only writes the player's facing onto
+    -- state.creatures[<playerId>] (proto/parser.lua applyCreature); state.player.direction
+    -- is touched only by 0xB5 walkCancel.
+    ctx.direction = function()
+        local p = player()
+        if not p then return 0 end
+        local s_ = st()
+        local c = p.id and s_ and s_.creatures and s_.creatures[p.id] or nil
+        local d = c and c.direction
+        if type(d) ~= 'number' then d = p.direction end
+        return d or 0
+    end
     ctx.speed  = function() local p = player(); return p and p.speed or 0 end
 
-    ctx.cap     = function() local p = player(); return p and p.capacity or 0 end
-    ctx.freecap = ctx.cap
+    -- REVIEW FIX: vBot's freecap() is player:getFreeCapacity(); proto/parser.lua:1773
+    -- (0xA0) stores that as `freeCapacity`, while `capacity` is TOTAL capacity from the
+    -- 0xA1 skill-stats block (and 0 when that block was never sent).  vBot's cap() calls
+    -- the non-existent LocalPlayer:getCapacity(), so free is the only sane reading.
+    ctx.freecap = function()
+        local p = player()
+        if not p then return 0 end
+        if type(p.freeCapacity) == 'number' then return p.freeCapacity end
+        return p.capacity or 0
+    end
+    ctx.cap     = ctx.freecap
     ctx.maxcap  = function() local p = player(); return p and p.maxCapacity or 0 end
     ctx.capmax  = ctx.maxcap
 
@@ -260,10 +295,19 @@ function api.new(b)
     -- =======================================================================
     -- talking  (functions/player.lua:64-160)
     -- =======================================================================
+    -- REVIEW FIX: spells added in 15.25+ carry an aim byte and the server REJECTS them
+    -- when it is "none", which is what a plain talk sends -- so `say("exura gran")` from a
+    -- function waypoint was silently dropped.  vBot's context.say tries
+    -- modules.game_interface.tryCastSpellMessage() first (functions/player.lua:88-96);
+    -- bot/shared.lua:328-338 already implements the equivalent rule (SPELLDB hit ->
+    -- talkSpell(words, SpellAimTarget = 3)).
     ctx.say = function(text, aimMode, aimPos)
         local s = snd(); if not s then return nil, 'no sender' end
         if aimMode and aimMode ~= 0 then
             return s:talkSpell(text, aimMode, aimPos)
+        end
+        if type(text) == 'string' and SPELLDB[text:lower()] then
+            return s:talkSpell(text, api.SpellAim.Target)
         end
         return s:talk(MODE.Say, 0, '', text)
     end
@@ -316,10 +360,12 @@ function api.new(b)
     -- absolute-deadline tables with no widget gating -- same API, strictly more
     -- correct.  We pick the NUMERIC model deliberately, as the VERIFIER asks.)
     -- =======================================================================
-    b._cooldownUntil      = b._cooldownUntil      or {}   -- [iconId]  = absolute ms
-    b._groupCooldownUntil = b._groupCooldownUntil or {}   -- [groupId] = absolute ms
-    b._spellCastTable     = b._spellCastTable     or {}   -- cast() managed spells
-    b._customCooldowns    = b._customCooldowns    or {}   -- [words] = {id=, group=}
+    -- REVIEW FIX: the 0xA4 / 0xA5 / talk bookkeeping used to be DUPLICATED here, in
+    -- tables that diverged from bot/shared.lua's cdSpell/cdGroup/custom.  bot/shared.lua
+    -- is the one owner (BOT.md "As built" 6); api.lua now reads it.  `_spellCastTable`
+    -- stays local: it is the sandbox's own cast() ledger (vlib.lua:258-277).
+    b._spellCastTable  = b._spellCastTable or {}
+    b._customCooldowns = SH.custom                       -- alias, for ported snippets
 
     -- LC.events is the module singleton (dot-called); lib/events.new() returns a
     -- Bus instance (colon-called).  Support both without guessing.
@@ -329,62 +375,39 @@ function api.new(b)
         return ev.on(name, fn)
     end
 
-    if b.events and b.events.on and not b._cooldownHooked then
-        b._cooldownHooked = true
-        evOn(b.events, 'spellCooldown', function(d)
-            if not d then return end
-            local id, ms = d.spellId or d.iconId, d.delay or d.duration
-            if id and ms then b._cooldownUntil[id] = b.clock() + ms end
-            local words = b._lastPhrase
-            if words and id and not b._customCooldowns[words] then
-                b._customCooldowns[words] = { id = id }
-            end
-        end)
-        evOn(b.events, 'spellGroupCooldown', function(d)
-            if not d then return end
-            local id, ms = d.groupId or d.iconId, d.delay or d.duration
-            if id and ms then b._groupCooldownUntil[id] = b.clock() + ms end
-            local words = b._lastPhrase
-            local e = words and b._customCooldowns[words]
-            if e and id then e.group = e.group or {}; e.group[id] = ms end
-        end)
+    if b.events and b.events.on and not b._castTableHooked then
+        b._castTableHooked = true
+        -- The phrase itself is recorded by bot/shared.lua's own talk hook; this one only
+        -- stamps the sandbox's cast() ledger with the server-confirmed utterance.
         evOn(b.events, 'talk', function(d)
             local p = player()
             if not d or not p or not d.name or not p.name then return end
             if d.name:lower() == tostring(p.name):lower() then
-                b._lastPhrase = tostring(d.text or ''):lower()
-                local rec = b._spellCastTable[b._lastPhrase]
-                if rec then rec.t = b.now end          -- server-confirmed utterance
+                local rec = b._spellCastTable[tostring(d.text or ''):lower()]
+                if rec then rec.t = b.now end
             end
         end)
     end
 
-    ctx.isCooldownIconActive = function(id)
-        return (b._cooldownUntil[id] or 0) > b.clock()
-    end
-    ctx.isGroupCooldownIconActive = function(id)
-        return (b._groupCooldownUntil[id] or 0) > b.clock()
-    end
+    ctx.isCooldownIconActive      = function(id) return SH:spellIconActive(id) end
+    ctx.isGroupCooldownIconActive = function(id) return SH:groupCooldownActive(id) end
     -- vlib.lua reaches these through `modules.game_cooldown` (VERIFIER); expose
     -- the same handle so ported snippets resolve.
     ctx.modules = { game_cooldown = { isCooldownIconActive = ctx.isCooldownIconActive,
                                       isGroupCooldownIconActive = ctx.isGroupCooldownIconActive } }
 
+    -- REVIEW FIX: vBot's getSpellData scans modules.gamelib.SpellInfo['Default'] FIRST
+    -- (vlib.lua:333-360) and only then the runtime-learned customCooldowns.  Looking at
+    -- customCooldowns alone made every real formula fall through canCast's
+    -- "unknown spell -> true" tail (vlib.lua:299).  bot/shared.lua already does this
+    -- correctly against data/spells1530.lua, and owning ONE cooldown cache also removes
+    -- the divergence between b._cooldownUntil and shared's cdSpell/cdGroup.
     ctx.getSpellData = function(words)
-        if type(words) ~= 'string' then return false end
-        local e = b._customCooldowns[words:lower()]
-        if e then return { id = e.id, mana = 1, level = 1, group = e.group } end
-        return false
+        return SH:spellData(words) or false
     end
 
     ctx.getSpellCoolDown = function(words)
-        local data = ctx.getSpellData(words)
-        if not data then return false end
-        if data.id and ctx.isCooldownIconActive(data.id) then return true end
-        for gid in pairs(data.group or {}) do
-            if ctx.isGroupCooldownIconActive(gid) then return true end
-        end
-        return false
+        return SH:spellCooldownActive(words)
     end
 
     --- canCast(spell, ignoreRL, ignoreCd)  (vlib.lua:279-300)
@@ -394,16 +417,12 @@ function api.new(b)
     ctx.canCast = function(spell, ignoreRL, ignoreCd)
         if type(spell) ~= 'string' then return end
         spell = spell:lower()
+        -- cast()-managed spells stay local to the sandbox (vlib.lua:279-285)
         local rec = b._spellCastTable[spell]
         if rec then return (b.now - rec.t) > rec.d or ignoreCd == true end
-        local data = ctx.getSpellData(spell)
-        if data then
-            local cdOk = ignoreCd == true or not ctx.getSpellCoolDown(spell)
-            local rlOk = ignoreRL == true or
-                         (ctx.level() >= (data.level or 1) and ctx.mana() >= (data.mana or 1))
-            return cdOk and rlOk
-        end
-        return true
+        -- everything else goes through bot/shared.lua, which consults
+        -- data/spells1530.lua first and only then the learned customCooldowns.
+        return SH:canCast(spell, ignoreRL, ignoreCd)
     end
 
     --- cast(text, delay): delay nil or < 100 -> a plain say.  Otherwise register
@@ -495,11 +514,18 @@ function api.new(b)
             for idx, it in ipairs(c.items or {}) do
                 if it.id == itemId and (subType == -1 or (it.count or 0) == subType)
                    and (it.tier or 0) == tier then
+                    -- REVIEW FIX: Container::getSlotPosition(slot) is
+                    -- {0xffff, m_id | 0x40, uint8_t(slot)} with the slot PAGE-LOCAL --
+                    -- the index into m_items, NOT firstIndex + index (container.h:37,
+                    -- container.cpp:94/133 re-stamp positions with the local loop index
+                    -- after every add/remove).  On any paged container beyond page 1 the
+                    -- absolute index addressed the wrong slot and was truncated to a u8.
                     local wrapped = setmetatable({}, { __index = it })
-                    wrapped.containerId = c.id
-                    wrapped.slot = (c.firstIndex or 0) + idx - 1
-                    wrapped.stackPos = wrapped.slot
-                    wrapped.pos = { x = 0xFFFF, y = 0x40 + c.id, z = wrapped.slot }
+                    wrapped.containerId  = c.id
+                    wrapped.slot         = idx - 1
+                    wrapped.stackPos     = idx - 1
+                    wrapped.absoluteSlot = (c.firstIndex or 0) + idx - 1
+                    wrapped.pos = { x = 0xFFFF, y = 0x40 + c.id, z = idx - 1 }
                     return wrapped
                 end
             end
@@ -530,7 +556,19 @@ function api.new(b)
         end
         return total
     end
-    ctx.itemAmount = function(itemId, subType) return ctx.findItemCount(itemId, subType) end
+    -- REVIEW FIX: vBot's itemAmount(id) is max(server-pushed count, client-side scan)
+    -- (vlib.lua:783-888) -- the server table is the whole point, because it covers items
+    -- in CLOSED backpacks.  luaclient parses it into state.inventoryCounts
+    -- (proto/parser.lua:1440-1458, keyed itemId*256 + tier); bot/supplies.lua:226-238 uses
+    -- it correctly and this surface did not.  findItemCount stays the pure open scan.
+    ctx.itemAmount = function(itemId, tier)
+        if type(itemId) ~= 'number' then return 0 end
+        local s_ = st()
+        local counts = s_ and s_.inventoryCounts
+        local server = (type(counts) == 'table' and counts[itemId * 256 + (tier or 0)]) or 0
+        local scan = ctx.findItemCount(itemId)
+        return scan > server and scan or server
+    end
 
     -- ---- use / usewith ----------------------------------------------------
     local function thingPos(thing)
@@ -543,6 +581,21 @@ function api.new(b)
     --- use(thing|itemId, [subtype])
     ---   number  -> useInventoryItem: sendUseItem({0xFFFF,0,0}, id, 0, 0)
     ---   object  -> sendUseItem(pos, id, stackpos, 0)
+    --- Game::use (src/client/game.cpp:838-852) passes findEmptyContainerId(), with the
+    --- comment "some items, e.g. parcel, are not set as containers but they are. always
+    --- try to use these items in free container slots."  Only Game::useInventoryItem (the
+    --- numeric-id path, game.cpp:854-863) sends a literal 0.  REVIEW FIX: using a
+    --- backpack/parcel through the object form used to reuse window 0 and close the main
+    --- backpack, breaking the open-container invariant findItem/loot depend on.
+    local function emptyContainerId()
+        local s_ = st()
+        local used = {}
+        if s_ and s_.containers then for id in pairs(s_.containers) do used[id] = true end end
+        for i = 0, 15 do if not used[i] then return i end end
+        return 0
+    end
+    ctx.emptyContainerId = emptyContainerId
+
     ctx.use = function(thing, subtype)
         local s = snd(); if not s then return nil, 'no sender' end
         if type(thing) == 'number' then
@@ -550,7 +603,7 @@ function api.new(b)
         end
         local pos = thingPos(thing)
         if not pos then return nil, 'use: not a thing' end
-        return s:use(pos, thing.id or 0, thing.stackPos or 0, 0)
+        return s:use(pos, thing.id or 0, thing.stackPos or 0, emptyContainerId())
     end
 
     --- usePos(pos, [stackpos]): use whatever is on that tile.  Picks the topmost
@@ -588,9 +641,21 @@ function api.new(b)
     --- sendUseOnCreature, anything else to sendUseItemWith (Game::useWith).
     ctx.useWith = function(thing, target, subtype)
         local s = snd(); if not s then return nil, 'no sender' end
-        local isCreature = type(target) == 'table' and target.id and
-                           (target.isMonster ~= nil or target.isPlayer ~= nil or
-                            target.healthPercent ~= nil)
+        -- REVIEW FIX: the real client tests `toThing->isCreature()`
+        -- (src/client/game.cpp:870-877).  Duck-typing on isMonster/isPlayer/healthPercent
+        -- missed (a) a creature state:addThing synthesised from a tile description before
+        -- its 0x8E arrived (game/state.lua:288-291 creates `{ id = creatureId }` and
+        -- nothing else) and (b) state.player itself -- both of which then built a 0x83
+        -- frame whose u16 toThingId carried a truncated 32-bit CREATURE id.
+        local s_ = st()
+        local isCreature = type(target) == 'table' and (
+              target.kind == 'creature'
+              or target.creatureId ~= nil
+              or (s_ ~= nil and s_.player == target)
+              or (target.id ~= nil and s_ ~= nil and s_.creatures ~= nil
+                  and s_.creatures[target.id] == target)
+              or target.isMonster ~= nil or target.isPlayer ~= nil
+              or target.healthPercent ~= nil)
         if isCreature then return ctx.useOnCreature(thing, target) end
         local fromPos, fromId, fromStack = INVENTORY_POS, 0, 0
         if type(thing) == 'number' then
@@ -749,15 +814,63 @@ function api.new(b)
         return out
     end
 
+    -- REVIEW FIX: in vBot all three return a COUNT, not a list (vlib.lua:652-760), and
+    -- every real call site compares numerically (targetbot/creature_attack.lua:148,
+    -- vBot/exeta.lua:21, vBot/AttackBot.lua:3064, vBot/Equipper.lua:576-598).  A ported
+    -- snippet used through a `function:` waypoint threw on `getMonsters(2) > 0`, and
+    -- bot/init.lua deliberately does not advance lastExecution on a throw -- 100 Hz error
+    -- spam.  The list forms live on under explicit names.
+    --   * getMonsters EXCLUDES summons (`spec:getType() < 3`)
+    --   * getPlayers  EXCLUDES the local player, party members and emblem == 1
+    --   * `multifloor` is now passed through to the spectator scan
+    local function countNear(pred, range, multifloor)
+        range = range or 10
+        local n = 0
+        local me = player()
+        local myId = me and me.id or 0
+        local p = ctx.pos()
+        for _, c in ipairs(ctx.getSpectators(nil, multifloor)) do
+            if c.id ~= myId and pred(c)
+               and p and c.pos and chebyshev(p, c.pos) <= range then
+                n = n + 1
+            end
+        end
+        return n
+    end
+
+    local PARTY_SHIELDS = { [1] = true, [3] = true, [4] = true, [5] = true, [6] = true,
+                            [7] = true, [8] = true, [9] = true, [10] = true }
+
     ctx.getMonsters = function(range, multifloor)
+        return countNear(function(c)
+            return c.isMonster == true and (c.type == nil or c.type < 3)
+        end, range, multifloor)
+    end
+    ctx.getPlayers = function(range, multifloor)
+        return countNear(function(c)
+            if c.isPlayer ~= true then return false end
+            -- vlib.lua:667-674: `not ((getShield() ~= 1 and isPartyMember()) or
+            -- getEmblem() == 1)` -- a ShieldWhiteYellow (=1) party member IS counted.
+            local shield = c.shield or 0
+            if shield ~= 1 and PARTY_SHIELDS[shield] then return false end
+            if (c.emblem or 0) == 1 then return false end
+            return true
+        end, range, multifloor)
+    end
+    ctx.getNpcs = function(range, multifloor)
+        return countNear(function(c) return c.isNpc == true end, range, multifloor)
+    end
+
+    -- The list forms (what these three used to return).
+    ctx.getMonsterList = function(range, multifloor)
         local f = W('monsters'); if f then return f(ctx.pos(), range) end
         return filtered(function(c) return c.isMonster == true end, range, multifloor)
     end
-    ctx.getPlayers = function(range, multifloor)
+    ctx.getPlayerList = function(range, multifloor)
         local f = W('players'); if f then return f(ctx.pos(), range) end
         return filtered(function(c) return c.isPlayer == true end, range, multifloor)
     end
-    ctx.getNpcs = function(range, multifloor)
+    ctx.getNpcList = function(range, multifloor)
         local f = W('npcs'); if f then return f(ctx.pos(), range) end
         return filtered(function(c) return c.isNpc == true end, range, multifloor)
     end
@@ -803,15 +916,21 @@ function api.new(b)
         b._following = id
         return s:follow(id)
     end
+    -- REVIEW FIX: vBot binds these straight to g_game.cancelAttack / cancelFollow
+    -- (functions/player.lua:203-205), which are attack(nullptr) / follow(nullptr)
+    -- (game.h:199,201) -- i.e. 0xA1 sendAttack(0, seq) and 0xA2 sendFollow(0, seq).
+    -- 0xBE is strictly larger: game.cpp:1018-1035 clears BOTH targets and calls
+    -- stopAutoWalk(), which is exactly what CaveBot/TargetBot rely on NOT happening
+    -- while chasing.  proto/sender.lua:464 already leaves self.seq alone on a cancel.
     ctx.cancelAttack = function()
         local s = snd(); if not s then return nil, 'no sender' end
         b._attacking = nil
-        return s:cancelAttackAndFollow()
+        return s:attack(0)
     end
     ctx.cancelFollow = function()
         local s = snd(); if not s then return nil, 'no sender' end
         b._following = nil
-        return s:cancelAttackAndFollow()
+        return s:follow(0)
     end
     ctx.cancelAttackAndFollow = function()
         local s = snd(); if not s then return nil, 'no sender' end

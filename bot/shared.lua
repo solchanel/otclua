@@ -329,7 +329,10 @@ function S:say(words)
     local snd = self.sender
     if not snd or type(words) ~= 'string' or #words == 0 then return nil, 'no sender' end
     self.sends = self.sends + 1
-    self.bot._lastPhrase = words:lower()
+    -- REVIEW FIX: `lastPhrase` is written ONLY from the onTalk ECHO (vlib.lua:302-307),
+    -- never at send time.  A formula the server silently rejects (out of mana, on a real
+    -- cooldown, fired predictively inside one RTT) must NOT own the phrase, or the next
+    -- unrelated 0xA4/0xA5 is attributed to it and poisons `self.custom[words]` for good.
     if SPELLDB[words:lower()] then
         return snd:talkSpell(words, 3)
     end
@@ -341,7 +344,6 @@ function S:sayAt(words, pos)
     local snd = self.sender
     if not snd or type(words) ~= 'string' or #words == 0 then return nil, 'no sender' end
     self.sends = self.sends + 1
-    self.bot._lastPhrase = words:lower()
     return snd:talkSpell(words, 2, pos)
 end
 

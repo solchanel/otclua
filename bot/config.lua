@@ -672,14 +672,30 @@ function config.writeFileAtomic(path, text)
     local wok, werr = f:write(text)
     f:close()
     if not wok then os.remove(tmp); return nil, tostring(werr) end
-    os.remove(path)                      -- Windows os.rename refuses an existing target
+    -- REVIEW FIX: `os.remove(path); os.rename(tmp, path)` leaves a window in which NO file
+    -- exists at all -- strictly worse than the whole-file overwrite this function replaces,
+    -- since a vanished storage/profile_N.json loses every macro flag and config selection.
+    -- Keep the previous contents under `.bak` across the swap and restore them on failure.
+    -- (Windows os.rename refuses an existing target, hence the dance rather than a plain
+    -- rename over the top.)
+    local bak = path .. '.bak'
+    local hadOld = config.fileExists(path)
+    if hadOld then
+        os.remove(bak)
+        if not os.rename(path, bak) then os.remove(path); hadOld = false end
+    end
     local rok, rerr = os.rename(tmp, path)
     if not rok then
         -- last resort: direct write (the target may be locked)
         local g = io.open(path, 'wb')
-        if not g then os.remove(tmp); return nil, tostring(rerr) end
+        if not g then
+            if hadOld then os.rename(bak, path) end       -- put the old file back
+            os.remove(tmp)
+            return nil, tostring(rerr)
+        end
         g:write(text); g:close(); os.remove(tmp)
     end
+    if hadOld then os.remove(bak) end
     return true
 end
 
@@ -792,6 +808,11 @@ function Profile:saveSupplies(t)  return self:_saveJson(self:suppliesPath(),  t,
 function Profile:loadStorage()
     local path = self:storagePath()
     if not path then return {} end
+    -- REVIEW FIX: writeFileAtomic keeps the previous contents under `.bak` while it swaps;
+    -- if a crash landed exactly there, the .bak is the newest intact copy.
+    if not config.fileExists(path) and config.fileExists(path .. '.bak') then
+        path = path .. '.bak'
+    end
     if not config.fileExists(path) then return config.markObject({}, {}) end
     local text, err = config.readFile(path)
     if not text then return nil, err end

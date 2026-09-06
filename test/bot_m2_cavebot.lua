@@ -405,9 +405,16 @@ do
         H.cb.walker:reset(true)             -- the server never confirms: nothing moves
     end
     io.write('        retries seen: ', listStr(seen), '\n')
-    eqList(seen, {0,1,2,3,4,5}, 'the goto retried 0..4 and gave up on the 6th entry (retries=5)')
-    eq(H.cb.index, 2, 'the waypoint was SKIPPED (false advances), landing on the label')
-    eq(H.cb.stats.skips, 1, 'one skip recorded')
+    -- REVIEW FIX: actions.lua:472 resets the callback's own `retries` to 0 the moment the
+    -- blocking monster is engaged, so steps 10 (precision widening), 11 (the retries >= 5
+    -- skip) and 13 (the delay ramp) all see 0 for the rest of that call.  vBot therefore
+    -- NEVER skips a monster-blocked goto: it falls through to the last-resort
+    -- ignoreCreatures walkTo and answers "retry" indefinitely while it kills its way
+    -- through.  The waypoint index must not move.
+    eqList(seen, {0,1,2,3,4,5,6,7,8,9,10,11},
+           'the goto keeps retrying while it unclogs -- it is never skipped')
+    eq(H.cb.index, 1, 'the waypoint was NOT skipped (still on the goto)')
+    eq(H.cb.stats.skips, 0, 'no skip recorded')
     ok(#H.ops('attack') > 0, 'the blocking monster was attacked (' .. #H.ops('attack') .. 'x)')
     eq(H.ops('attack')[1].id, F.st:tile({x=F.start.x+1, y=F.start.y, z=F.start.z}).things[2].creatureId,
        'and it is the creature standing on the next tile')
