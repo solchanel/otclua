@@ -496,6 +496,120 @@ function M.new(opts)
   return s
 end
 
+-- --------------------------------------------------- profile directory scan
+-- The config pickers used to be answerable ONLY by a running worker, because the
+-- lists live in files under its profile directory and nothing hub-side could read a
+-- directory.  bot/config.lua can (`config.listDir`, FFI readdir with an io.popen
+-- fallback), and the hub runs on the same machine as its workers -- it spawns them
+-- with `cwd = self.workersDir` -- so the same path the worker would resolve
+-- resolves here too.  That is what lets a NEVER-STARTED instance offer a cavebot
+-- config to pick.
+local botconfig = nil
+local function botConfigMod()
+  if botconfig == nil then
+    local ok, m = pcall(require, 'bot.config')
+    botconfig = (ok and type(m) == 'table') and m or false
+  end
+  return botconfig or nil
+end
+
+local function isAbsolutePath(p)
+  return p:match('^%a:[/\\]') ~= nil or p:sub(1, 1) == '/' or p:sub(1, 1) == '\\'
+end
+
+--- Collapse `.` and `a/..` textually.  Returns the normalised path and how many `..`
+--- components were left over, i.e. how far the path climbs ABOVE its own first
+--- segment.  Purely lexical -- no symlink resolution -- which is enough here because
+--- the answer is only ever used to build a directory listing, and a leftover `..` is
+--- refused before any listing happens.
+local function normalisePath(p)
+  local prefix = ''
+  local drive = p:match('^(%a:)[/\\]')
+  if drive then prefix = drive .. '/'; p = p:sub(#drive + 2)
+  elseif p:sub(1, 1) == '/' then prefix = '/'; p = p:sub(2) end
+  local out, up = {}, 0
+  for seg in p:gmatch('[^/]+') do
+    if seg == '.' then                      -- nothing
+    elseif seg == '..' then
+      if #out > 0 then out[#out] = nil
+      elseif prefix == '' then up = up + 1; out[#out + 1] = '..'
+      end                                   -- above an absolute root: swallow it
+    else
+      out[#out + 1] = seg
+    end
+  end
+  return prefix .. table.concat(out, '/'), up
+end
+M._normalisePath = normalisePath
+
+--- Resolve an instance's `botProfile` the way the worker will.
+---
+--- `botProfile` is a free-form string a web account controls, and the answer here is
+--- turned into a directory listing that goes back to that account's browser -- so a
+--- RELATIVE value must stay inside the directory the hub spawns its workers in.
+--- `../../etc` is refused; `a/../b` is not, because it names `b` inside that
+--- directory and refusing it would only be theatre.  An ABSOLUTE value is taken as
+--- given: pointing an instance at a vBot profile elsewhere on the box is the normal
+--- case (`--bot-profile=D:/.../vBot_4.8`), and refusing `..` inside it would refuse
+--- nothing an absolute path could not already say directly.
+function Sup:profileDir(botProfile)
+  if type(botProfile) ~= 'string' or botProfile == '' then return nil end
+  local p = botProfile:gsub('\\', '/')
+  local norm, up = normalisePath(p)
+  if norm == '' then return nil end
+  if isAbsolutePath(p) then return norm end
+  if up > 0 then return nil end            -- climbs out of the worker directory
+  local root = self.workersDir
+  if type(root) ~= 'string' or root == '' then return norm end
+  -- The root is joined VERBATIM (only trailing slashes go).  Normalising it would be
+  -- wrong: `workersDir` is whatever hub/main.lua was given, often a relative
+  -- 'test/..', and collapsing that to '' would turn the join into an ABSOLUTE
+  -- '/profile_1'.  The OS resolves the uncollapsed form correctly.
+  return (root:gsub('\\', '/'):gsub('/+$', '')) .. '/' .. norm
+end
+
+--- Read the three config lists straight off disk.
+---   cavebot_configs/*.cfg          -> cavebot
+---   targetbot_configs/*.json       -> targetbot
+---   vBot_configs/profile_*         -> profiles
+--- `macros` is deliberately absent: a macro is a Lua registration inside a RUNNING
+--- bot, not a file, so a directory scan cannot honestly produce that list.
+function Sup:scanProfileConfigs(botProfile)
+  local dir = self:profileDir(botProfile)
+  if not dir then return nil, 'the bot profile name is not a usable path' end
+  local cfg = botConfigMod()
+  if not cfg or type(cfg.listDir) ~= 'function' then
+    return nil, 'bot/config.lua is not available to the hub'
+  end
+  -- Anchored, unlike bot/config.lua's stripConfigExt (which reproduces a vBot bug on
+  -- purpose and would list "backup.json.bak" as "backup.bak").  A picker offering a
+  -- name the worker cannot then open is worse than a shorter list.
+  local function listWithExt(sub, ext)
+    local out = {}
+    for _, name in ipairs(cfg.listDir(dir .. '/' .. sub)) do
+      local base = name:match('^(.+)%.' .. ext .. '$')
+      if base and #base > 0 then out[#out + 1] = base end
+    end
+    table.sort(out)
+    return out
+  end
+  local out = {
+    cavebot   = listWithExt('cavebot_configs', 'cfg'),
+    targetbot = listWithExt('targetbot_configs', 'json'),
+    profiles  = {},
+    macros    = {},
+  }
+  for _, name in ipairs(cfg.listDir(dir .. '/vBot_configs')) do
+    if name:match('^profile_%d+$') then out.profiles[#out.profiles + 1] = name end
+  end
+  table.sort(out.profiles)
+  local found = #out.cavebot + #out.targetbot + #out.profiles
+  if found == 0 then
+    return out, 'nothing found under ' .. tostring(botProfile)
+  end
+  return out
+end
+
 -- ----------------------------------------------------------------- accessors
 function Sup:worker(id) return self.workers[tostring(id)] end
 
@@ -517,7 +631,16 @@ function Sup:info(id)
     healthy  = w.healthy and true or false,
     lastError = w.lastError,
     reconnects = w.reconnects or 0,
+    lastStop = w.lastStop,          -- {ms, acked, killed, code, signal, graceful}
   }
+end
+
+--- How the workers this supervisor stopped actually went: {total, graceful, killed}.
+--- hub/main.lua prints it on the way out, so "did anything get killed" is a fact in
+--- the log rather than a guess.
+function Sup:stopSummary()
+  local s = self.stopStats or { total = 0, graceful = 0, killed = 0 }
+  return { total = s.total, graceful = s.graceful, killed = s.killed }
 end
 
 function Sup:logs(id, limit)
@@ -532,6 +655,61 @@ function Sup:chat(id, limit)
   return w.chatRing:tail(limit or 200)
 end
 
+-- ------------------------------------------------------ ring persistence ----
+-- The rings live in memory, so a hub restart used to leave the panel's Console
+-- and Chat tabs blank for every instance -- including the lines that explain WHY
+-- the hub had to be restarted, which are the ones an operator wants most.  These
+-- two calls are the whole mechanism; hub/main.lua owns the file (same atomic
+-- write and integrity footer as the rest of the data dir) and the flush cadence.
+
+--- The tail of every instance's rings, ready to be written out.
+--- `maxLines` caps each ring (default 200), because this is a convenience cache,
+--- not an archive: the audit log is the record that must be complete.
+function Sup:snapshotLogs(maxLines)
+  local n = tonumber(maxLines) or 200
+  local out = {}
+  for id, w in pairs(self.workers) do
+    local logs, chat = w.logRing:tail(n), w.chatRing:tail(n)
+    if #logs > 0 or #chat > 0 then
+      out[#out + 1] = { id = id, logs = logs, chat = chat }
+    end
+  end
+  table.sort(out, function(a, b) return a.id < b.id end)
+  return out
+end
+
+--- Put a saved tail back.  Creates the bookkeeping record for an instance that is
+--- NOT running -- state 'stopped', no process, no control link -- which is exactly
+--- what every instance is one moment after a hub start.
+function Sup:restoreLogs(id, logs, chat)
+  id = tostring(id)
+  local w = self.workers[id]
+  if not w then
+    w = {
+      id = id,
+      logRing  = newRing(self.logRingSize),
+      chatRing = newRing(self.chatRingSize),
+      restarts = 0, reconnects = 0,
+      live = {}, state = 'stopped', wantUp = false, restored = true,
+    }
+    self.workers[id] = w
+  end
+  for _, line in ipairs(logs or {}) do
+    if type(line) == 'table' and line.text then
+      w.logRing:push{ id = id, t = tonumber(line.t) or 0,
+                      level = tostring(line.level or 'info'), text = tostring(line.text) }
+    end
+  end
+  for _, msg in ipairs(chat or {}) do
+    if type(msg) == 'table' and msg.text then
+      w.chatRing:push{ id = id, t = tonumber(msg.t) or 0,
+                       channel = tostring(msg.channel or 'Default'),
+                       from = tostring(msg.from or '?'), text = tostring(msg.text) }
+    end
+  end
+  return true
+end
+
 function Sup:isRunning(id)
   local st = self:state(id)
   return st ~= 'stopped' and st ~= 'error'
@@ -544,8 +722,24 @@ function Sup:runningCount()
 end
 
 -- --------------------------------------------------------------- state edges
+--- Terminal states are terminal.  A `stopping` worker still has commands in
+--- flight -- its own `login` answer, a health check, a `loginState` push -- and
+--- every one of those calls _setState.  One of them landing after the stop began
+--- used to drag the instance back to `running`, which then made _workerExit take
+--- the "unexpected exit" branch: no lastStop record, no graceful/killed
+--- bookkeeping, and (with wantUp still true) a restart of a worker the operator
+--- had just asked to stop.  Measured on Debian: the `--dry-run` login refusal
+--- arrived 4 ms after the shutdown command and turned an orderly stop into
+--- `graceful=0 stopped=0`.
+local TERMINAL_NEXT = {
+  stopping = { stopped = true, error = true },
+  stopped  = { starting = true, error = true },
+}
+
 function Sup:_setState(w, state, detail)
   if w.state == state and w.detail == detail then return end
+  local allowed = TERMINAL_NEXT[w.state]
+  if allowed and not allowed[state] then return end
   w.state, w.detail = state, detail
   if state ~= 'online' then w.onlineAt = nil end
   if self.onState then pcall(self.onState, w.id, state, detail) end
@@ -642,6 +836,8 @@ function Sup:startInstance(id, spec)
   end
   w.spec       = spec
   w.wantUp     = true
+  w.stopRequested = false
+  w.stopDeadline, w.stopSignalAt, w.stopStartedAt = nil, nil, nil
   w.lastError  = nil
   w.healthMiss = 0
   w.healthy    = false
@@ -890,6 +1086,7 @@ local function flattenLive(data)
       out.danger          = tb.danger
     end
     if b.supplies ~= nil then out.supplies = b.supplies end
+    if b.suppliesStatus ~= nil then out.suppliesStatus = b.suppliesStatus end
     if b.macros ~= nil then out.macroCount = b.macros end
   end
   local st = data.stats
@@ -897,14 +1094,15 @@ local function flattenLive(data)
     for k, v in pairs(st) do if out[k] == nil then out[k] = v end end
   end
 
-  -- panel/api.js declares `supplies` as an ARRAY of {name,itemId,count,min}.
-  -- bot/supplies.lua answers with its module STATUS object (rounds, profile,
-  -- stats, ...) and keeps no per-item ledger, and that object arrives both under
-  -- bot.supplies and at the top level of a `stats` push.  Handing it over as
-  -- `supplies` is what made the panel's Overview throw, so anything that is not
-  -- a list travels beside it as `suppliesStatus` and `supplies` is simply absent.
+  -- panel/api.js declares `supplies` as an ARRAY of {name,itemId,count,min}, and
+  -- bot/supplies.lua's ledger now produces exactly that (control/commands.lua splits
+  -- the rows from the surrounding profile/rounds context, which travels as
+  -- `suppliesStatus`).  The guard stays because an OLDER worker -- one built before
+  -- the ledger, still running against a newer hub -- sends the mixed status object
+  -- under `supplies`, and handing that to the panel is what made its Overview throw.
+  -- Anything that is not a non-empty list is demoted rather than forwarded.
   if out.supplies ~= nil and not (type(out.supplies) == 'table' and #out.supplies > 0) then
-    out.suppliesStatus = out.supplies
+    if out.suppliesStatus == nil then out.suppliesStatus = out.supplies end
     out.supplies = nil
   end
   return out
@@ -962,12 +1160,38 @@ end
 
 -- ------------------------------------------------------------------ exit path
 function Sup:_workerExit(w, code, signal)
-  local wasStopping = (w.state == 'stopping')
+  -- The flag, not the state string: an operator asked for this stop, and that
+  -- fact must not depend on which asynchronous callback last touched w.state.
+  local wasStopping = (w.stopRequested or w.state == 'stopping') and true or false
   w.proc = nil
   w.healthy = false
   if w.ctl then w.ctl:close('worker exited'); w.ctl = nil end
   local how = signal and ('signal ' .. tostring(signal)) or ('exit code ' .. tostring(code))
   self:_pushLog(w, wasStopping and 'info' or 'warn', 'supervisor: worker gone (' .. how .. ')')
+
+  if wasStopping then
+    -- What actually happened, so an operator (and the test suite) can tell an
+    -- orderly logout from a kill instead of inferring it.  "graceful" means the
+    -- worker acknowledged `shutdown` and left on its own, inside the window,
+    -- without the SIGKILL/TerminateProcess step.
+    local ms = w.stopStartedAt and (nowMs() - w.stopStartedAt) or 0
+    w.lastStop = {
+      ms       = ms,
+      acked    = w.stopAcked and true or false,
+      killed   = w.stopKilled and true or false,
+      code     = code, signal = signal,
+      graceful = (w.stopAcked and not w.stopKilled and signal == nil and code == 0) and true or false,
+    }
+    self.stopStats = self.stopStats or { total = 0, graceful = 0, killed = 0 }
+    self.stopStats.total = self.stopStats.total + 1
+    if w.lastStop.graceful then self.stopStats.graceful = self.stopStats.graceful + 1 end
+    if w.lastStop.killed then self.stopStats.killed = self.stopStats.killed + 1 end
+    self:_pushLog(w, w.lastStop.graceful and 'info' or 'warn', string.format(
+      'supervisor: stopped %s after %d ms (%s)',
+      w.lastStop.graceful and 'gracefully' or 'the hard way', ms, how))
+    w.stopStartedAt, w.stopDeadline, w.stopSignalAt = nil, nil, nil
+    w.stopRequested = false
+  end
 
   if wasStopping or not w.wantUp or self.stopping then
     w.wantUp = false
@@ -1004,16 +1228,58 @@ function Sup:stopInstance(id, graceMs)
     self:_setState(w, 'stopped', 'stopped')
     return true
   end
+  -- ------------------------------------------------------------------------
+  -- The orderly stop, in three steps, on BOTH platforms.
+  --
+  -- Step 1 is the `shutdown` COMMAND over the control link, and it is the whole
+  -- point of the exercise: main.lua's shutdown handler sends 0x14 LeaveGame
+  -- before it drops the socket.  Without that the server keeps the character
+  -- online for its own logout timeout and the NEXT login on that account is
+  -- answered with `session ended` (docs/live-findings.md) -- so a worker that is
+  -- merely killed costs the operator the next login, not just this one.
+  --
+  -- Step 2, at `signalAt`, is proc:stop() -- stdin EOF everywhere, plus SIGTERM
+  -- on POSIX.  It is a fallback, not the plan: it runs when the control link
+  -- was never up, when the worker did not acknowledge, or when it acknowledged
+  -- and then took too long.
+  --
+  -- Step 3, at `deadline`, is proc:kill().
+  --
+  -- Windows used to have no step 1 at all on the hub-exit path, and step 2 is
+  -- weaker there (there is no SIGTERM), which is exactly why the job object was
+  -- doing the work and no worker ever logged out.  _tick() drives both edges, so
+  -- they hold whether the stop came from the panel, from a signal, or from the
+  -- console control handler.
+  local grace = tonumber(graceMs) or self.stopGraceMs
+  if grace < 200 then grace = 200 end
+  local now = nowMs()
+  w.stopRequested = true
+  w.stopStartedAt = now
+  w.stopDeadline  = now + grace
+  -- 60 % of the window for the polite path, the rest for SIGTERM/EOF.
+  w.stopSignalAt  = now + floor(grace * 0.6)
+  w.stopAcked     = false
+  w.stopKilled    = false
   self:_setState(w, 'stopping', 'shutting down')
-  self:_pushLog(w, 'info', 'supervisor: sending shutdown')
-  local grace = graceMs or self.stopGraceMs
+
   if w.ctl and w.ctl.state == 'open' then
-    w.ctl:send('shutdown', {}, nil, 2000)
+    self:_pushLog(w, 'info', 'supervisor: asking the worker to shut down (logout first)')
+    local wr = self
+    w.ctl:send('shutdown', {}, function(ok, res)
+      w.stopAcked = ok and true or false
+      if ok then
+        wr:_pushLog(w, 'info', 'supervisor: the worker acknowledged shutdown')
+      else
+        wr:_pushLog(w, 'warn', 'supervisor: the worker refused shutdown: ' ..
+                    tostring(res and res.message or 'no answer'))
+        -- No point waiting out the polite window for an answer we have.
+        w.stopSignalAt = nowMs()
+      end
+    end, math.min(grace, 5000))
+  else
+    self:_pushLog(w, 'info', 'supervisor: no control link -- stopping the process directly')
+    w.stopSignalAt = now                     -- nothing to be polite to
   end
-  local proc = w.proc
-  self.sched.after(250, function()
-    if proc and proc:isRunning() then proc:stop(grace) end
-  end)
   return true
 end
 
@@ -1067,6 +1333,25 @@ function Sup:_tick()
       w.spawnDeadline = nil
       self:_pushLog(w, 'error', 'supervisor: the worker never announced its control port')
       if w.proc then w.proc:stop(1000) else self:_setState(w, 'error', 'no control port') end
+    end
+
+    -- the orderly-stop ladder (see stopInstance): shutdown command -> stdin
+    -- EOF / SIGTERM -> kill.  Driven here so the deadline is enforced by the
+    -- reactor rather than by whoever happened to call stop().
+    if w.state == 'stopping' and w.proc then
+      if w.stopSignalAt and now >= w.stopSignalAt then
+        w.stopSignalAt = nil
+        local left = (w.stopDeadline or now) - now
+        if left < 100 then left = 100 end
+        self:_pushLog(w, 'info', ('supervisor: escalating -- %s (%d ms left)'):format(
+          process.isWindows and 'closing stdin' or 'stdin EOF + SIGTERM', left))
+        w.proc:stop(left)
+      end
+      if w.stopDeadline and now >= w.stopDeadline and not w.stopKilled then
+        w.stopKilled = true
+        self:_pushLog(w, 'warn', 'supervisor: the worker outlasted its grace window -- killing it')
+        w.proc:kill()
+      end
     end
 
     -- backoff expired
@@ -1123,9 +1408,17 @@ function Sup:install()
   local self_ = self
   self.timers[#self.timers + 1] = self.sched.every(self.pollMs, function() self_:_tick() end)
   self.timers[#self.timers + 1] = self.sched.every(self.healthMs, function() self_:_health() end)
-  -- children can never outlive the hub: lib/process.lua arms a Windows job object
-  -- and PR_SET_PDEATHSIG on Linux, and this is the orderly path on top.
-  sys.atExit(function() pcall(function() self_:shutdownAll(2000) end) end)
+  -- Children can never outlive the hub: lib/process.lua arms a Windows job object
+  -- and PR_SET_PDEATHSIG on Linux, and this is the orderly path on top of it.
+  -- shutdownAll only ASKS; drainStop is what turns the reactor by hand until the
+  -- asking has had its effect, which on an exit path nothing else will do.
+  sys.atExit(function()
+    pcall(function()
+      if self_:allStopped() then return end
+      self_:shutdownAll(2000)
+      self_:drainStop(2000)
+    end)
+  end)
 end
 
 function Sup:uninstall()
@@ -1148,14 +1441,50 @@ function Sup:allStopped()
   return true
 end
 
---- The final, blocking step of process exit only.
+--- BLOCKING.  Turn the reactor by hand until every worker is gone, or the window
+--- closes.  Exit paths only -- an exit hook, an unhandled error, a test.
+---
+--- It exists because `shutdown` is a COMMAND over a socket: it needs the reactor
+--- to deliver it, to read the answer and to notice the worker leaving, and on
+--- those paths lib/sched.lua is no longer running.  Without this the exit hook
+--- would fall straight through to process.reapAll(), which is the kill path, and
+--- the last thing a hub does before dying would be to leave every character
+--- online server-side.
+---
+--- It refuses to run while the reactor IS running -- re-entering sched.tick()
+--- from inside one of its own callbacks would iterate the timer array under
+--- itself -- so an orderly shutdown driven from the reactor (hub/main.lua's
+--- M.shutdown) is left alone to finish on its own turns.
+function Sup:drainStop(graceMs)
+  if self._draining then return false, 'already draining' end
+  if self.sched and self.sched.running then return false, 'the reactor is still running' end
+  self._draining = true
+  local deadline = nowMs() + (tonumber(graceMs) or self.stopGraceMs) + 1500
+  local ok = pcall(function()
+    while nowMs() < deadline do
+      if self.sched and self.sched.tick then self.sched.tick(5) else process.pollAll() end
+      if self:allStopped() then break end
+      sys.sleepMs(2)
+    end
+  end)
+  self._draining = false
+  return ok and self:allStopped()
+end
+
+--- The final, blocking step of process exit only.  Asks politely first (that is
+--- the only chance the worker gets to log out), then reaps whatever is left.
 function Sup:reap(graceMs)
+  local grace = tonumber(graceMs) or 3000
   self.stopping = true
+  if not self:allStopped() then
+    self:shutdownAll(grace)
+    self:drainStop(grace)
+  end
   self:uninstall()
   for _, w in pairs(self.workers) do
     if w.ctl then pcall(function() w.ctl:close('hub shutting down') end); w.ctl = nil end
   end
-  pcall(process.reapAll, graceMs or 3000)
+  pcall(process.reapAll, grace)
 end
 
 return M

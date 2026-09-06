@@ -803,6 +803,59 @@ runSuite('exec / Lua runs inside the real worker', function()
   eq(empty.status, 400, 'an empty chunk is refused')
 end)
 
+-- ============================ 6b. a slow HTTP request stops blocking =========
+-- PANEL.md: "login blocks the reactor for the duration of the HTTPS POST.
+-- Status pushes and the bot tick pause for that request."  This is the same
+-- claim, measured from OUTSIDE the worker -- by counting the 1 Hz `status`
+-- frames that reach the panel's own WebSocket while a request is in flight
+-- inside the worker -- and then measured again with the fix on.
+--
+-- The A/B happens in the SAME live worker: `http.asyncChild = false` puts
+-- lib/http.lua back on its blocking path, and clearing it turns the
+-- out-of-process path back on.  The endpoint is a socket that accepts nothing,
+-- so the request runs to its timeout without a network.
+runSuite('exec / a slow HTTP request no longer freezes the worker', function()
+  if not haveWorker or not sock then check(true, 'skipped (no worker)'); return end
+
+  local dead = assert(socket.listen('127.0.0.1', 0))
+  local url = 'http://127.0.0.1:' .. dead:port() .. '/never-answers'
+  local CODE = ('local http = require("lib.http") ' ..
+                'local t0 = LC.sys.nowMs() ' ..
+                'http.post(%q, {}, "account=x&password=hunter2", { timeoutMs = 2500 }) ' ..
+                'return LC.sys.nowMs() - t0'):format(url)
+
+  local function statusesDuring(code)
+    local before = #sock:eventsFor('status', function(d) return d and d.id == ids.instance end)
+    local t0 = sys.nowMs()
+    local r = rest('POST', '/api/instances/' .. ids.instance .. '/exec', { code = code })
+    local ms = sys.nowMs() - t0
+    local after = #sock:eventsFor('status', function(d) return d and d.id == ids.instance end)
+    return after - before, ms, r
+  end
+
+  restOk('POST', '/api/instances/' .. ids.instance .. '/exec',
+         { code = 'require("lib.http").asyncChild = false return "blocking"' })
+  local nBlocking, msBlocking = statusesDuring(CODE)
+
+  restOk('POST', '/api/instances/' .. ids.instance .. '/exec',
+         { code = 'require("lib.http").asyncChild = nil return "async"' })
+  local nAsync, msAsync, rAsync = statusesDuring(CODE)
+
+  dead:close()
+  note('worker status frames reaching the panel during a slow request: ' ..
+       'blocking %d in %d ms, out-of-process %d in %d ms',
+       nBlocking, msBlocking, nAsync, msAsync)
+
+  check(msBlocking > 900, ('the request really was slow (%d ms)'):format(msBlocking))
+  check(nBlocking <= 1, ('a BLOCKING request silences the worker: %d status frames in %d ms')
+        :format(nBlocking, msBlocking))
+  check(nAsync >= 2, ('the out-of-process request does not: %d status frames in %d ms')
+        :format(nAsync, msAsync))
+  check(nAsync > nBlocking, '   which is the whole point of the change')
+  eq(rAsync and rAsync.status, 200, 'and the command still answers normally')
+  check(hub.sup:isRunning(ids.instance), '   with the worker still alive')
+end)
+
 -- ==================================================== 7. script upload =======
 runSuite('scripts / uploaded, assigned, and running in the worker', function()
   if not haveWorker then check(true, 'skipped (no worker)'); return end
@@ -1213,13 +1266,65 @@ runSuite('real login / a hub-spawned worker reaches test/fakeserver.lua', functi
            concat(envKeys, ' '))
     end
 
-    -- ---- 7. stop it -------------------------------------------------------
+    -- ---- 7. stop it, ORDERLY ----------------------------------------------
+    -- This is the interesting half of the section on both platforms.  Windows
+    -- used to have no orderly path at all: the job object reaped the worker, so
+    -- the character stayed online server-side for the logout timeout and the
+    -- NEXT login on that account was answered with `session ended`
+    -- (docs/live-findings.md).  The fix is a supervisor ladder -- the `shutdown`
+    -- COMMAND first, then stdin EOF / SIGTERM, then a kill -- and what has to be
+    -- proved is that the FIRST rung is the one that fires.
+    --
+    -- The probe below is the conclusive part.  It wraps the live worker's
+    -- sender:logout, which is the call that puts 0x14 LeaveGame on the wire, so
+    -- a line in the worker's own log says the frame really went out during the
+    -- shutdown -- rather than inferring it from an exit code.
+    local probe = rest('POST', '/api/instances/' .. iid .. '/exec', { code = [[
+      local s = LC.sender
+      local orig = s.logout
+      s.logout = function(self, ...)
+        local r = orig(self, ...)
+        io.write('PROBE-LEAVEGAME-SENT ', tostring(r ~= nil), '\n')
+        io.stdout:flush()
+        return r
+      end
+      return 'armed'
+    ]] })
+    eq(probe.status, 200, 'the LeaveGame probe is armed inside the running worker')
+    eq(h2.sup:state(iid), 'online', '   and the character is still online when we ask it to stop')
+
+    local tStop = sys.nowMs()
     restOk('POST', '/api/instances/actions', { action = 'stop', ids = { iid } })
     local stopped = waitFor(function()
       process.pollAll()
       return h2.sup:state(iid) == 'stopped'
     end, 20000)
+    local stopMs = sys.nowMs() - tStop
     check(stopped, 'the panel stops the worker again')
+
+    local info = h2.sup:info(iid)
+    local ls = info.lastStop or {}
+    check(ls.acked, 'the worker ACKNOWLEDGED the shutdown command')
+    eq(ls.killed, false, '   and was never killed')
+    eq(ls.graceful, true, '   so the stop is recorded as graceful')
+    eq(ls.code, 0, '   and the worker chose its own exit code (0)')
+    eq(ls.signal, nil, '   with no signal involved')
+    check(ls.ms and ls.ms < 8000,
+          ('   inside the grace window (%s ms)'):format(tostring(ls.ms)))
+    note('orderly stop on %s: acked=%s killed=%s exit=%s in %d ms (panel round trip %d ms)',
+         sys.os, tostring(ls.acked), tostring(ls.killed), tostring(ls.code),
+         tonumber(ls.ms) or -1, stopMs)
+
+    local sawLogout, tail = false, h2.sup:logs(iid, 200)
+    for _, l in ipairs(tail) do
+      if tostring(l.text):find('PROBE%-LEAVEGAME%-SENT true') then sawLogout = true end
+    end
+    check(sawLogout,
+          'the worker really sent 0x14 LeaveGame on its way out (its own log says so)')
+    local sum = h2.sup:stopSummary()
+    eq(sum.killed, 0, 'nothing in this hub had to be killed')
+    check(sum.graceful >= 1, ('   and %d of %d stops were graceful'):format(
+          sum.graceful, sum.total))
   end)
 
   PORT, jar = savedPort, savedJar
@@ -1284,6 +1389,123 @@ runSuite('surface / only the panel is served, and sockets are capped', function(
   check(held > 0, '   and the newest ones are the survivors, not nothing at all')
   for _, w in ipairs(socks) do pcall(function() w:close() end) end
   step(300)
+end)
+
+-- ======================= 13. Ctrl+C / SIGINT at a REAL hub process ==========
+-- Everything above stops workers through the panel.  This stops the HUB the way
+-- an operator does, at a real hub process with a real worker under it, and
+-- checks that the worker was logged out and exited on its own rather than being
+-- reaped by the job object (Windows) or by SIGKILL (Linux).
+--
+--   Windows  GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT) at the hub's own console
+--            process group -- the same event Ctrl+Break delivers, and the same
+--            handler path Ctrl+C and a console CLOSE take.  It has to be its own
+--            group: group 0 would signal this suite and the shell too.
+--   Linux    SIGINT, which the hub's sigtimedwait gate collects.
+--
+-- Both arrive through lib/process.lua's process.sendInterrupt().
+runSuite('shutdown / Ctrl+C at a real hub logs its workers out', function()
+  if not haveWorker then check(true, 'skipped (no worker)'); return end
+  local hubMain3 = require('hub.main')
+
+  -- ---- a data dir with one auto-starting instance -------------------------
+  local DATA3 = DATA .. '-ctrl'
+  assert(storage.fs.mkdirp(DATA3))
+  assert(storage.fs.mkdirp(DATA3 .. '/scripts'))
+  local o3 = assert(hubMain3.parseArgs{
+    '--port=0', '--bind=127.0.0.1', '--data-dir=' .. DATA3,
+    '--panel-dir=' .. ROOT .. '/panel', '--workers-dir=' .. ROOT,
+    '--luajit=' .. LUAJIT, '--no-autostart',
+  })
+  local h3 = assert(hubMain3.build(o3))
+  local savedPort3, savedJar3 = PORT, jar
+  PORT, jar = h3.port, {}
+  local instId
+  local okSeed = pcall(function()
+    restOk('POST', '/api/bootstrap', { token = h3.auth:bootstrapToken(),
+                                       name = 'ctrladmin', password = 'a-long-enough-secret' })
+    local acc = restOk('POST', '/api/accounts',
+      { label = 'ctrl', login = 'ctrl@example.invalid', password = 'game-password-ctrl' })
+    local ch = restOk('POST', '/api/characters',
+      { accountId = acc.account.id, name = 'Ctrl Tester', world = 'Gunzodus' })
+    local inst = restOk('POST', '/api/instances',
+      { characterId = ch.character.id, autoStart = true, autoRelogin = false })
+    instId = inst.instance.id
+  end)
+  PORT, jar = savedPort3, savedJar3
+  pcall(function() h3.server:stop() end)
+  pcall(function() hubMain3.flushCaches(h3) end)
+  pcall(function() h3.storage:close() end)
+  pcall(function() h3.audit:close() end)
+  pcall(function() h3.tel:uninstall() end)
+  if not check(okSeed and instId, 'a data dir with one autoStart instance was prepared') then
+    return
+  end
+
+  -- ---- the hub, as its own process ---------------------------------------
+  local out, exitCode = {}, nil
+  local h, err = process.spawn{
+    cmd = { LUAJIT, ROOT .. '/hub/main.lua',
+            '--port=0', '--bind=127.0.0.1', '--data-dir=' .. DATA3,
+            '--panel-dir=' .. ROOT .. '/panel', '--workers-dir=' .. ROOT,
+            '--worker-script=main.lua', '--luajit=' .. LUAJIT,
+            -- --dry-run: no game server is involved, but every other step (the
+            -- spawn, the stdin token, the control handshake, the `shutdown`
+            -- command, the worker's own exit) is the production path.
+            '--worker-arg=--dry-run', '--stop-grace-ms=6000', '--log-level=info' },
+    cwd = ROOT, captureOutput = true, newProcessGroup = true,
+    name = 'hub-under-test',
+    onLine = function(t) out[#out + 1] = t end,
+    onExit = function(c) exitCode = c end,
+  }
+  if not check(h ~= nil, 'the hub started as its own process', err) then return end
+
+  local function sawLine(pat)
+    for _, l in ipairs(out) do if tostring(l):find(pat) then return l end end
+    return nil
+  end
+  local up = waitFor(function()
+    process.pollAll()
+    return sawLine('event=instance%.state.*state=running') ~= nil
+        or sawLine('event=instance%.state.*state=online') ~= nil
+  end, 60000)
+  if not up then
+    for _, l in ipairs(out) do io.write('      hub: ', tostring(l), '\n') end
+  end
+  check(up, 'it auto-started the instance and the control link came up')
+
+  -- ---- interrupt it -------------------------------------------------------
+  local t0 = sys.nowMs()
+  local sent, serr = process.sendInterrupt(h)
+  check(sent, sys.isWindows and 'CTRL_BREAK delivered to the hub process group'
+                             or 'SIGINT delivered to the hub process', serr)
+  local gone = waitFor(function() process.pollAll(); return exitCode ~= nil end, 40000)
+  local tookMs = sys.nowMs() - t0
+  check(gone, ('the hub exited after the interrupt (%d ms)'):format(tookMs))
+  eq(exitCode, 0, '   with exit code 0 -- it chose to leave, it was not killed')
+
+  local shut = sawLine('event=hub%.shutdown')
+  check(shut ~= nil, 'it logged an orderly shutdown: ' .. tostring(shut))
+  local summary = sawLine('event=hub%.workers%.stopped')
+  check(summary ~= nil, 'it reported how its workers went: ' .. tostring(summary))
+  check(summary and summary:find('killed=0', 1, true),
+        '   and NOTHING had to be killed')
+  local okGraceful = check(summary and summary:find('graceful=1', 1, true) and true or false,
+        '   the worker acknowledged shutdown and exited on its own')
+  if not okGraceful then
+    io.write('    --- the hub process said ---\n')
+    for _, l in ipairs(out) do io.write('      ', tostring(l), '\n') end
+  end
+  check(sawLine('event=hub%.stopped') ~= nil, 'and the hub ran to the end of its own exit path')
+  note('hub interrupt on %s: exit %s in %d ms -- %s', sys.os, tostring(exitCode), tookMs,
+       tostring(summary))
+
+  -- Nothing may be left behind: on Windows the job object is the backstop, but
+  -- the point of the exercise is that it never had to be used.
+  step(300)
+  process.pollAll()
+  check(not process.isPidAlive(h:pid()), 'the hub process is really gone')
+  if not KEEP then rmrf(DATA3) end
 end)
 
 -- ===================================================================== report

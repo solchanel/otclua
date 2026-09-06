@@ -6,9 +6,13 @@ run inside the bot, and watch live stats (level, experience per hour, money per 
 The panel has **web accounts** with an **administrator** who creates and removes them; **only the
 administrator sees the panel's activity log**.
 
-**Status: built and green on Windows and Debian.** `README-HUB.md` is the operator's guide (how to
-start it, first-run bootstrap, adding accounts and instances, and the security notes).
-Requirements that are *not* met are marked **NOT DONE** in place; there is a summary at the end.
+**Status: built, packaged, and verified end to end on a real Debian 13 machine.** `README-HUB.md`
+is the operator's guide (how to start it, first-run bootstrap, adding accounts and instances, and
+the security notes); `INSTALL.md` is how to get it onto a server. Every requirement in this
+document is now marked **BUILT**; what is still missing is smaller than a requirement and is
+listed under *Not done*. *End-to-end verification on a real Debian machine*, at the end, records
+exactly what was run against a real install, the two defects that found, and what remains
+unproven — read that before believing any of the rest.
 
 ## Shape of the system
 
@@ -63,8 +67,16 @@ browser ──HTTP/WS──► hub (one process, Lua)
 * Sessions: 32-byte random token, HttpOnly + SameSite=Strict cookie, sliding expiry under an
   absolute ceiling, revocable by the admin. Signing in **replaces** whatever session the client
   already held: the previous token is revoked at once, so a stolen-then-noticed session does not
-  survive the victim signing in again. **Sessions live in memory, so a hub restart signs everyone
-  out.**
+  survive the victim signing in again. **Sessions survive a hub restart**: `hub/main.lua` persists
+  them to `sessions.json` through a second `hub/storage.lua` store (atomic write-and-rename, SHA-256
+  footer, 0600, `onCorrupt='quarantine'` so a damaged cache is moved aside rather than refusing to
+  start). Only `SHA-256(token)` is stored, hex-encoded — never a token, so the file cannot be
+  replayed into a login — along with the absolute deadline, which is re-checked on load, and the
+  per-session CSRF token, without which every write would 403 after a restart. `logout`, `revoke`
+  and `revokeUser` flush immediately, so revocation is authoritative; everything else rides a 30 s
+  flush plus the shutdown flush. Verified on the real Debian install: the cookie held before
+  `systemctl restart luaclient-hub` still drives the panel afterwards, and the live cookie value
+  does not appear anywhere in `sessions.json`.
 * Rate limiting has two counters with different jobs. The **account** counter (per submitted name,
   5 failures per 15 min) locks that account, and is checked before the password is verified. The
   **source-address** counter is a much looser throttle (50 failures) and is consulted *only after*
@@ -148,8 +160,15 @@ scripts.json      uploaded-script metadata (name, owner, size, sha256)
 scripts/<id>.lua  the sources themselves
 history/<id>.json a rolling stats history per instance, flushed every 60 s
 audit.jsonl       the admin-only activity log
+sessions.json     live web sessions -- SHA-256(token) only, never a token, plus the
+                  absolute deadline and the per-session CSRF token
+worklogs.json     the last 200 log and chat lines per instance, so the panel's Console
+                  and Chat tabs are not blank after a hub restart
 secret.key        the hub master key, 0600
 ```
+
+`sessions.json` and `worklogs.json` are caches: deleting them is safe, and deleting `sessions.json`
+only signs everyone out.
 
 Every file is written atomically and carries a SHA-256 integrity footer; a truncated, empty or
 corrupted file is reported by name and never silently emptied. Referential integrity is derived from
@@ -195,6 +214,48 @@ against `test/fakeserver.lua`:
 adds environment for every worker (settings only — never a credential: an environment is readable
 from `/proc` on some configurations, which is why the token goes on stdin instead).
 
+Confirmed on the real Debian install with the worker running: `/proc/<pid>/cmdline` carries only
+`--control-port=0 --control-bind=127.0.0.1 --control-token-fd=0 --instance-name=… --bot-profile=…`
+— `--control-token-fd=0` is a *reference* to a descriptor, not a value — and `/proc/<pid>/environ`
+carries only `HOME`, `PATH`, `LANG`, `USER`, the `HUB_*` settings from the unit's EnvironmentFile
+and `LUACLIENT_BOT_PROFILE`. Grepping both for the game password, the 2FA token and both web
+passwords finds nothing. `cmdline` is world-readable (`-r--r--r--`), which is exactly why nothing
+is in it.
+
+### Stopping a worker — BUILT
+
+A stop is a three-rung ladder, not a blind timer, and it runs the same way on both platforms:
+the control `shutdown` **command** first (with an acknowledgement, which is what makes the worker
+send `0x14 LeaveGame` before dropping its socket); at 60 % of the grace window `proc:stop()` (stdin
+EOF everywhere, `SIGTERM` on POSIX); at the deadline `proc:kill()`. `--stop-grace-ms=N` sets the
+window (default 8000). `Sup:info(id).lastStop` records `{ms, acked, killed, code, signal, graceful}`
+and the hub logs `event=hub.workers.stopped stopped=N graceful=N killed=N`, so an operator can see
+when a worker did *not* get to log out — which matters, because a merely-killed worker leaves the
+character online for the server's logout timeout and costs the next login too. On Windows the
+console control handler is 39 bytes of position-independent machine code in a `VirtualAlloc` page
+rather than an FFI callback, because a Lua callback fired from the thread Windows injects killed
+the process outright when the main thread was on a JIT trace.
+
+Observed on the Debian install under systemd, stopping the service with a worker running:
+
+```
+INFO event=hub.shutdown graceMs=8000 reason="signal 15" workers=1
+INFO event=instance.state detail="shutting down"  state=stopping
+INFO event=instance.state detail="exit code 0"    state=stopped
+INFO event=hub.workers.stopped graceful=1 killed=0 stopped=1
+INFO event=hub.stopped
+```
+
+### The login POST no longer blocks the reactor — BUILT
+
+`lib/http.lua`'s `postAsync` runs the request in a short-lived child process driven by
+`lib/process.lua`; the whole request — URL, headers, timeout, backend, proxy credential and body —
+goes down that child's private stdin as one base64 line, so the account password never reaches
+`/proc/<pid>/cmdline`. `http.post` is unchanged for every existing caller and only takes the async
+route inside a coroutine created by `http.runAsync`, which `control/server.lua` uses for every
+worker command. Measured against an endpoint that accepts and never answers: the longest reactor
+gap fell from 5063 ms to 16 ms on Windows and from 2543 ms to 10 ms on Debian.
+
 ## Worker control protocol (hub ⇄ worker) — BUILT
 
 Request `{id, cmd, args}` → `{id, ok, result|error}`, plus `{event, data}` pushes, over
@@ -223,9 +284,9 @@ Per instance, computed in the worker and pushed with `stats`:
 |---|---|
 | level, experience | **BUILT** — from the player-stats packet |
 | **exp/h** | **BUILT** — 15-minute sliding window plus the session average |
-| **money/h** | **PARTIAL** — gold/platinum/crystal on hand is counted exactly; **loot sold value needs a price table** |
-| loot/h, waste/h, balance | **PARTIAL** — the *counts* are exact; the *values* are 0 unless the profile's `vBot/items.lua` price table loads. The snapshot says so in `noDataFor`, so the panel can print "prices not loaded" rather than a confident 0. Loot counts also need the TargetBot loot module to be wired with a container list. |
-| supplies | **NOT DONE** — `bot/supplies.lua` reports rounds and pouch pages, not per-item counts against `Supplies.json`. The hub therefore sends no `supplies` array at all (the module's status object travels as `suppliesStatus`), and the panel's supplies column says "no supply data". |
+| **money/h** | **BUILT** — `moneySource = 'gold+goods'`: d(gold on hand)/h plus d(loot − lootCash − waste)/h, sharing one baseline sample so the coins are not counted twice. `goldPerHour` and `goodsPerHour` break it out. It is a *valuation*, not realised cash: looted goods are priced at their list price the moment they are looted, exactly as vBot's own analyzer does, so a character that hoards shows money/h it has not banked. With no price table at all it falls back to the narrower `'gold'` answer. |
+| loot/h, waste/h, balance | **BUILT** — counts and values. Prices come from the profile's `vBot/items.lua`, whose `LootItems` table is keyed by lowercase item *name* and is mapped onto item ids through `proto/items.lua`. The snapshot is honest about where they came from: `pricesSource` (`profile` / `file` / `profile+file` / `coins-only`), `pricesLoaded`, `pricesInTable`, `pricesFromProfile`, `pricesFromFile`, `pricesUnmapped`, `pricesPath`, `pricesFilePath`, `pricesFileError`, and `noDataFor` gains `itemPrices` when nothing real loaded. An operator can override per id with `--worker-env=LUACLIENT_PRICES=/etc/luaclient/prices.json`; a name-keyed file is refused loudly rather than silently pricing everything at 0. Loot counts still need the TargetBot loot module wired with a container list — a worker without one reports `lootContainers` in `noDataFor`. |
+| supplies | **BUILT** — `bot/supplies.lua` has a per-item ledger against `Supplies.json`: `ledger()` returns `{itemId, item, name, count, threshold, min, max, ok, inInventory, inContainers, serverCount}` per row, where `count = max(inventory + open containers, the server's 0xC0 total)` so a closed-but-full backpack still counts. `levels()` is the same rows with **no named keys** — that shape matters, because a mixed-key Lua table encodes as a JSON *object* and the panel's `Array.isArray(L.supplies)` then drops it. The hub sends `supplies` (the array) and `suppliesStatus` (profile, rounds, pouch pages, low) side by side. |
 | kills/h, deaths | **BUILT** — from `Loot of <name>` messages and the death event |
 | hp/mana, position, target, cavebot waypoint | **BUILT** — live, in `status` |
 | uptime, online time, reconnects | **BUILT** — supervisor bookkeeping |
@@ -379,24 +440,155 @@ up and the control link is established, but the character is not in the game), `
 3. Panel UI. ✔
 4. End-to-end tests with real workers, on Windows and Debian. ✔ (`test/hube2esuite.lua`)
 
+## Deployment — BUILT
+
+`deploy/` packages the system for a Debian server and `INSTALL.md` is the operator's install guide.
+`deploy/package.sh` builds a reproducible versioned tarball (two builds of the same source give
+byte-identical output) with a `sha256sum -c`-readable digest and a per-file manifest; `test/`,
+`docs/`, `panel/test`, `panel/mock` and `panel/devhub.lua` are deliberately excluded, so a
+production install cannot serve the development harness. `deploy/install.sh` is idempotent and
+creates a `luaclient` system user, `/opt/luaclient` (root-owned, read-only to the service),
+`/var/lib/luaclient` (0700, the service user's), `/var/log/luaclient`, `/etc/luaclient/hub.conf`
+and a hardened systemd unit. `deploy/upgrade.sh` backs the data up, runs a migration dry run and
+rolls the whole thing back on failure; `deploy/uninstall.sh` keeps the data unless `--purge`.
+`deploy/nginx-luaclient.conf` terminates TLS in front.
+
+Verified end to end on a real Debian 13 machine that genuinely runs systemd (systemd 257): built
+the tarball, purged the previous install, installed from the tarball into a clean prefix, and drove
+the REST API with `curl` — bootstrap an administrator, create a `user` account, a game account, a
+character and an instance, start it with a `--dry-run` worker, read its live status and log ring,
+read the audit log as the administrator, and confirm that the plain account is refused every admin
+route with `403` and every cross-tenant id with `404`. See *End-to-end verification* below.
+
 ## Not done
 
-* **Supplies vs thresholds.** `bot/supplies.lua` has no per-item ledger, so the panel's supplies
-  column is empty. Needs a `supplies:levels() -> {[itemId]={have,threshold,name}}` in the bot.
-* **Loot and waste *values*.** The counts are exact; the money needs the profile's price table
-  (`vBot/items.lua`) to be present. With none, every non-coin item is worth 0 and the snapshot says
-  so in `noDataFor`.
-* **Config pickers before an instance has ever run.** The cavebot/targetbot/profile lists live in
-  the worker's profile directory, so a stopped instance shows the last cached answer (empty on a
-  fresh hub). A hub-side scan would need a directory-listing primitive the repo does not have.
-* **Graceful shutdown on Windows Ctrl+C.** Linux has an orderly `sigtimedwait` path; Windows has no
-  safe console-handler path from LuaJIT, so workers are reaped by the job object rather than by a
-  `shutdown` command.
-* **`login` blocks the reactor** for the duration of the HTTPS POST (`lib/http.lua` is synchronous,
-  capped at 20 s). Status pushes and the bot tick pause for that request. A non-blocking TLS client
-  would be needed.
+* **Config pickers still cannot list macros.** The cavebot, targetbot and profile lists *are* now
+  answered for an instance that has never run: `hub/supervisor.lua` scans the profile directory
+  through `bot/config.lua`'s `listDir`, and `GET /api/instances/:id/configs` reports which answer it
+  gave in a `source` field (`worker` / `scan` / `cache` / `none`). Macros are the exception and are
+  honestly empty from a scan — a macro is a Lua registration inside a running bot, not a file — so a
+  stopped instance still shows whatever a worker last reported.
 * **No rate limiting on the worker control endpoint**, and no per-command authorisation there: the
   token is all-or-nothing.
+* **vBot's per-character price overrides are not read.** `analyzer.lua` checks
+  `storage.analyzers.customPrices[name]` before scanning `LootItems`; only `vBot/items.lua` and the
+  operator's own price file are read. On the reference profile 6 `LootItems` names match no item in
+  `assets/items1530.bin`; they are counted in `pricesUnmapped` but not listed anywhere, so an
+  operator cannot yet be told exactly which ones to price by hand.
+* **The panel does not yet draw the honesty fields.** `pricesSource`, `pricesLoaded`, `moneySource`
+  and `configs.source` are on the wire and asserted by the suites; rendering them is still to do.
+
+## End-to-end verification on a real Debian machine
+
+Everything in this section was executed on Debian 13 (trixie), amd64, LuaJIT 2.1.1737090214, with
+systemd 257 genuinely running: the unit was installed, verified, enabled, started, restarted and
+stopped for real. The tarball was built by `deploy/package.sh`, the machine was purged first, and
+the install came from the tarball, not from the checkout.
+
+What was driven with `curl` against the real REST API, in order: `GET /api/health` →
+`POST /api/bootstrap` with the one-time token read out of the journal → `GET /api/session` →
+`POST /api/admin/users` (role `user`) → `POST /api/accounts` → `POST /api/characters` →
+`POST /api/instances` → `POST /api/instances/actions {start}` (a `--dry-run` worker, spawned as a
+child of the hub inside the service's own cgroup) → `GET /api/instances/:id` for live status →
+`GET /api/instances/:id/logs` → `GET /api/admin/audit` as the administrator → sign in as the plain
+user → every admin route refused `403 forbidden` → every cross-tenant id refused `404 not-found`
+→ the refusals read back out of the admin-only audit log → `{stop}`.
+
+Security properties, checked on that install rather than argued from the source:
+
+* `/var/lib/luaclient` is `0700 luaclient:luaclient`, every file in it `0600`; another user gets
+  `Permission denied` even listing it, and the service user gets `Permission denied` writing to
+  `/opt/luaclient` (`ProtectSystem=strict`).
+* The game password, the 2FA token and both web passwords appear in **zero** files under
+  `/var/lib/luaclient`, `/var/log/luaclient` and `/etc/luaclient`, and in **zero** journal lines.
+  `accounts.json` holds `sbx$1$…` records; `users.json` holds `pbkdf2$sha256$200000$…`.
+* The worker's `/proc/<pid>/cmdline` and `/proc/<pid>/environ` contain none of them.
+* **The worker inherits exactly three descriptors — 0, 1 and 2** — and those are the stdio pipes to
+  the hub. Comparing every entry of `/proc/<worker>/fd` against `/proc/<hub>/fd` finds no other
+  shared object: not the hub's listening socket, not `audit.jsonl`, not `hub.log`. The worker does
+  hold two more descriptors of its **own**, opened after `execve`: fd 3 is its control listener
+  (`LISTEN 127.0.0.1:45857`) and fd 4 the hub's accepted connection to it. Both carry `O_CLOEXEC`.
+  So "only 0, 1, 2" is true of what is *inherited*, which is the property that matters; it is not
+  true of the running process, and this document should not be read as claiming otherwise.
+
+### Two defects this pass found, and fixed
+
+Both were invisible to all sixteen suites, and both needed a real install and a real browser-shaped
+client to see.
+
+* **Every `DELETE` the panel can issue answered `415`.** `panel/api.js` sent `null` as the body for
+  a `DELETE` (the id is in the path, so there was nothing to say), `panel/rpc.js` sets
+  `Content-Type` only when there *is* a body, and the first of the hub's four CSRF checks refuses
+  any state-changing request that is not `application/json`. So deleting an instance, a game
+  account, a character, a proxy, a script or a web account, revoking a session, and **Sign out**
+  all failed. `test/hube2esuite.lua`'s `rest()` helper sets the header itself for every non-GET, so
+  the suite could not reproduce what a browser sends. Fixed in `panel/api.js` by sending `{}` — the
+  smallest thing that satisfies the check without weakening any of the four.
+* **The hub leaked one file descriptor per HTTP connection, permanently.** `lib/socket.lua`'s
+  `recv()` sets `state = 'closed'` when the peer sends FIN — a statement about the *protocol*; the
+  socket is in `CLOSE-WAIT` and the descriptor is still ours. `Sock:close()` guarded on
+  `state ~= 'closed'` and therefore skipped `P.close()` for every socket the peer closed first,
+  which is every ordinary keep-alive request. `lib/httpserver.lua`'s `Conn:destroy()` decremented
+  `stat.active` regardless, so `maxConnections` never noticed and the 30 s idle sweep could not
+  help — the connection was already gone from `server.conns` while its fd stayed open forever.
+  Measured on the installed hub: one request leaked exactly one descriptor; 100 requests left 100
+  `CLOSE-WAIT` sockets that were still there 70 s later. At the unit's `LimitNOFILE=8192` the hub
+  dies after a few thousand panel requests. It affected every socket in the program, not just the
+  hub — the worker's control endpoint, the game transport and the proxy client all close this way.
+  `Sock:close()` now keys on a separate `fdOpen` flag. After the fix, 500 requests and 30
+  concurrent clients leave the hub at its idle 6 descriptors and 0 `CLOSE-WAIT`.
+  `test/fdleaksuite.lua` is the regression test: it counts `/proc/<getpid()>/fd`, and reverting the
+  one-line guard makes it fail with 205 descriptors after 200 rounds instead of 4.
+
+### What was *not* verified
+
+* **No browser.** The panel was driven only through its HTTP API with `curl`, using the exact
+  headers `panel/rpc.js` emits. Browser navigation to loopback was unavailable in the verification
+  environment, so no version of this system has been clicked through since the `DELETE` fix.
+  `panel/app.js` was not exercised at all this pass.
+* **Not a real machine.** Debian 13 under WSL2. systemd is genuinely running, so `enable`, `start`,
+  `restart`, `stop`, the sandbox, cgroup membership, journal capture and `systemd-analyze` are all
+  real — but behaviour across an actual host reboot was not tested, because WSL's lifecycle is not
+  a boot.
+* **No real game server.** The worker was started with `--dry-run`, so it wires the bot, loads the
+  item table and serves its control endpoint, but never opens a game socket. The login path itself
+  is covered offline by `test/hube2esuite.lua` against `test/fakeserver.lua`.
+* **No TLS certificate issuance.** `deploy/nginx-luaclient.conf` was proven against a self-signed
+  certificate at the exact path certbot uses; certbot itself has never run, because the machine has
+  no public name.
+
+### Test suites — Debian 13 and Windows, all green
+
+| suite | Debian | Windows |
+|---|---|---|
+| selftest | 2538 | 2538 |
+| botsuite | 2137 | 2137 |
+| statsuite | 194 | 194 |
+| cryptosuite | 278 | 277 |
+| httpserversuite | 444 | 444 |
+| wssuite | 309 | 309 |
+| proxysuite | 235 | 235 |
+| processsuite | 204 | 196 |
+| controlsuite | 390 | 390 |
+| hubcoresuite | 358 | 358 |
+| hubapisuite | 259 | 259 |
+| hube2esuite | 200 | 198 |
+| fdleaksuite | 15 | 12 |
+| shim_platform_suite | 436 | 436 |
+| shim_host_suite | 118 | 118 |
+| shim_game_suite | 371 | 371 |
+| shim_ui_suite | 260 | 260 |
+| **total** | **8746 passed, 0 failed** | **8732 passed, 0 failed** |
+
+The counts differ where a suite has platform-specific checks: `cryptosuite` and `processsuite` do
+more on Linux, `hube2esuite` has two Linux-only signal checks, and `fdleaksuite`'s descriptor
+counting needs `/proc` and reports itself as skipped on Windows.
+
+`test/` is not packaged, so the suites run from the source tree. What is checked against the
+**installed** tree instead: every one of its 87 `.lua` files compiles, `hub/main.lua` and `main.lua`
+answer `--help`, the panel's own files are served with the right content types, the development
+harness (`devhub.lua`, `panel/test/`, `panel/mock/`) answers `404` to everyone, and the whole REST
+and WebSocket surface above was driven against it.
 * **The worker is not isolated from the hub.** It runs as the same OS user, so `canExec` is
   administrator-equivalent by construction (see *Web accounts and authorisation*). What a worker
   no longer inherits is the hub's **descriptors** and **signal mask**: `lib/process.lua` closes
@@ -408,4 +600,5 @@ up and the control link is established, but the character is not in the game), `
   restart) and the audit log's `O_APPEND` write handle (so code running in a worker could forge
   records in the admin-only log), and `kill -9` of the hub left every worker running and logged in.
   Real isolation — a separate OS user, a systemd user slice, a container — is still not built.
-* **Cross-browser and mobile.** The panel was driven only in Chromium.
+* **Cross-browser and mobile.** The panel was driven in Chromium once, before the `DELETE` fix
+  below. No browser has opened it since; see *What was not verified*.

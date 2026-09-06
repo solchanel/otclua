@@ -1,0 +1,141 @@
+[Unit]
+Description=luaclient hub (web panel and worker supervisor)
+Documentation=file:///opt/luaclient/INSTALL.md file:///opt/luaclient/README-HUB.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=luaclient
+Group=luaclient
+EnvironmentFile=/etc/luaclient/hub.conf
+WorkingDirectory=/var/lib/luaclient
+
+# The code lives read-only in /opt/luaclient; everything the hub or a worker
+# writes goes to /var/lib/luaclient.  --worker-script is therefore an ABSOLUTE
+# path into /opt while --workers-dir (the cwd every worker gets, and the root a
+# relative --bot-profile resolves against) is under the state directory.  Get
+# that backwards and the first instance you start dies trying to create its bot
+# profile inside a read-only tree.
+#
+# $HUB_EXTRA_ARGS is unbraced on purpose: systemd word-splits $VAR and does not
+# split ${VAR}, and an empty value expands to no argument at all.
+ExecStart=/usr/bin/luajit /opt/luaclient/hub/main.lua \
+    --luajit=/usr/bin/luajit \
+    --bind=${HUB_BIND} \
+    --port=${HUB_PORT} \
+    --data-dir=/var/lib/luaclient \
+    --panel-dir=/opt/luaclient/panel \
+    --workers-dir=/var/lib/luaclient/workers \
+    --worker-script=/opt/luaclient/main.lua \
+    --log-level=${HUB_LOG_LEVEL} \
+    --log-file=/var/log/luaclient/hub.log \
+    --worker-env=LUACLIENT_BOT_PROFILE=${HUB_BOT_PROFILE} \
+    $HUB_EXTRA_ARGS
+
+Restart=on-failure
+RestartSec=5s
+
+# SIGTERM goes to the HUB ONLY (KillMode=mixed), not to the whole cgroup, and
+# that is deliberate.  The hub answers SIGTERM by asking each worker to LOG OUT
+# over the control socket and waiting for it -- a worker that is merely killed
+# leaves the character online for the server's own logout timeout and the next
+# login on that account is refused with "session ended", so killing a worker
+# costs the operator the next login too.  Only after TimeoutStopSec does systemd
+# SIGKILL what is left of the cgroup, which is the backstop for a wedged hub.
+# TimeoutStopSec must exceed --stop-grace-ms (default 8 s) times the number of
+# workers that stop serially; 90 s is room for a dozen.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=90
+
+# The bootstrap token is written to stdout ONLY -- never to --log-file -- so it
+# reaches the operator through the journal:  journalctl -u luaclient-hub
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=luaclient-hub
+
+# ------------------------------------------------------------------ sandbox --
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/luaclient /var/log/luaclient
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# One `~` for the whole list.  `~@privileged ~@resources` is NOT two denials:
+# systemd reads the second `~@resources` as a literal syscall name and logs
+# "System call ~@resources is not known, ignoring" -- which install.sh now
+# prints rather than swallows, and which is how this was caught.
+SystemCallFilter=~@privileged @resources @obsolete
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+UMask=0077
+MemoryMax=1G
+TasksMax=512
+LimitNOFILE=8192
+
+# --------------------------------------------------- deliberately NOT set --
+#
+# Each of these is a hardening option a reviewer will ask about.  They are off
+# because they break this service, not because they were forgotten.
+#
+# MemoryDenyWriteExecute=yes
+#     Fatal.  LuaJIT's JIT compiler writes machine code into a page and then
+#     executes it; W^X enforcement makes mprotect(PROT_EXEC) fail and the hub
+#     dies during startup -- and so does every worker, which inherits the
+#     restriction through the cgroup.  There is no LuaJIT build flag that keeps
+#     the tracing compiler and satisfies this.
+#
+# PrivateUsers=yes
+#     The hub spawns workers with fork()+execve() and reaps them by pid; a user
+#     namespace also makes the service's own uid unmappable to the host uid the
+#     data directory is owned by, so /var/lib/luaclient becomes unreadable.
+#
+# ProtectSystem=full  ->  we use strict, which is stronger.  strict needs the
+#     ReadWritePaths above; without them the hub cannot create secret.key and
+#     refuses to start.
+#
+# NoExecPaths= / ExecPaths=
+#     A worker is `luajit /opt/luaclient/main.lua`.  Restricting exec to a path
+#     list is possible but buys nothing here: the hub already refuses to put a
+#     secret in argv and the only binary it ever execs is the interpreter named
+#     by --luajit.
+#
+# DynamicUser=yes
+#     Incompatible with a persistent, operator-inspectable /var/lib/luaclient
+#     that must survive an uninstall/reinstall, and with `secret.key` being
+#     owned by a stable uid.  A fresh uid on every start would orphan the whole
+#     data directory.
+#
+# PrivateNetwork=yes
+#     The hub is a web server and the workers dial a game server, usually
+#     through an HTTP CONNECT proxy.  Obviously incompatible.
+#
+# RestrictAddressFamilies without AF_UNIX
+#     journald's stdout socket is AF_UNIX.  Drop it and the service starts but
+#     logs nothing, including the bootstrap token.
+#
+# THE SANDBOX IS NOT AN ISOLATION BOUNDARY BETWEEN THE HUB AND ITS WORKERS.
+# A worker runs as the same user, in the same cgroup, with the same sandbox and
+# with /var/lib/luaclient readable -- so an account holding the `canExec`
+# capability can read secret.key and decrypt every stored game credential.
+# PANEL.md says so plainly; this unit does not change it.  Grant canExec only to
+# someone you would also give a shell on this machine.
+
+[Install]
+WantedBy=multi-user.target

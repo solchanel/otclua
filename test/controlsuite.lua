@@ -1186,6 +1186,24 @@ local itemsLoaded = pcall(function()
     require('proto.items').load(ROOT .. '/assets/items1530.bin')
 end)
 
+-- The user's REAL vBot profile, resolved the way main.lua's defaultBotProfile() does,
+-- so the identical file runs on Windows and under WSL.
+local PROFILE
+do
+    -- ABSOLUTE candidates first: hub/supervisor.lua's profileDir refuses a relative
+    -- profile that climbs out of the worker directory, which is exactly what the
+    -- ROOT-relative form (`test/../../../otclient_mehah1530/...`) does.  Both
+    -- absolute forms are the same directory, one per platform.
+    for _, c in ipairs({
+        'D:/Claude/otclient_mehah1530/otclient/profiles/bot/vBot_4.8',
+        '/mnt/d/Claude/otclient_mehah1530/otclient/profiles/bot/vBot_4.8',
+        ROOT .. '/../../otclient_mehah1530/otclient/profiles/bot/vBot_4.8',
+    }) do
+        local f = io.open(c .. '/vBot/items.lua', 'r')
+        if f then f:close(); PROFILE = (c:gsub('\\', '/')); break end
+    end
+end
+
 local function scratchLC()
     local LC = {
         log = require('lib.log'), sys = sys, sched = require('lib.sched'),
@@ -1475,6 +1493,640 @@ runSuite('proxy and token flags keep credentials out of argv', function()
     os.remove(pf); os.remove(tf); os.remove(tf2)
     -- keep the unused locals honest
     truthy(code ~= nil or out ~= nil or true, 'flag validation completed')
+end)
+
+-- ===========================================================================
+-- G1 -- the data gaps PANEL.md marked NOT DONE / PARTIAL
+-- ===========================================================================
+
+runSuite('prices come out of the profile vBot/items.lua, and say so honestly', function()
+    truthy(PROFILE, 'the user\'s real vBot_4.8 profile is on this machine', tostring(PROFILE))
+    truthy(itemsLoaded, 'and assets/items1530.bin loaded (the name index)')
+    if not (PROFILE and itemsLoaded) then return end
+
+    -- 1. the source, cited: vBot/items.lua assigns ONE global, LootItems, keyed by
+    --    lowercase item NAME (analyzer.lua:645-672 getPrice() looks names up in it).
+    local raw = io.open(PROFILE .. '/vBot/items.lua', 'rb')
+    local text = raw and raw:read('*a') or ''
+    if raw then raw:close() end
+    truthy(text:match('^LootItems%s*=%s*{') ~= nil,
+           'vBot/items.lua opens with `LootItems = {` -- a NAME-keyed price table')
+    truthy(text:find('%["gold coin"%]%s*=%s*1'), 'and prices "gold coin" at 1')
+
+    -- 2. buildPrices turns it into id -> price through proto/items.lua's name index
+    local prices, loaded, unmapped = control._buildPrices(PROFILE .. '/vBot/items.lua')
+    truthy(type(prices) == 'table', 'buildPrices returns a table')
+    truthy(loaded > 1000, 'and priced ' .. tostring(loaded) .. ' item ids')
+    eq(prices[3031], 1, 'gold coin = 1 gp')
+    eq(prices[3035], 100, 'platinum coin = 100 gp')
+    eq(prices[3043], 10000, 'crystal coin = 10000 gp')
+    truthy(type(unmapped) == 'number' and unmapped >= 0,
+           'unmapped names are counted, not clamped away: ' .. tostring(unmapped))
+
+    -- REGRESSION: `unmapped` used to be (#names - #ids), which goes NEGATIVE because
+    -- several client ids share one name -- it was then clamped to 0 and reported
+    -- "everything mapped" for a file that really does contain unmappable names.
+    local names = 0
+    for _ in text:gmatch('\n%s*%[?"') do names = names + 1 end
+    truthy(loaded > names, 'more ids were priced than the file has names (ids share names): ' ..
+           tostring(loaded) .. ' ids from ~' .. tostring(names) .. ' names')
+
+    -- 3. the snapshot table the reviewer asked for
+    local items = require('proto.items')
+    local SAMPLE = { 3031, 3035, 3043, 268, 7643, 23374, 3097, 8090, 3079, 5741 }
+    io.write(('\n     price table  --  %s/vBot/items.lua\n'):format(PROFILE))
+    io.write('     itemId  name                          price(gp)\n')
+    io.write('     ------  ----------------------------  ---------\n')
+    for _, id in ipairs(SAMPLE) do
+        local okn, nm = pcall(items.name, id)
+        io.write(('     %6d  %-28s  %9s\n')
+                 :format(id, (okn and nm or '?'):sub(1, 28),
+                         prices[id] and tostring(prices[id]) or '(no price)'))
+    end
+    io.write(('     %d ids priced, %d LootItems names matched nothing in items1530.bin\n')
+             :format(loaded, unmapped))
+
+    -- 4. the telemetry says WHERE they came from, and money/h uses the values
+    local LC = scratchLC()
+    local T = control.newTelemetry{ LC = LC, pricesPath = PROFILE .. '/vBot/items.lua' }
+    local s = T:snapshot()
+    eq(s.pricesSource, 'profile', 'pricesSource says the profile supplied them')
+    eq(s.pricesLoaded, loaded, 'pricesLoaded is the number that came from a real source')
+    truthy(s.pricesInTable > s.pricesLoaded - 1,
+           'pricesInTable also counts the three hard-coded coin values')
+    local noPrices = false
+    for _, k in ipairs(s.noDataFor or {}) do if k == 'itemPrices' then noPrices = true end end
+    eq(noPrices, false, 'and itemPrices is NOT listed as missing')
+
+    -- 5. with NO source at all the coins are still priced but the snapshot is honest
+    local T0 = control.newTelemetry{ LC = scratchLC(), pricesPath = nil }
+    local s0 = T0:snapshot()
+    eq(s0.pricesLoaded, 0, 'no source -> pricesLoaded is 0, not "3 coins"')
+    eq(s0.pricesSource, 'coins-only', 'and pricesSource says coins-only')
+    local missing0 = false
+    for _, k in ipairs(s0.noDataFor or {}) do if k == 'itemPrices' then missing0 = true end end
+    eq(missing0, true, 'so the panel can print "prices not loaded" instead of 0 gp/h')
+    eq(T0.engine:itemValue(3031), 1, 'the coins are priced regardless (they never change)')
+    eq(T0.engine:itemValue(8090), 0, 'and every other item is worth 0, as documented')
+
+    -- 6. the operator's own file overrides the profile, per id
+    local pf = tmpPath('prices'):gsub('%.tmp$', '.json')
+    writeFile(pf, '{"8090": 123456, "3031": 1}')
+    local T2 = control.newTelemetry{ LC = scratchLC(),
+                                     pricesPath = PROFILE .. '/vBot/items.lua',
+                                     pricesFile = pf }
+    local s2 = T2:snapshot()
+    eq(s2.pricesSource, 'profile+file', 'both sources are reported')
+    eq(s2.pricesFromFile, 2, 'the file contributed two entries')
+    eq(T2.engine:itemValue(8090), 123456, 'and the file WINS for an id both define')
+    eq(T2.engine:itemValue(3035), 100, 'ids only the profile has are untouched')
+
+    -- a file the operator got wrong is refused loudly, not silently zeroed
+    local bad = tmpPath('badprices'):gsub('%.tmp$', '.lua')
+    writeFile(bad, 'return { ["gold coin"] = 1 }')       -- the vBot NAME-keyed shape
+    local T3 = control.newTelemetry{ LC = scratchLC(), pricesFile = bad }
+    eq(T3.pricesFromFile, 0, 'a name-keyed price file loads nothing')
+    truthy(T3.pricesFileError ~= nil, 'and the reason is kept for the panel',
+           tostring(T3.pricesFileError))
+    eq(T3:snapshot().pricesSource, 'coins-only', 'so the snapshot still says coins-only')
+
+    -- 6b. the ENVIRONMENT route, which is the one an operator actually uses:
+    --     hub --worker-env=LUACLIENT_PRICES=/etc/luaclient/prices.json.  Lua 5.1 has
+    --     no setenv, so this is proved in a REAL child process with a real
+    --     environment, the same way the hub's supervisor hands one to a worker.
+    local pf2 = tmpPath('envprices'):gsub('%.tmp$', '.json')
+    writeFile(pf2, '{"8090": 777, "5741": 12}')
+    local envOut = {}
+    local eh = process.spawn{
+        cmd = { luajitExe(), '-e',
+                'package.path="./?.lua;./?/init.lua;"..package.path;' ..
+                'local c=require("control.server");' ..
+                'local t=c.newTelemetry{LC={events=require("lib.events").new()}};' ..
+                'local s=t:snapshot();' ..
+                'io.write("ENVPRICES ",tostring(s.pricesFromFile)," ",' ..
+                'tostring(s.pricesSource)," ",tostring(t.engine:itemValue(8090)),"\\n")' },
+        cwd = ROOT, captureOutput = true,
+        env = { LUACLIENT_PRICES = pf2 },
+        onLine = function(l) envOut[#envOut + 1] = l end,
+    }
+    truthy(eh, 'a child can be spawned with LUACLIENT_PRICES in its environment')
+    if eh then
+        waitUntil(function() process.pollAll(); return not eh:isRunning() end, 15000)
+        process.pollAll()
+        local line
+        for _, l in ipairs(envOut) do if l:find('ENVPRICES', 1, true) then line = l end end
+        truthy(line, 'the child reported its price state', concat(envOut, ' | '))
+        if line then
+            local n, src, val = line:match('ENVPRICES (%S+) (%S+) (%S+)')
+            eq(n, '2', 'LUACLIENT_PRICES loaded both entries with no --prices flag at all')
+            eq(src, 'file', 'and pricesSource says the file supplied them')
+            eq(val, '777', 'and an item really is valued from it')
+        end
+    end
+    os.remove(pf); os.remove(pf2); os.remove(bad)
+
+    -- 7. loot and waste VALUES, and therefore money/h
+    local T4 = control.newTelemetry{ LC = LC, pricesPath = PROFILE .. '/vBot/items.lua' }
+    local e = T4.engine
+    local t0 = 1000000
+    e:sessionStart(t0)
+    for m = 0, 10 do
+        e:sampleBalance(t0 + m * 60000, 100000 + m * 1000)      -- +1000 gp/min of cash
+        if m > 0 then
+            e:addLoot(t0 + m * 60000, 3035, 10)                  -- 1000 gp of that IS coins
+            e:addLoot(t0 + m * 60000, 7643, 1)                   -- an ultimate health potion
+            e:addWaste(t0 + m * 60000, 268, 4)                   -- four mana potions
+        end
+    end
+    local snap = e:snapshot(t0 + 600000)
+    truthy(snap.loot > 0, 'loot has a VALUE now, not just a count: ' .. tostring(snap.loot))
+    truthy(snap.waste > 0, 'and so does waste: ' .. tostring(snap.waste))
+    eq(snap.lootCash, 10 * 1000, 'the coin part of the loot is separated out')
+    eq(snap.moneySource, 'gold+goods', 'money/h is the gauge plus the goods, minus waste')
+
+    truthy(math.abs(snap.moneyPerHour - (snap.goldPerHour + snap.goodsPerHour)) < 0.001,
+           'money/h == goldPerHour + goodsPerHour exactly')
+    io.write(('     one 10-minute hunt: loot %d gp, waste %d gp, cash %+d gp/h, ' ..
+              'goods %+d gp/h, money %+d gp/h (%s)\n')
+             :format(snap.loot, snap.waste, snap.goldPerHour, snap.goodsPerHour,
+                     snap.moneyPerHour, snap.moneySource))
+end)
+
+runSuite('the supplies ledger reaches the panel as an ARRAY', function()
+    local LC = scratchLC()
+    local suppliesmod = require('bot.supplies')
+    local st = LC.state
+    st.player.inventory = { [10] = { id = 268, count = 20 } }
+    st.containers = { [0] = { id = 0, name = 'bag', capacity = 20,
+                              item = { id = 2854 },
+                              items = { { id = 268, count = 55 },
+                                        { id = 7643, count = 3 } } } }
+    st.inventoryCounts = { [268 * 256] = 90 }
+
+    local sup = suppliesmod.new({ state = st }, {
+        supplies = { currentProfile = 'Default', Default = {
+            capSwitch = true, capValue = '200',
+            items = { ['268'] = { min = 100, max = 500, avg = 0 },
+                      ['7643'] = { min = 2, max = 20, avg = 0 } } } } })
+
+    local rows = sup:ledger()
+    eq(#rows, 2, 'two configured supply items')
+    eq(rows[1].itemId, 268, 'rows are in ascending id order')
+    eq(rows[1].count, 90, 'count = max(20 inventory + 55 container, 90 server)')
+    eq(rows[1].threshold, 100, 'threshold straight from the JSON string/number')
+    eq(rows[1].ok, false, '90 < 100 -> not ok')
+    eq(rows[2].count, 3, 'the second item is counted from the container alone')
+    eq(rows[2].ok, true, '3 >= 2 -> ok')
+
+    -- through the worker's status command
+    LC.bot = { status = function() return { on = true, supplies = sup:status() } end,
+               modules = { supplies = sup } }
+    local snap = commands.botSnapshot(LC)
+    truthy(type(snap.supplies) == 'table' and #snap.supplies == 2,
+           'botSnapshot forwards `supplies` as a two-row array')
+    local named = false
+    for k in pairs(snap.supplies) do if type(k) ~= 'number' then named = true end end
+    eq(named, false, 'with no named keys on it')
+    truthy(type(snap.suppliesStatus) == 'table', 'and the context beside it')
+    eq(snap.suppliesStatus.profile, 'Default', 'which carries the sub-profile name')
+    eq(snap.suppliesStatus.low, 1, 'and how many items are below their minimum')
+    eq(snap.suppliesStatus[1], nil, 'the context carries NO array part')
+
+    -- ... and survives the JSON normaliser as an ARRAY, which is the whole point
+    local safe = control._jsonSafe(snap)
+    eq(safe.supplies[1] ~= nil and safe.supplies[2] ~= nil and safe.supplies[3] == nil, true,
+       'jsonSafe keeps `supplies` a JSON array')
+    eq(safe.supplies[1].name, rows[1].name, 'with the item name the panel prints')
+    local encoded = json.encode(safe)
+    truthy(encoded:find('"supplies":[', 1, true) ~= nil,
+           'and the encoded frame really has `"supplies":[`')
+
+    -- ... and hub/supervisor.lua's flattenLive forwards it rather than demoting it
+    local flat = require('hub.supervisor').Sup.flattenLive{ bot = snap }
+    truthy(type(flat.supplies) == 'table' and #flat.supplies == 2,
+           'flattenLive passes the array through to the panel')
+    truthy(type(flat.suppliesStatus) == 'table', 'and keeps the context')
+
+    -- an OLD worker (mixed status object under `supplies`) is still demoted, not drawn
+    local legacy = require('hub.supervisor').Sup.flattenLive{
+        bot = { supplies = { rounds = 3, profile = 'Default' } } }
+    eq(legacy.supplies, nil, 'a pre-ledger worker\'s status object is not offered as rows')
+    truthy(type(legacy.suppliesStatus) == 'table', 'it travels as suppliesStatus instead')
+
+    -- the telemetry snapshot carries the same split
+    local T = control.newTelemetry{ LC = LC }
+    local ts = T:snapshot()
+    truthy(type(ts.supplies) == 'table' and #ts.supplies == 2,
+           'the `stats` push carries the ledger too')
+    eq(ts.suppliesStatus.low, 1, 'and its context')
+
+    -- with no supplies module at all the snapshot says so
+    local T2 = control.newTelemetry{ LC = scratchLC() }
+    local missing = false
+    for _, k in ipairs(T2:snapshot().noDataFor or {}) do
+        if k == 'supplies' then missing = true end
+    end
+    eq(missing, true, 'noDataFor names `supplies` when there is no module')
+
+    io.write('\n     supplies over the wire: ' ..
+             encoded:match('"supplies":%[.-%]'):sub(1, 200) .. '\n')
+end)
+
+runSuite('the hub lists configs for an instance that has never run', function()
+    truthy(PROFILE, 'the real profile is present')
+    if not PROFILE then return end
+    local sup = require('hub.supervisor').new{ workersDir = ROOT }
+
+    -- path resolution, including the traversal refusal
+    eq(sup:profileDir('profile_1'), ROOT:gsub('/+$', '') .. '/profile_1',
+       'a relative bot profile resolves against the worker cwd')
+    eq(sup:profileDir('D:/games/vBot_4.8'), 'D:/games/vBot_4.8',
+       'an absolute one is used as it stands')
+    eq(sup:profileDir('../../etc'), nil,
+       'a relative profile that climbs out of the worker directory is refused')
+    eq(sup:profileDir('a/../b'), ROOT:gsub('/+$', '') .. '/b',
+       'but a `..` that stays inside is just normalised')
+
+    local cfgs, err = sup:scanProfileConfigs(PROFILE)
+    truthy(type(cfgs) == 'table', 'the profile directory scans', tostring(err))
+    if not cfgs then return end
+    truthy(#cfgs.cavebot > 0, 'cavebot_configs/*.cfg -> ' .. #cfgs.cavebot .. ' configs')
+    truthy(#cfgs.targetbot > 0, 'targetbot_configs/*.json -> ' .. #cfgs.targetbot)
+    truthy(#cfgs.profiles > 0, 'vBot_configs/profile_* -> ' .. #cfgs.profiles)
+    eq(#cfgs.macros, 0, 'macros stay empty: a macro is a registration, not a file')
+
+    -- the names are the STEMS the worker's bot.setCavebot expects, not file names
+    local hasExt = false
+    for _, n in ipairs(cfgs.cavebot) do if n:find('%.cfg$') then hasExt = true end end
+    eq(hasExt, false, 'the .cfg extension is stripped')
+    local hasProfile1 = false
+    for _, n in ipairs(cfgs.profiles) do if n == 'profile_1' then hasProfile1 = true end end
+    eq(hasProfile1, true, 'profile_1 is offered')
+
+    io.write(('\n     hub-side scan of %s\n'):format(PROFILE))
+    io.write(('     cavebot   (%d): %s\n'):format(#cfgs.cavebot,
+             concat(cfgs.cavebot, ', '):sub(1, 150)))
+    io.write(('     targetbot (%d): %s\n'):format(#cfgs.targetbot,
+             concat(cfgs.targetbot, ', '):sub(1, 150)))
+    io.write(('     profiles  (%d): %s\n'):format(#cfgs.profiles, concat(cfgs.profiles, ', ')))
+
+    -- and the endpoint the panel calls answers from the scan while the worker is down
+    local hubapi = require('hub.api')
+    local H = hubapi._handlers
+    truthy(type(H) == 'table' and type(H['instance.configs']) == 'function',
+           'hub/api.lua exposes its handler table to the suite')
+    if not H then return end
+    local inst = { id = 'i1', botProfile = PROFILE }
+    local fake = { configsCache = {}, sup = sup,
+                   ownedInstance = function() return inst end }
+    local res = H['instance.configs'](fake, { id = 'i1' }, {}, function() end)
+    truthy(type(res) == 'table', 'a STOPPED instance still gets an answer')
+    eq(res.source, 'scan', 'and it says the answer came from a directory scan')
+    eq(#res.cavebot, #cfgs.cavebot, 'with the same cavebot list')
+    eq(res.stale, true, 'marked stale, because no worker confirmed it')
+
+    -- a profile with nothing in it falls back to the cache rather than inventing rows
+    local empty = { id = 'i2', botProfile = 'profile_1' }
+    local fake2 = { configsCache = { i2 = { cavebot = { 'cached' }, targetbot = {},
+                                           profiles = {}, macros = { 'm' } } },
+                    sup = sup, ownedInstance = function() return empty end }
+    local res2 = H['instance.configs'](fake2, { id = 'i2' }, {}, function() end)
+    eq(res2.source, 'cache', 'an empty profile directory falls through to the cache')
+    eq(res2.cavebot[1], 'cached', 'and returns what a worker last reported')
+end)
+
+-- ===========================================================================
+-- G1.4 -- CHAT, proved against real packets rather than a synthetic bus event.
+--
+-- The WebSocket section above emits `talk` on the worker's OWN event bus from
+-- inside `exec` and checks that a `chat` frame comes back.  That proves the
+-- broadcast wiring and nothing else: it never touches proto/parser.lua, so a
+-- mis-decoded 0xAA would sail straight past it, and `say` was not covered at all.
+--
+-- This section stands up a scripted 1530 server on 127.0.0.1, lets the REAL
+-- main.lua log into it (the same path test/fakeserver.lua exercises -- raw world
+-- preamble, RSA login frame, PendingGame, the two enter-game frames, XTEA on),
+-- and then:
+--   * sends a real Talk (0xAA) packet and asserts the worker pushes `chat` with the
+--     speaker, the level, the mode and the text that were on the wire;
+--   * sends a real TextMessage (0xB4) and asserts it arrives as a `chat` frame
+--     flagged `system`;
+--   * calls `say` over the control WebSocket and reads the 0x96 Talk packet the
+--     worker put on the game socket, checking the opcode, the mode byte, the text
+--     and the trailing aim byte the 1525+ gunz protocol requires.
+--
+-- The server does its own framing, padding, sequencing and XTEA, so a framing bug
+-- in proto/transport.lua cannot cancel itself out.  The XTEA session key cannot be
+-- recovered from the RSA block (no private key), so the worker is started with
+-- LUACLIENT_TEST_XTEA -- main.lua's documented test hook, and the only thing about
+-- this session that is not the production path.
+-- ===========================================================================
+local xtea   = require('lib.xtea')
+local buffer = require('lib.buffer')
+
+local CHAT_XTEA_HEX = '0f1e2d3c4b5a69788796a5b4c3d2e1f0'
+local CHAT_KEY = {}
+for i = 0, 3 do
+    CHAT_KEY[i + 1] = tonumber(CHAT_XTEA_HEX:sub(i * 8 + 1, i * 8 + 8), 16)
+end
+
+local function u16le(v) return schar(v % 256, floor(v / 256) % 256) end
+local function u32le(v)
+    v = v % 0x100000000
+    return schar(v % 256, floor(v / 0x100) % 256,
+                 floor(v / 0x10000) % 256, floor(v / 0x1000000) % 256)
+end
+
+local GS = {}
+GS.__index = GS
+
+--- A scripted game server, driven entirely by pump() so the single-threaded suite
+--- can interleave it with the control WebSocket and the child's stdout.
+local function newGameServer()
+    local listener, lerr = socket.listen('127.0.0.1', 0)
+    if not listener then return nil, 'listen: ' .. tostring(lerr) end
+    local S = setmetatable({
+        listener = listener, port = listener:port(),
+        buf = '', pos = 1, seq = 0, outbox = {},
+        clientFrames = {}, done = false, err = nil,
+    }, GS)
+    S.co = coroutine.create(function() return S:_script() end)
+    return S
+end
+
+function GS:_frame(body, key)
+    local pad = 8 - (#body % 8) - 1
+    local region = schar(pad) .. body .. string.rep('\0', pad)
+    if key then region = xtea.encrypt(key, region) end
+    local f = u16le(#region / 8) .. u32le(self.seq) .. region
+    self.seq = self.seq + 1
+    return f
+end
+
+--- Queue a server -> client frame.  Safe to call from the driver at any time.
+function GS:push(body, key)
+    self.outbox[#self.outbox + 1] = self:_frame(body, key == nil and CHAT_KEY or key)
+end
+
+function GS:_avail() return #self.buf - self.pos + 1 end
+
+--- Inside the script coroutine only: yield until `n` bytes are buffered.
+function GS:_need(n)
+    while self:_avail() < n do coroutine.yield() end
+    local s = ssub(self.buf, self.pos, self.pos + n - 1)
+    self.pos = self.pos + n
+    return s
+end
+
+function GS:_readLine()
+    local out = {}
+    for _ = 1, 256 do
+        local c = self:_need(1)
+        if c == '\n' then return concat(out) end
+        out[#out + 1] = c
+    end
+    error('no newline in the first 256 bytes of the preamble')
+end
+
+function GS:_readFrame(key)
+    local hdr = self:_need(2)
+    local blocks = sbyte(hdr, 1) + sbyte(hdr, 2) * 256
+    if blocks == 0 then error('bad block count 0') end
+    local body = self:_need(blocks * 8 + 4)
+    local seq = sbyte(body, 1) + sbyte(body, 2) * 256
+              + sbyte(body, 3) * 65536 + sbyte(body, 4) * 16777216
+    local region = ssub(body, 5)
+    if key then region = xtea.decrypt(key, region) end
+    local pad = sbyte(region, 1)
+    local payload = ssub(region, 2, #region - pad)
+    return payload, seq
+end
+
+--- The whole session, written linearly; every read yields when it runs dry.
+function GS:_script()
+    self.preamble = self:_readLine()
+
+    -- challenge (unencrypted, like the real server's first frame)
+    self:push(schar(0x1F) .. u32le(0x11223344) .. schar(0x5A) .. schar(0x00), false)
+    local login, lseq = self:_readFrame(nil)
+    self.loginOpcode, self.loginSeq = sbyte(login, 1), lseq
+
+    -- PendingGame: XTEA is on from here in both directions
+    self:push(schar(0x0A))
+    self:_readFrame(CHAT_KEY)              -- enter-game frame 1 (0x0F)
+    self:_readFrame(CHAT_KEY)              -- enter-game frame 2 (extended hwid)
+
+    -- EnterGame + PlayerData, so the worker is really in the game
+    self:push(schar(0x0F))
+    local w = buffer.writer()
+    w:u8(0xA0)
+    w:u32(155):u32(185):u32(87650):u64(4242):u16(9):u16(37)
+    w:u16(0):u16(0):u16(0):u16(0)
+    w:u32(31):u32(62):u8(100):u16(2400):u16(220):u16(0):u16(0)
+    w:u16(0):u8(0)
+    w:u32(0):u32(0)
+    self:push(w:data())
+    self.inGame = true
+
+    -- from here the driver pushes packets and we record everything the client sends
+    while not self.stop do
+        local payload, seq = self:_readFrame(CHAT_KEY)
+        self.clientFrames[#self.clientFrames + 1] = { payload = payload, seq = seq }
+    end
+    return true
+end
+
+function GS:pump()
+    if self.done then return end
+    if not self.sock then
+        local s, err = self.listener:accept()
+        if s then self.sock = s
+        elseif err ~= 'wouldblock' then self.err = 'accept: ' .. tostring(err); self.done = true end
+        if not self.sock then return end
+    end
+    -- read whatever arrived
+    while true do
+        local d, err = self.sock:recv(65536)
+        if d == nil then
+            self.closed, self.closedErr = true, err
+            break
+        end
+        if #d == 0 then break end
+        self.buf = ssub(self.buf, self.pos) .. d
+        self.pos = 1
+    end
+    -- write whatever the script (or the driver) queued
+    while #self.outbox > 0 do
+        local f = table.remove(self.outbox, 1)
+        local n = self.sock:send(f)
+        if not n then self.err = 'send failed'; self.done = true; return end
+    end
+    self.sock:flush()
+    if coroutine.status(self.co) == 'suspended' then
+        local ok, err = coroutine.resume(self.co)
+        if not ok then self.err = tostring(err); self.done = true end
+    end
+end
+
+function GS:close()
+    self.stop = true
+    if self.sock then pcall(function() self.sock:close() end) end
+    if self.listener then pcall(function() self.listener:close() end) end
+end
+
+--- Every 0x96 (client Talk) packet the worker has sent, decoded.
+--- The frame body starts with the gunz "\0\0\0\0" compression header.
+function GS:talkPackets()
+    local out = {}
+    for i = 1, #self.clientFrames do
+        local p = self.clientFrames[i].payload
+        if #p > 5 and ssub(p, 1, 4) == '\0\0\0\0' and sbyte(p, 5) == 0x96 then
+            local R = buffer.reader(ssub(p, 6))
+            local e = { seq = self.clientFrames[i].seq, mode = R:u8() }
+            e.text = R:string()
+            if R:remaining() > 0 then e.aimMode = R:u8() end
+            e.trailing = R:remaining()
+            out[#out + 1] = e
+        end
+    end
+    return out
+end
+
+runSuite('chat: real Talk/TextMessage packets in, a real say packet out', function()
+    local gs, gerr = newGameServer()
+    truthy(gs, 'a scripted 1530 server is listening', tostring(gerr))
+    if not gs then return end
+
+    local token = 'chat-' .. tostring(math.random(1, 2 ^ 30)) .. '-abcdefgh'
+    local lines = {}
+    local h, serr = process.spawn{
+        cmd = { luajitExe(), 'main.lua',
+                '--session-key=FAKE-SESSION-KEY',
+                '--account=chatsuite@example.invalid',
+                '--character=Chat Tester',
+                '--world=Gunzodus',
+                '--host=127.0.0.1:' .. gs.port,
+                '--ping=600000',
+                '--control-port=0', '--control-token-fd=0',
+                '--instance-name=chat', '--log-level=info' },
+        cwd = ROOT, captureOutput = true,
+        -- `key` has to come out of the denylist for THIS spawn: main.lua has no
+        -- --session-key-fd, and lib/process.lua refuses `--session-key=` in argv on
+        -- the strength of the word alone.  The value here is the literal string
+        -- FAKE-SESSION-KEY, handed to a fake server on 127.0.0.1; a real session key
+        -- would go the same way as the control token, down stdin.  The control token
+        -- itself still travels on stdin below.
+        redact = { 'password', 'passwd', 'pass', 'secret', 'credential' },
+        env = { LUACLIENT_TEST_XTEA = CHAT_XTEA_HEX },
+        stdinData = token .. '\n',
+        onLine = function(l) lines[#lines + 1] = l end,
+    }
+    truthy(h, 'the worker spawns', tostring(serr))
+    if not h then gs:close(); return end
+
+    local W = setmetatable({ h = h, token = token, lines = lines }, Worker)
+    -- ONE pump drives the child, its stdout and the game server together.
+    W.pump = function() process.pollAll(); gs:pump() end
+
+    local up = waitUntil(function()
+        for i = 1, #lines do
+            local host, port = lines[i]:match('^control%-endpoint%s+(%S+)%s+(%d+)')
+            if host then W.host, W.port = host, tonumber(port); return true end
+        end
+        return false
+    end, 20000, W.pump)
+    truthy(up, 'and announces its control port', concat(lines, '\n  '))
+
+    local inGame = waitUntil(function() W.pump(); return gs.inGame end, 20000)
+    truthy(inGame, 'the worker completed the real login handshake against the server',
+           tostring(gs.err) .. '\n  ' .. concat(lines, '\n  '))
+    eq(gs.preamble, 'Gunzodus', 'the raw world preamble arrived first')
+    eq(gs.loginOpcode, 0x0A, 'and then the 0x0A login packet')
+    if not inGame then gs:close(); W:stop(); return end
+
+    local ws, werr = wsConnect(W)
+    truthy(ws, 'the control WebSocket connects', tostring(werr))
+    if not ws then gs:close(); W:stop(); return end
+    ws.W = W                                     -- so ws:drain() pumps the game server
+    truthy(ws:waitHandshake(8000) and ws.handshook, 'and upgrades')
+
+    -- ---------------------------------------------------------------- INBOUND 1
+    -- A real Talk packet.  1530 has F_MESSAGE_STATEMENTS(45) and F_MESSAGE_LEVEL(46)
+    -- on, so the body is: u32 statementId, STR name, u16 level, u8 mode, and -- for
+    -- mode byte 1 (Say) -- a 5-byte Position before the STR text.
+    local talk = buffer.writer()
+    talk:u8(0xAA)
+    talk:u32(0)                                  -- statementId 0 -> no suffix byte
+    talk:string('Bubble Wizard')
+    talk:u16(233)                                -- speaker level
+    talk:u8(1)                                   -- mode byte 1 = Say
+    talk:u16(32369):u16(32241):u8(7)             -- Position
+    talk:string('exura vita')
+    gs:push(talk:data())
+
+    local chat = ws:waitEvent('chat', 8000, function(e)
+        return e.data and e.data.name == 'Bubble Wizard'
+    end)
+    truthy(chat, 'a real 0xAA Talk packet becomes a `chat` push')
+    if chat then
+        eq(chat.data.text, 'exura vita', 'with the text that was on the wire')
+        eq(chat.data.level, 233, 'the speaker level')
+        eq(chat.data.mode, 'Say', 'and the decoded mode name')
+        eq(chat.data.system, nil, 'a player message is not flagged system')
+    end
+
+    -- ---------------------------------------------------------------- INBOUND 2
+    -- A real TextMessage.  Mode byte 6 is a channel message: u16 channelId then STR.
+    local tm = buffer.writer()
+    tm:u8(0xB4):u8(6):u16(4)
+    tm:string('Welcome to the fake world.')
+    gs:push(tm:data())
+    local sys_ = ws:waitEvent('chat', 8000, function(e)
+        return e.data and e.data.text == 'Welcome to the fake world.'
+    end)
+    truthy(sys_, 'a real 0xB4 TextMessage becomes a `chat` push too')
+    if sys_ then
+        eq(sys_.data.system, true, 'flagged system, so the panel can style it apart')
+        eq(sys_.data.name, nil, 'with no speaker')
+    end
+
+    -- --------------------------------------------------------------- OUTBOUND
+    -- `say` over the control socket has to put a real 0x96 on the GAME socket.
+    -- This worker runs WITHOUT --bot, so it takes control/commands.lua's raw-sender
+    -- path; before this work item that path did not exist and `say` answered
+    -- "there is no game session to speak in" from a healthy, logged-in session.
+    local before = #gs:talkPackets()
+    local rep = ws:call(4242, 'say', { text = 'hello from the panel' }, 8000)
+    truthy(rep and rep.ok, 'say answers ok', rep and tostring(rep.error))
+    if rep and rep.ok then
+        eq(rep.result.said, 'hello from the panel', 'and echoes what it said')
+    end
+
+    local got = waitUntil(function()
+        W.pump()
+        return #gs:talkPackets() > before
+    end, 8000)
+    truthy(got, 'and the server really received a packet')
+    local pk = gs:talkPackets()[before + 1]
+    if pk then
+        eq(pk.mode, 1, 'opcode 0x96 with wire mode 1 (Say)')
+        eq(pk.text, 'hello from the panel', 'carrying the exact text')
+        eq(pk.aimMode, 0, 'and the trailing aim byte the 1525+ gunz protocol requires')
+        eq(pk.trailing, 0, 'with nothing after it')
+    end
+
+    -- an empty message is refused by the sender, not put on the wire
+    local n0 = #gs:talkPackets()
+    local bad = ws:call(4243, 'say', { text = '   ' }, 8000)
+    truthy(bad and bad.ok == false, 'a blank message is refused')
+    waitUntil(function() W.pump(); return false end, 200)
+    eq(#gs:talkPackets(), n0, 'and nothing was sent')
+
+    -- ------------------------------------------------------------------- close
+    gs:push(schar(0x18) .. schar(0))             -- SessionEnd
+    waitUntil(function() W.pump(); return not h:isRunning() end, 8000)
+    gs:close()
+    W:stop()
 end)
 
 -- ================================================================== report

@@ -429,6 +429,74 @@ do
 end
 
 --=============================================================================
+head('S7b money/h = cash gauge + goods value - waste  (setCashItems)')
+do
+    local COINS = { [3031] = 1, [3035] = 100, [3043] = 10000 }
+    local PRICES = { [3031] = 1, [3035] = 100, [3043] = 10000,
+                     [7642] = 90, [3577] = 3, [8090] = 42000, [268] = 50 }
+    -- One hour of hunting, described twice over: the coins land in the gold gauge,
+    -- the goods land in the loot model, and the potions land in waste.
+    local s = stats.new{ window = 60 * 60 * 1000, prices = PRICES, cashItems = COINS }
+    s:sessionStart(BASE)
+    eq(s.cashItemCount, 3, 'three ids were declared as cash')
+
+    local t
+    for minute = 0, 60 do
+        t = BASE + minute * 60000
+        -- 1200 gp of coins picked up per minute, 500 gp of supplies bought per minute
+        s:sampleBalance(t, 50000 + minute * 700)
+        if minute > 0 then
+            s:addLoot(t, 3035, 12)        -- 1200 gp of platinum: ALSO in the gauge
+            s:addLoot(t, 8090, 0.5)       -- 21000 gp/min of sellable goods
+            s:addWaste(t, 268, 10)        -- 500 gp/min of mana potions
+        end
+    end
+    local snap = s:snapshot(t)
+
+    eq(snap.moneySource, 'gold+goods', 'the full model is used once cash ids are declared')
+    near(snap.lootCash, 60 * 1200, 1, 'lootCash is exactly the coin part of the loot')
+    near(snap.lootGoods, 60 * 21000, 1, 'lootGoods is the rest')
+    near(snap.goldPerHour, 42000, 1, 'the gauge on its own is +700 gp/min = 42k gp/h')
+    near(snap.goodsPerHour, (21000 - 500) * 60, 1,
+         'the goods term is loot-minus-coins minus waste')
+    near(snap.moneyPerHour, snap.goldPerHour + snap.goodsPerHour, 0.001,
+         'money/h is exactly the sum of the two')
+    -- the point of subtracting lootCash: the coins must not be counted twice
+    near(snap.moneyPerHour, 42000 + (21000 - 500) * 60, 1,
+         'and the 1200 gp/min of coins appears ONCE, in the gauge')
+    check(snap.moneyPerHour < snap.goldPerHour + snap.balancePerHour,
+          'which is strictly less than gauge + loot-minus-waste would have been',
+          fmt(snap.goldPerHour + snap.balancePerHour))
+    note(('gold %s/h + goods %s/h = money %s/h   (naive gauge+balance would be %s/h)')
+         :format(fmt(snap.goldPerHour), fmt(snap.goodsPerHour), fmt(snap.moneyPerHour),
+                 fmt(snap.goldPerHour + snap.balancePerHour)))
+
+    -- BACK-COMPAT: a caller that never declares cash ids keeps the old, narrower answer
+    local o = stats.new{ window = 60 * 60 * 1000, prices = PRICES }
+    o:sessionStart(BASE)
+    for minute = 0, 60 do
+        local tt = BASE + minute * 60000
+        o:sampleBalance(tt, 50000 + minute * 700)
+        if minute > 0 then o:addLoot(tt, 3035, 12) end
+    end
+    local os_ = o:snapshot(BASE + 3600000)
+    eq(os_.moneySource, 'gold', 'no cash set declared -> the gauge alone, as before')
+    near(os_.moneyPerHour, 42000, 1, '   and the same number the old code gave')
+    eq(os_.lootCash, 0, 'lootCash stays 0 when nothing is declared cash')
+
+    -- and with no gauge at all it is still the vBot balance
+    local b = stats.new{ window = 60 * 60 * 1000, prices = PRICES, cashItems = COINS }
+    b:sessionStart(BASE)
+    for minute = 1, 60 do
+        b:addLoot(BASE + minute * 60000, 8090, 1)
+        b:addWaste(BASE + minute * 60000, 268, 10)
+    end
+    local bs = b:snapshot(BASE + 3600000)
+    eq(bs.moneySource, 'balance', 'declaring cash ids does not invent a gauge that is not fed')
+    eq(bs.moneyPerHour, bs.balancePerHour, '   money/h is the balance rate')
+end
+
+--=============================================================================
 head('S8  kills and deaths')
 do
     local s = stats.new{ window = 15 * 60 * 1000 }

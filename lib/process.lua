@@ -47,6 +47,12 @@ Module API
     process.reapAll(graceMs)              stop + wait for everything (BLOCKING)
     process.isPidAlive(pid)               for orphan detection across hub restarts
     process.jobActive()                   Windows: is the kill-on-close job live?
+    process.sendInterrupt(h)              "act as if the user pressed Ctrl+C" at a
+                                          CHILD: CTRL_BREAK to its own process
+                                          group (needs opts.newProcessGroup) on
+                                          Windows, SIGINT on POSIX
+    process.watchConsoleCtrl(opts)        Windows: Ctrl+C / Ctrl+Break / console
+                                          close, polled from the reactor
     process.quoteWindowsArg(s)            exposed for tests
     process.encodeWindowsCommandLine(t)   exposed for tests
     process.isWindows / process.isLinux
@@ -129,7 +135,10 @@ Windows
     back to CreateProcessA when a byte string is not valid UTF-8) with
     CREATE_NO_WINDOW | CREATE_SUSPENDED, then AssignProcessToJobObject, then
     ResumeThread -- suspended-first so a worker cannot fork a grandchild before
-    it is inside the job.
+    it is inside the job.  opts.newProcessGroup swaps CREATE_NO_WINDOW for
+    CREATE_NEW_PROCESS_GROUP: the two are incompatible, because CREATE_NO_WINDOW
+    gives the child a console of its own and GenerateConsoleCtrlEvent only
+    reaches groups on the CALLER's console.
   * Reads are non-blocking via PeekNamedPipe(avail) + ReadFile(min(avail,64K)).
   * Writes are non-blocking via SetNamedPipeHandleState(PIPE_NOWAIT) on the
     parent's stdin write handle, with the remainder kept in a Lua queue.
@@ -503,6 +512,10 @@ cdef [[ lcp_wchar* GetEnvironmentStringsW(void); ]]
 cdef [[ int FreeEnvironmentStringsW(lcp_wchar*); ]]
 cdef [[ void* GetStdHandle(unsigned long); ]]
 cdef [[ void* OpenProcess(unsigned long, int, unsigned long); ]]
+cdef [[ int GenerateConsoleCtrlEvent(unsigned long, unsigned long); ]]
+cdef [[ typedef int (__stdcall *lcp_PHANDLER_ROUTINE)(unsigned long); ]]
+cdef [[ int SetConsoleCtrlHandler(lcp_PHANDLER_ROUTINE, int); ]]
+cdef [[ void Sleep(unsigned long); ]]
 
 local k32 = ffi.load('kernel32')
 
@@ -511,6 +524,7 @@ local STARTF_USESTDHANDLES   = 0x00000100
 local CREATE_NO_WINDOW       = 0x08000000
 local CREATE_UNICODE_ENV     = 0x00000400
 local CREATE_SUSPENDED       = 0x00000004
+local CREATE_NEW_PROCESS_GROUP = 0x00000200
 local ERROR_BROKEN_PIPE      = 109
 local ERROR_INVALID_HANDLE   = 6
 local ERROR_PIPE_NOT_CONNECTED = 233
@@ -687,7 +701,24 @@ function backend.spawn(h, opts)
     end
 
     local pi = ffi.new('lcp_PROCESS_INFORMATION')
-    local flags = CREATE_NO_WINDOW + CREATE_SUSPENDED
+    local flags = CREATE_SUSPENDED
+    -- opts.newProcessGroup makes the child the root of its OWN console process
+    -- group, which is the only way GenerateConsoleCtrlEvent can be aimed at it:
+    -- a CTRL_BREAK_EVENT is delivered to a group id, and group 0 means "every
+    -- process sharing this console", i.e. also the parent and the shell that
+    -- started it.  The child stops receiving the console's Ctrl+C as a side
+    -- effect (documented CREATE_NEW_PROCESS_GROUP behaviour), which is why this
+    -- is opt-in and not the default.
+    --
+    -- CREATE_NO_WINDOW and CREATE_NEW_PROCESS_GROUP are mutually exclusive HERE
+    -- for a reason that costs an hour to find otherwise: CREATE_NO_WINDOW gives
+    -- the child a console of its OWN (an invisible one), and
+    -- GenerateConsoleCtrlEvent can only reach a process group attached to the
+    -- CALLER's console.  A child spawned with both flags never sees the event.
+    -- So a group-led child inherits our console instead -- which shows no new
+    -- window either, as long as this process has one.
+    if h.newProcessGroup then flags = flags + CREATE_NEW_PROCESS_GROUP
+    else flags = flags + CREATE_NO_WINDOW end
 
     local cmdline, cerr = process.encodeWindowsCommandLine(cmd)
     if not cmdline then return fail(cerr) end
@@ -859,6 +890,160 @@ function process.isPidAlive(pid)
     return alive
 end
 
+-- ------------------------------------------------------- console control ----
+local CTRL_C_EVENT     = 0
+local CTRL_BREAK_EVENT = 1
+
+--- Ask a child to stop the way a console Ctrl+C would.  Windows can only aim a
+--- console control event at a process GROUP, so the child must have been spawned
+--- with opts.newProcessGroup = true; without it the only legal target is group 0,
+--- which would signal this process and the shell that started it as well, and is
+--- refused here rather than fired.
+function process.sendInterrupt(h)
+    local pid = (type(h) == 'table') and h:pid() or tonumber(h)
+    if not pid or pid <= 0 then return nil, 'sendInterrupt: no pid' end
+    if type(h) == 'table' and not h.newProcessGroup then
+        return nil, 'sendInterrupt: the child was not spawned with newProcessGroup = true'
+    end
+    if k32.GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) == 0 then
+        return nil, 'GenerateConsoleCtrlEvent failed, GetLastError=' .. lastError()
+    end
+    return true
+end
+
+-- ===========================================================================
+-- Ctrl+C / Ctrl+Break / console close, WITHOUT ever entering the Lua VM
+-- ===========================================================================
+-- A console control handler runs on a thread the OS injects into the process.
+-- The obvious implementation -- ffi.cast a Lua function and register it -- is
+-- NOT safe, and not in a theoretical way: measured here, an FFI callback fired
+-- from that injected thread worked on one run and killed the next one outright
+-- with `PANIC: unprotected error in call to Lua API (bad callback)`, because the
+-- main thread was executing a JIT trace at the time and LuaJIT cannot re-enter
+-- its state from a foreign thread.  A hub that crashes on Ctrl+C is no better
+-- than a hub that is killed by Ctrl+C.
+--
+-- So the handler is not Lua at all.  It is 39 bytes of position-independent
+-- machine code, assembled here into a VirtualAlloc'd page:
+--
+--     mov  rax, <flag page>        ; baked in as an immediate
+--     inc  ecx                     ; ecx = dwCtrlType (Win64 argument 1)
+--     mov  [rax], ecx              ; flag[0] = dwCtrlType + 1   -> "pending"
+--     mov  edx, <spin count>
+--   spin:
+--     mov  ecx, [rax+4]            ; flag[1] -- set by release(), on OUR thread
+--     test ecx, ecx
+--     jnz  done
+--     pause
+--     sub  edx, 1
+--     jnz  spin
+--   done:
+--     mov  eax, 1                  ; TRUE = "handled"
+--     ret
+--
+-- It touches nothing but two volatile registers and one page of its own memory:
+-- no VM, no allocation, no GC, no re-entrancy to get wrong.
+--
+-- Returning TRUE is what makes this work for the two interactive events: for
+-- CTRL_C_EVENT and CTRL_BREAK_EVENT a handler that returns TRUE means the
+-- process is NOT terminated, so the reactor picks the flag up on its next turn
+-- and shuts down in an orderly way.  For CTRL_CLOSE_EVENT (and logoff/shutdown)
+-- Windows kills the process as soon as the handler returns, so the spin is the
+-- only way to buy the seconds an orderly stop needs; release() ends it the
+-- moment the workers are down.
+--
+-- x86-64 only.  On any other architecture this returns nil and the caller falls
+-- back to what the hub did before: the job object reaps the workers, with no
+-- logout.  (POSIX never gets here -- it has the sigtimedwait gate.)
+cdef [[ void* VirtualAlloc(void*, size_t, unsigned long, unsigned long); ]]
+cdef [[ int FlushInstructionCache(void*, const void*, size_t); ]]
+cdef [[ void* GetCurrentProcess(void); ]]
+
+local MEM_COMMIT_RESERVE     = 0x1000 + 0x2000
+local PAGE_EXECUTE_READWRITE = 0x40
+local PAGE_READWRITE         = 0x04
+
+local consoleWatch = nil
+
+--- Emit the handler above into `page`, with `flagAddr` baked in as an immediate.
+--- Returns the number of bytes written.
+local function emitCtrlHandler(page, flagAddr, spinCount)
+    local b, n = ffi.cast('unsigned char*', page), 0
+    local function byte(v) b[n] = v; n = n + 1 end
+    local function imm32(v)
+        for i = 0, 3 do byte(math.floor(v / (256 ^ i)) % 256) end
+    end
+    byte(0x48); byte(0xB8)                       -- mov rax, imm64
+    local a = ffi.cast('uint64_t', ffi.cast('uintptr_t', flagAddr))
+    for _ = 1, 8 do
+        byte(tonumber(a % 256ULL))
+        a = a / 256ULL
+    end
+    byte(0xFF); byte(0xC1)                       -- inc ecx
+    byte(0x89); byte(0x08)                       -- mov [rax], ecx
+    byte(0xBA); imm32(spinCount)                 -- mov edx, spinCount
+    local spin = n
+    byte(0x8B); byte(0x48); byte(0x04)           -- spin: mov ecx, [rax+4]
+    byte(0x85); byte(0xC9)                       -- test ecx, ecx
+    byte(0x75); byte(0x07)                       -- jnz done
+    byte(0xF3); byte(0x90)                       -- pause
+    byte(0x83); byte(0xEA); byte(0x01)           -- sub edx, 1
+    -- rel8 is measured from the END of the jump, and `n` is a moving target:
+    -- computing it inline after byte(0x75) had already advanced n produced a
+    -- backward jump one byte short, landing inside the `mov edx, imm32` above
+    -- and faulting the process the first time a console event arrived.
+    local rel = (spin - (n + 2)) % 256
+    byte(0x75); byte(rel)                        -- jnz spin
+    byte(0xB8); imm32(1)                         -- done: mov eax, 1
+    byte(0xC3)                                   -- ret
+    return n
+end
+process._emitCtrlHandler = emitCtrlHandler       -- checked by test/processsuite.lua
+
+--- Install the console control handler.  Returns a watch:
+---   w:pending() -> nil | 0 Ctrl+C | 1 Ctrl+Break | 2 close | 5 logoff | 6 shutdown
+---   w:release() lets the handler thread return (call it when the stop is done)
+--- Idempotent; the two pages it allocates live for the life of the process.
+function process.watchConsoleCtrl(opts)
+    opts = opts or {}
+    if consoleWatch then return consoleWatch end
+    if ffi.arch ~= 'x64' then
+        return nil, 'console control handler: x86-64 only (this is ' .. tostring(ffi.arch) .. ')'
+    end
+    local flagPage = k32.VirtualAlloc(nil, 4096, MEM_COMMIT_RESERVE, PAGE_READWRITE)
+    if flagPage == nil then return nil, 'VirtualAlloc(flags) failed' end
+    local slot = ffi.cast('int*', flagPage)
+    slot[0], slot[1] = 0, 0
+
+    local page = k32.VirtualAlloc(nil, 4096, MEM_COMMIT_RESERVE, PAGE_EXECUTE_READWRITE)
+    if page == nil then return nil, 'VirtualAlloc(code) failed' end
+    -- The spin is a BOUNDED busy-wait, and it only ever runs to the end when the
+    -- main thread never releases it.  Measured here: 20,000,000 `pause`
+    -- iterations = 260 ms, so 300,000,000 is about four seconds, which is inside
+    -- the roughly five Windows allows a CTRL_CLOSE handler before it terminates
+    -- the process anyway.  release() ends it as soon as the workers are down --
+    -- 200 ms in the hub's own measurements -- so this bound is the failure case,
+    -- not the normal one.
+    local nbytes = emitCtrlHandler(page, flagPage,
+                                   tonumber(opts.spinIterations) or 300000000)
+    k32.FlushInstructionCache(k32.GetCurrentProcess(), page, nbytes)
+
+    local fn = ffi.cast('lcp_PHANDLER_ROUTINE', page)
+    if k32.SetConsoleCtrlHandler(fn, 1) == 0 then
+        return nil, 'SetConsoleCtrlHandler failed, GetLastError=' .. lastError()
+    end
+    consoleWatch = {
+        _slot = slot, _page = page, _fn = fn, bytes = nbytes, armed = true,
+        pending = function(self)
+            local v = self._slot[0]
+            if v == 0 then return nil end
+            return v - 1
+        end,
+        release = function(self) self._slot[1] = 1 end,
+    }
+    return consoleWatch
+end
+
 --=============================================================================
 elseif process.isLinux then
 --=============================================================================
@@ -950,6 +1135,7 @@ local F_DUPFD_CLOEXEC  = 1030
 local WNOHANG          = 1
 local SIGTERM          = 15
 local SIGKILL          = 9
+local SIGINT           = 2
 local EAGAIN           = 11
 local EINTR            = 4
 local EPIPE            = 32
@@ -1262,6 +1448,23 @@ end
 function backend.release(h) end
 
 function process.jobActive() return false end
+
+--- Ask a child to stop the way a console Ctrl+C would.  On POSIX that is simply
+--- SIGINT at the child (hub/main.lua's signal gate collects it with
+--- sigtimedwait and shuts down in an orderly way on the reactor).
+function process.sendInterrupt(h)
+    local pid = (type(h) == 'table') and h:pid() or tonumber(h)
+    if not pid or pid <= 0 then return nil, 'sendInterrupt: no pid' end
+    if type(h) == 'table' and (h._reaped or h._exited) then
+        return nil, 'sendInterrupt: the child is already gone'
+    end
+    if C.kill(pid, SIGINT) ~= 0 then return nil, 'kill(SIGINT) failed' end
+    return true
+end
+
+--- POSIX needs no console-control handler: SIGINT/SIGTERM/SIGHUP are blocked at
+--- start-up and collected with sigtimedwait from the reactor.
+function process.watchConsoleCtrl() return nil, 'not needed on POSIX' end
 
 --- Is some pid still running?  A zombie is NOT alive: kill(pid, 0) succeeds for
 --- one, so the /proc state is the tiebreaker.
@@ -1604,6 +1807,10 @@ function process.spawn(opts)
     h.maxStdinQueue     = math.max(4096, tonumber(opts.maxStdinQueue) or (1024 * 1024))
     h.drainMs           = tonumber(opts.drainMs) or 2000
     h.name              = opts.name
+    -- Windows only: give the child its own console process group, so
+    -- process.sendInterrupt() can aim a CTRL_BREAK_EVENT at it and at nothing
+    -- else.  Ignored on POSIX, where a signal is already per-pid.
+    h.newProcessGroup   = opts.newProcessGroup and true or false
     -- Linux only: SIGTERM when the hub dies.  opts.deathSignal = false disables,
     -- a number picks another signal (9 for a worker that might ignore SIGTERM).
     if opts.deathSignal == false then h.deathSignal = 0

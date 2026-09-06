@@ -670,6 +670,93 @@ do
 end
 
 -- ============================================================================
+S('supplies: the per-item ledger the panel draws (PANEL.md "Supplies vs thresholds")')
+do
+    local F = newWorld({ '..@..' })
+    local H = newHost(F)
+    local sup = H.sup
+    local order = sup:itemOrder()
+
+    -- Put real stock in three places at once, so the breakdown has to separate them:
+    --   * the ammo slot (inventory slot 10) holds 40 of the first supply item
+    --   * an OPEN backpack holds 150 more of it, in two stacks
+    --   * the server's own 0xC0 total says 220, i.e. 30 are in a CLOSED bag
+    local id1 = order[1]
+    local id2 = order[2]
+    F.st.player.inventory[10] = { kind = 'item', id = id1, count = 40 }
+    addContainer(F.st, 0, 2854, { { kind = 'item', id = id1, count = 100 },
+                                  { kind = 'item', id = id1, count = 50 },
+                                  { kind = 'item', id = 3031, count = 77 } })
+    F.st.inventoryCounts = { [id1 * 256] = 220 }
+    -- ... and stock the SECOND supply item partly, so the printed table shows both a
+    -- satisfied row and a row that is genuinely below its Supplies.json minimum.
+    if id2 then
+        addContainer(F.st, 1, 2854, { { kind = 'item', id = id2, count = 100 },
+                                      { kind = 'item', id = id2, count = 45 } })
+        F.st.inventoryCounts[id2 * 256] = 185
+    end
+
+    local rows = sup:ledger()
+    eq(#rows, #order, 'the ledger has one row per configured supply item')
+    local r1
+    for _, r in ipairs(rows) do if r.itemId == id1 then r1 = r end end
+    ok(r1 ~= nil, 'the first configured id has a row')
+    eq(r1.inInventory, 40, 'the inventory half of the count is the equipment slots')
+    eq(r1.inContainers, 150, 'the container half is every OPEN container')
+    eq(r1.serverCount, 220, 'and the server 0xC0 total is reported on its own')
+    eq(r1.count, 220, 'count is max(visible, server) -- a CLOSED bag still counts')
+    eq(r1.threshold, sup:items()[id1].min, 'threshold is `min` straight out of Supplies.json')
+    eq(r1.ok, r1.count >= r1.threshold, 'ok is count >= threshold')
+    ok(type(r1.name) == 'string' and r1.name ~= '',
+       'the row carries the item NAME from proto/items.lua: ' .. tostring(r1.name))
+
+    -- the count really does follow the containers, with no invalidation hook to forget
+    F.st.containers[0].items[1].count = 10
+    F.st.inventoryCounts = {}
+    local after
+    for _, r in ipairs(sup:ledger()) do if r.itemId == id1 then after = r end end
+    eq(after.count, 40 + 10 + 50, 'a container change is picked up on the next read')
+
+    -- levels() is PANEL.md's requested map shape over the same numbers
+    local lv = sup:levels()
+    eq(lv[id1].have, after.count, 'levels()[id].have matches the ledger count')
+    eq(lv[id1].threshold, after.threshold, 'levels()[id].threshold too')
+
+    -- and the status object hands the panel a PURE array beside the legacy one
+    local st = sup:status()
+    ok(type(st.levels) == 'table' and #st.levels == #order, 'status().levels is the array')
+    local mixed = false
+    for k in pairs(st.levels) do if type(k) ~= 'number' then mixed = true end end
+    ok(not mixed, 'status().levels has NO named keys (or every JSON encoder on the ' ..
+                  'way to the browser turns it into an object)')
+    eq(st.items, #order, 'status().items counts them')
+    ok(type(st.low) == 'number', 'status().low counts the ones below their minimum')
+
+    -- ------------------------------------------------------------------ SNAPSHOT
+    -- A real table, computed from the user's real profile, printed so the reviewer
+    -- can see the numbers rather than take the assertions' word for it.  The server
+    -- totals the "a container change is picked up" check cleared go back first, so
+    -- the printed breakdown shows all three sources at once.
+    F.st.containers[0].items[1].count = 100
+    F.st.inventoryCounts = { [id1 * 256] = 220 }
+    if id2 then F.st.inventoryCounts[id2 * 256] = 185 end
+    st = sup:status()
+    io.write(('\n     supplies ledger  --  %s  profile %q\n')
+             :format(PROFILE or '(no profile)', tostring(st.profile)))
+    io.write('     itemId  name                        inv   cont  server  count  threshold  ok\n')
+    io.write('     ------  --------------------------  ----  ----  ------  -----  ---------  --\n')
+    for _, r in ipairs(st.levels) do
+        io.write(('     %6d  %-26s  %4d  %4d  %6d  %5d  %9d  %s\n')
+                 :format(r.itemId, r.name:sub(1, 26), r.inInventory, r.inContainers,
+                         r.serverCount, r.count, r.threshold, r.ok and 'y' or 'NO'))
+    end
+    io.write(('     %d item(s), %d below threshold, pouch pages %s\n')
+             :format(st.items, st.low, tostring(st.pouchPages)))
+    -- id2 is only referenced to keep the "two configured items" assumption honest
+    ok(id2 == nil or lv[id2] ~= nil, 'every configured id appears in levels()')
+end
+
+-- ============================================================================
 S('the BOT.md status object')
 do
     local F = newWorld({ '.....', '..@m.', '.....' }, { hp = 800, maxHp = 1000 })

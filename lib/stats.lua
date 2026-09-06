@@ -9,6 +9,7 @@ lib/stats.lua -- the statistics engine behind the panel's per-instance numbers
   s:addLoot(ms, itemId, count, unitValue)   s:addWaste(ms, itemId, count, unitValue)
   s:addKill(ms, monsterName)           s:addDeath(ms)
   s:sampleBalance(ms, goldOnHand)      s:reset()
+  s:setPrices(idToValue)               s:setCashItems{ [3031]=true, ... }
   local snap = s:snapshot(ms)
 
 PROPERTIES (these are the requirements, restated so they can be checked):
@@ -109,10 +110,25 @@ snapshot(ms) -> table
 out by reference so that snapshot() stays allocation-light: read them, never
 write them.  Everything else in the snapshot is a fresh value.
 
-`moneySource` says where moneyPerHour came from: 'gold' when the caller feeds
-sampleBalance (real cash on hand -- coins looted minus coins spent, which is
-what PANEL.md's money/h asks for), 'balance' when it does not and the loot-minus-
-waste rate is used instead, nil when neither is available yet.
+`moneySource` says where moneyPerHour came from:
+
+  'gold+goods'  the full model, and the one a hub worker gets: the cash-on-hand
+                gauge PLUS the value of the non-cash loot MINUS the waste value.
+                Requires both sampleBalance and setCashItems (which declares the
+                coin ids, so the coins the gauge already sees are subtracted out
+                of the loot term and nothing is counted twice).
+                money/h = d(gold)/h + d(loot - lootCash - waste)/h
+  'gold'        sampleBalance is fed but no cash set was declared, so only the
+                coin gauge can be trusted: it misses every sellable item looted.
+  'balance'     no gold gauge at all -- vBot's loot-minus-waste rate, which misses
+                the coins actually spent on supplies.
+  nil           neither is measurable yet.
+
+The extra fields that go with it are `goldPerHour` (the gauge term on its own),
+`goodsPerHour` (the item term on its own), `lootCash` (how much of `loot` was
+coins) and `lootGoods` (the rest).  Loot and waste VALUES are zero until a price
+table is loaded, which `pricesLoaded` reports -- see control/server.lua, which
+builds one from the profile's vBot/items.lua and says so in the snapshot.
 ============================================================================]]
 
 local M = { _version = '1.0.0' }
@@ -138,13 +154,17 @@ local MAX_KEY_CHARS = 64
 local Ring = {}
 Ring.__index = Ring
 
+-- Three value slots per sample (a, b, c) rather than two: the money series has to
+-- carry cumulative loot, cumulative waste AND cumulative CASH loot at exactly the
+-- same timestamps, because money/h subtracts the third from the first and a
+-- separately-trimmed ring could hand back a baseline from a different instant.
 local function ringNew(maxN)
     maxN = maxN or 20000
     return setmetatable({
         cap = (maxN < 8) and maxN or 8,  -- head is 0-based; slot = (head+i)%cap+1
         n = 0, head = 0,
         maxN = maxN,
-        t = {}, a = {}, b = {},
+        t = {}, a = {}, b = {}, c = {},
         dropped = 0,
     }, Ring)
 end
@@ -153,17 +173,17 @@ function Ring:_grow()
     local ncap = self.cap * 2
     if ncap > self.maxN then ncap = self.maxN end
     if ncap <= self.cap then return false end
-    local t, a, b = {}, {}, {}
+    local t, a, b, c = {}, {}, {}, {}
     for i = 0, self.n - 1 do
         local j = (self.head + i) % self.cap + 1
-        t[i + 1], a[i + 1], b[i + 1] = self.t[j], self.a[j], self.b[j]
+        t[i + 1], a[i + 1], b[i + 1], c[i + 1] = self.t[j], self.a[j], self.b[j], self.c[j]
     end
-    self.t, self.a, self.b = t, a, b
+    self.t, self.a, self.b, self.c = t, a, b, c
     self.cap, self.head = ncap, 0
     return true
 end
 
-function Ring:push(ts, va, vb)
+function Ring:push(ts, va, vb, vc)
     if self.n >= self.cap and not self:_grow() then
         -- at the hard cap: recycle the oldest slot (memory stays flat)
         self.head = (self.head + 1) % self.cap
@@ -171,7 +191,7 @@ function Ring:push(ts, va, vb)
         self.dropped = self.dropped + 1
     end
     local j = (self.head + self.n) % self.cap + 1
-    self.t[j], self.a[j], self.b[j] = ts, va, vb
+    self.t[j], self.a[j], self.b[j], self.c[j] = ts, va, vb, vc
     self.n = self.n + 1
 end
 
@@ -179,11 +199,12 @@ function Ring:_slot(i) return (self.head + i) % self.cap + 1 end
 function Ring:tAt(i) return self.t[self:_slot(i)] end
 function Ring:aAt(i) return self.a[self:_slot(i)] end
 function Ring:bAt(i) return self.b[self:_slot(i)] end
+function Ring:cAt(i) return self.c[self:_slot(i)] end
 
 function Ring:popFront()
     if self.n == 0 then return end
     local j = self:_slot(0)
-    self.t[j], self.a[j], self.b[j] = nil, nil, nil
+    self.t[j], self.a[j], self.b[j], self.c[j] = nil, nil, nil, nil
     self.head = (self.head + 1) % self.cap
     self.n = self.n - 1
 end
@@ -197,7 +218,7 @@ function Ring:trim(nowMs, windowMs)
 end
 
 function Ring:clear()
-    self.t, self.a, self.b = {}, {}, {}
+    self.t, self.a, self.b, self.c = {}, {}, {}, {}
     self.cap, self.n, self.head, self.dropped = 8, 0, 0, 0
 end
 
@@ -330,8 +351,37 @@ function M.new(opts)
     if self.minSessionMs < 0 then self.minSessionMs = 0 end
     if self.maxSamples < 4 then self.maxSamples = 4 end
     self.prices, self.pricesLoaded, self.pricesSkipped = M.prices(opts.prices)
+    self:setCashItems(opts.cashItems)
     self:reset()
     return self
+end
+
+--- Declare which item ids ARE cash, i.e. which looted items already show up in the
+--- gold-on-hand gauge the caller feeds to sampleBalance.  Without this, money/h has
+--- to choose between two half-truths: the coin gauge (which misses every sellable
+--- item the character looted) or loot-minus-waste (which misses the coins actually
+--- spent on supplies).  With it, snapshot() adds them:
+---
+---     money/h = d(gold on hand)/h  +  d(non-cash loot value - waste value)/h
+---
+--- and nothing is counted twice, because the coins removed from the second term are
+--- exactly the ones the first term already sees.  Pass the ids as a set
+--- `{[3031]=true}` or as a value map `{[3031]=1, [3035]=100}` -- only the keys matter.
+function Engine:setCashItems(tbl)
+    local set, n = {}, 0
+    if type(tbl) == 'table' then
+        for k in pairs(tbl) do
+            local id = tonumber(k)
+            if id then set[floor(id)] = true; n = n + 1 end
+        end
+    end
+    self.cashItems, self.cashItemCount = set, n
+    return set, n
+end
+
+function Engine:isCashItem(itemId)
+    local id = tonumber(itemId)
+    return (id ~= nil) and (self.cashItems[floor(id)] == true)
 end
 
 --- Returns the normalised table, how many entries were kept and how many were dropped.  A
@@ -365,6 +415,7 @@ function Engine:reset()
     -- always share the same baseline sample
     self.moneyRing = ringNew(self.maxSamples)
     self.lootTotal, self.wasteTotal = 0, 0
+    self.lootCashTotal = 0        -- the part of lootTotal the gold gauge already sees
     self.lootItems, self.wasteItems = {}, {}
     self.lootItemsN, self.wasteItemsN = 0, 0
 
@@ -398,7 +449,7 @@ function Engine:sessionStart(ms)
         self.sessionStartMs = ms
         self.lastMs = ms
         self.expRing:push(ms, 0)
-        self.moneyRing:push(ms, 0, 0)
+        self.moneyRing:push(ms, 0, 0, 0)
         self.killRing:push(ms, 0)
     end
     return self
@@ -414,7 +465,7 @@ function Engine:_at(ms)
         self.sessionStartMs = ms
         self.lastMs = ms
         self.expRing:push(ms, 0)
-        self.moneyRing:push(ms, 0, 0)
+        self.moneyRing:push(ms, 0, 0, 0)
         self.killRing:push(ms, 0)
     end
     if self.lastMs and ms < self.lastMs then
@@ -461,7 +512,7 @@ end
 
 -- --------------------------------------------------------------------- money
 function Engine:_pushMoney(ms)
-    self.moneyRing:push(ms, self.lootTotal, self.wasteTotal)
+    self.moneyRing:push(ms, self.lootTotal, self.wasteTotal, self.lootCashTotal)
     self.moneyRing:trim(ms, self.windowMs)
 end
 
@@ -492,6 +543,7 @@ function Engine:addLoot(ms, itemId, count, unitValue)
     if not unit then unit = M.itemValue(self.prices, id) end
     local value = n * unit
     self.lootTotal = self.lootTotal + value
+    if self.cashItems[id] then self.lootCashTotal = self.lootCashTotal + value end
     local cut
     self.lootItemsN, cut = bump(self.lootItems, self.lootItemsN, id, n, value)
     if cut then self.breakdownTruncated = true end
@@ -598,6 +650,8 @@ function Engine:snapshot(ms)
         loot       = self.lootTotal,
         waste      = self.wasteTotal,
         balance    = self.lootTotal - self.wasteTotal,
+        lootCash   = self.lootCashTotal,
+        lootGoods  = self.lootTotal - self.lootCashTotal,
         lootItems  = self.lootItems,
         wasteItems = self.wasteItems,
         expTotal   = self.expLast,
@@ -663,12 +717,18 @@ function Engine:snapshot(ms)
     -- loot / waste / balance -- one baseline, so the three agree exactly ------
     local mSpan = spanOf(self.moneyRing, ms, self.windowMs)
     snap.spanMs.money = mSpan
+    local goodsPerHour = nil
     if mSpan then
-        local l0, w0 = self.moneyRing:aAt(0), self.moneyRing:bAt(0)
+        local l0, w0, c0 = self.moneyRing:aAt(0), self.moneyRing:bAt(0), self.moneyRing:cAt(0)
+        c0 = c0 or 0
         snap.lootPerHour    = perHour(self.lootTotal - l0, mSpan, self.minSpanMs)
         snap.wastePerHour   = perHour(self.wasteTotal - w0, mSpan, self.minSpanMs)
         snap.balancePerHour = perHour((self.lootTotal - l0) - (self.wasteTotal - w0),
                                       mSpan, self.minSpanMs)
+        -- the same window, minus the part the gold gauge already accounts for
+        goodsPerHour = perHour(((self.lootTotal - l0) - (self.lootCashTotal - c0))
+                               - (self.wasteTotal - w0), mSpan, self.minSpanMs)
+        snap.goodsPerHour = goodsPerHour
     end
 
     -- money/h: real cash when the caller samples it, else the vBot balance ----
@@ -678,12 +738,29 @@ function Engine:snapshot(ms)
     -- have retained.  With one retained sample the delta is (self.gold - aAt(0)) == 0, i.e. an
     -- honest 0 gp/h over the measured span, and moneySource stays 'gold' for the life of the
     -- session instead of silently swapping to the loot-minus-waste metric as the clock advances.
+    local goldPerHour = nil
     if self.goldSamples >= 2 and gSpan then
         local d = self.gold - self.goldRing:aAt(0)
-        snap.moneyPerHour = perHour(d, gSpan, self.minSpanMs)
-        if snap.moneyPerHour then snap.moneySource = 'gold' end
+        goldPerHour = perHour(d, gSpan, self.minSpanMs)
+        snap.goldPerHour = goldPerHour
     end
-    if snap.moneyPerHour == nil and snap.balancePerHour ~= nil then
+    -- The full model, when both halves are measurable: cash actually gained or spent
+    -- PLUS the value of the goods looted, MINUS what was consumed.  Coins are removed
+    -- from the second term (lootCash) because the gauge in the first term already
+    -- counted them -- adding them twice was the whole reason the two metrics could
+    -- not simply be summed before.  A supply run therefore shows up once, as a
+    -- negative cash delta, and a looted demon armour shows up once, at its price.
+    -- ... but ONLY when the caller told us which ids are cash.  With no cash set the
+    -- goods term still contains the coins, and adding it to the gauge would count
+    -- every looted coin twice; a caller that never calls setCashItems keeps the old,
+    -- narrower 'gold' answer rather than a silently inflated one.
+    if goldPerHour ~= nil and goodsPerHour ~= nil and self.cashItemCount > 0 then
+        snap.moneyPerHour = goldPerHour + goodsPerHour
+        snap.moneySource  = 'gold+goods'
+    elseif goldPerHour ~= nil then
+        snap.moneyPerHour = goldPerHour
+        snap.moneySource  = 'gold'
+    elseif snap.balancePerHour ~= nil then
         snap.moneyPerHour = snap.balancePerHour
         snap.moneySource  = 'balance'
     end

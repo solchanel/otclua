@@ -27,6 +27,14 @@ S6 gets the child to print its own argv.)
   S16 a grandchild dies with its parent (job object / PR_SET_PDEATHSIG)
   S17 pipe flags (Linux): the parent ends are non-blocking, the child ends are not
   S18 no zombies remain (Linux), the registry is empty, no globals
+  S19 post-fork hygiene: no inherited descriptors, a clean signal mask
+  S20 sendInterrupt(): a child stops the way Ctrl+C would -- the Windows
+      console control handler (machine code, never a Lua callback) and the
+      POSIX SIGINT gate, both driven for real
+  S21 lib/http.lua: the reactor stall a blocking POST causes, MEASURED, before
+      and after the out-of-process path
+  S22 the request child answers a real HTTP request, with the password on
+      stdin and nothing in argv
 ============================================================================]]
 
 local ROOT
@@ -1107,6 +1115,235 @@ else
     dataFile:close()
     os.remove(tmpPath)
     if not ok then check(false, 'S19 raised', tostring(res)) end
+end
+
+--=============================================================================
+-- S20  "stop the way Ctrl+C would", at a child, on both platforms.
+--
+-- Windows: a console control handler cannot be a Lua function -- an ffi.cast
+-- callback fired from the thread the OS injects panicked the VM with `bad
+-- callback` the moment the main thread happened to be on a JIT trace, and the
+-- process died with 0xC0000005 the run after that.  lib/process.lua therefore
+-- assembles 39 bytes of machine code instead.  This drives the real thing: a
+-- child in its OWN console process group (group 0 would signal this suite and
+-- the shell that started it), a real GenerateConsoleCtrlEvent, and the child
+-- must see it, do orderly work, release the handler and exit 0.
+--
+-- Linux: process.sendInterrupt is SIGINT at the child, which is what the hub's
+-- sigtimedwait gate collects.
+head('S20 sendInterrupt(): a child stops the way Ctrl+C would')
+do
+    if process.isWindows then
+        -- the encoding itself, before anything executes it
+        local ffi = require('ffi')
+        local flags = ffi.new('int[4]')
+        local page  = ffi.new('unsigned char[128]')
+        local n = process._emitCtrlHandler(page, flags, 7)
+        eq(n, 39, 'the handler assembles to 39 bytes')
+        eq(page[0], 0x48, '   mov rax, imm64')
+        eq(page[10], 0xFF, '   inc ecx')
+        eq(page[12], 0x89, '   mov [rax], ecx')
+        eq(page[38], 0xC3, '   ret')
+        -- the backward branch must land on the spin label (offset 19) and not,
+        -- as it did at first, one byte short of it -- inside the mov edx, imm32
+        -- above, which faulted the process on the first console event.
+        local rel = page[32]
+        if rel > 127 then rel = rel - 256 end
+        eq(33 + rel, 19, '   and `jnz spin` lands exactly on the spin label')
+    end
+
+    local CHILD = [==[
+package.path = os.getenv('LCP_ROOT') .. '/?.lua;' .. package.path
+local p, sys = require('lib.process'), require('lib.sys')
+local watch = p.watchConsoleCtrl{ spinIterations = 200000000 }
+if not watch and p.isWindows then io.write('nowatch\n') io.stdout:flush() os.exit(4) end
+local gate
+if p.isLinux then
+  -- The same construction hub/main.lua uses: SIGINT is BLOCKED and collected
+  -- from the loop, so nothing ever runs in signal context.
+  local ffi = require('ffi')
+  ffi.cdef[[ typedef struct { unsigned long v[16]; } t_set;
+             typedef struct { long s; long ns; } t_ts;
+             int sigemptyset(t_set*); int sigaddset(t_set*, int);
+             int sigprocmask(int, const t_set*, t_set*);
+             int sigtimedwait(const t_set*, void*, const t_ts*); ]]
+  local set, ts = ffi.new('t_set'), ffi.new('t_ts')
+  ts.s, ts.ns = 0, 0
+  ffi.C.sigemptyset(set) ffi.C.sigaddset(set, 2) ffi.C.sigprocmask(0, set, nil)
+  gate = function() local r = ffi.C.sigtimedwait(set, nil, ts) return r > 0 and r or nil end
+end
+io.write('ready\n') io.stdout:flush()
+local t0 = sys.nowMs()
+while sys.nowMs() - t0 < 20000 do
+  local ev = watch and watch:pending() or (gate and gate())
+  if ev then
+    io.write('signal ', tostring(ev), '\n') io.stdout:flush()
+    sys.sleepMs(150)                        -- "stop the children"
+    io.write('orderly\n') io.stdout:flush()
+    if watch then watch:release() end
+    os.exit(0)
+  end
+  sys.sleepMs(5)
+end
+io.write('nothing\n') io.stdout:flush()
+os.exit(7)
+]==]
+
+    local lines, code = {}, nil
+    local h, err = process.spawn{
+        cmd = { LUAJIT, '-e', CHILD },
+        env = { LCP_ROOT = ROOT },
+        newProcessGroup = true,
+        captureOutput = true,
+        onLine = function(t) lines[#lines + 1] = t end,
+        onExit = function(c) code = c end,
+    }
+    if not check(h ~= nil, 'spawned a child in its own process group', err) then
+        -- nothing else can run
+    else
+        local ready = pumpUntil(function() return lines[1] ~= nil end, 15000)
+        check(ready, 'the child installed its handler and is waiting', lines[1])
+        if lines[1] == 'nowatch' then
+            note('no console control handler available here: ' ..
+                 tostring(select(2, process.watchConsoleCtrl())))
+            h:kill()
+            pumpUntil(function() return code ~= nil end, 5000)
+        else
+            local t0 = sys.nowMs()
+            local sent, serr = process.sendInterrupt(h)
+            check(sent, process.isWindows and 'GenerateConsoleCtrlEvent(CTRL_BREAK) accepted'
+                                           or 'SIGINT delivered to the child', serr)
+            local gone = pumpUntil(function() return code ~= nil end, 15000)
+            local took = sys.nowMs() - t0
+            check(gone, 'the child exited after the interrupt')
+            eq(code, 0, '   with its own clean exit code, not a kill')
+            local saw, orderly = nil, false
+            for _, l in ipairs(lines) do
+                if l:match('^signal ') then saw = l end
+                if l == 'orderly' then orderly = true end
+            end
+            check(saw ~= nil, '   having actually seen the event (' .. tostring(saw) .. ')')
+            check(orderly, '   and having finished its orderly work first')
+            check(took < 10000, ('   inside the window (%d ms)'):format(took))
+                    note(('interrupt -> orderly exit in %d ms'):format(took))
+        end
+    end
+    eq(process.count(), 0, 'no handle is left behind')
+end
+
+--=============================================================================
+-- S21  The reactor stall lib/http.lua used to cause, measured, before and after.
+--
+-- The endpoint is a listening socket that ACCEPTS NOTHING: the kernel completes
+-- the TCP handshake out of the backlog, so the request goes out and the answer
+-- never comes.  That gives a deterministic slow request with no network and no
+-- second machine.  The heartbeat is a 10 ms sched timer; what is measured is the
+-- longest gap between two of its ticks while the request is in flight, which is
+-- exactly what a status push or a bot tick would have suffered.
+head('S21 lib/http.lua: the reactor stall, before and after')
+do
+    local sched  = require('lib.sched')
+    local socket = require('lib.socket')
+    local http   = require('lib.http')
+
+    local function measure(async, timeoutMs)
+        sched.reset()
+        local lis = assert(socket.listen('127.0.0.1', 0))
+        local url = 'http://127.0.0.1:' .. lis:port() .. '/never-answers'
+        local last, maxGap, ticks = sys.nowMs(), 0, 0
+        sched.every(10, function()
+            local now = sys.nowMs()
+            local gap = now - last
+            if gap > maxGap then maxGap = gap end
+            last = now
+            ticks = ticks + 1
+        end)
+        local done, t0, t1 = false, nil, nil
+        sched.after(120, function()
+            last, maxGap, ticks = sys.nowMs(), 0, 0   -- measure only the request
+            t0 = sys.nowMs()
+            local body = 'account=x&password=hunter2'
+            if async then
+                http.runAsync(function()
+                    http.post(url, {}, body, { timeoutMs = timeoutMs })
+                    t1, done = sys.nowMs(), true
+                end, function(ok) if not ok then done = true end end)
+            else
+                http.post(url, {}, body, { timeoutMs = timeoutMs })
+                t1, done = sys.nowMs(), true
+            end
+        end)
+        sched.every(25, function() if done then sched.stop() end end)
+        sched.after(120000, function() sched.stop() end)
+        sched.run()
+        lis:close()
+        sched.reset()
+        return { ms = math.floor((t1 or sys.nowMs()) - (t0 or 0)),
+                 gap = math.floor(maxGap), ticks = ticks }
+    end
+
+    local before = measure(false, 1500)
+    local after  = measure(true, 1500)
+    note(('BLOCKING       : request %d ms, longest reactor gap %d ms, %d heartbeats fired'):format(before.ms, before.gap, before.ticks))
+    note(('OUT OF PROCESS : request %d ms, longest reactor gap %d ms, %d heartbeats fired'):format(after.ms, after.gap, after.ticks))
+
+    check(before.gap > 1000, ('the blocking POST pins the reactor for the whole request ' ..
+          '(%d ms gap over a %d ms request)'):format(before.gap, before.ms))
+    check(before.ticks <= 3, ('   -- only %d of the ~%d expected 10 ms heartbeats fired')
+          :format(before.ticks, math.floor(before.ms / 10)))
+    check(after.gap < 300, ('the out-of-process POST does not (%d ms gap over a %d ms request)')
+          :format(after.gap, after.ms))
+    check(after.ticks > 20, ('   -- %d heartbeats fired while it was in flight')
+          :format(after.ticks))
+    check(after.gap * 4 < before.gap, ('and that is a %.0fx improvement')
+          :format(before.gap / math.max(after.gap, 1)))
+    eq(process.count(), 0, 'the request child was reaped')
+end
+
+--=============================================================================
+-- S22  The same child, doing a REAL request, with the credential on stdin only.
+head('S22 lib/http.lua: the request child answers, and keeps argv clean')
+do
+    local sched      = require('lib.sched')
+    local httpserver = require('lib.httpserver')
+    local http       = require('lib.http')
+    sched.reset()
+
+    local SECRET = 'hunter2-not-in-argv'
+    local seen = nil
+    local srv = httpserver.new{
+        host = '127.0.0.1', port = 0, sched = sched,
+        onRequest = function(req, res)
+            seen = req.body
+            return res:send(200, '{"session":{"sessionkey":"OK"}}',
+                            { ['Content-Type'] = 'application/json' })
+        end,
+    }
+    local port = assert(srv:start())
+    local url = 'http://127.0.0.1:' .. port .. '/game/login/1530'
+
+    local res, err, argvSeen
+    http.postAsync(url, { ['Content-Type'] = 'application/json' },
+                   '{"password":"' .. SECRET .. '"}', {}, function(r, e) res, err = r, e end)
+    -- the child is live right now: look at what the OS can see of it
+    for _, hh in ipairs(process.list()) do
+        if (hh.name or ''):find('http') then argvSeen = table.concat(hh.cmd, ' ') end
+    end
+    local got = false
+    local deadline = sys.nowMs() + 30000
+    while sys.nowMs() < deadline and not res and not err do sched.tick(5) end
+    got = res ~= nil
+
+    check(got, 'the request child came back with a response', tostring(err))
+    eq(res and res.status, 200, '   with the real status code')
+    check(res and res.body and res.body:find('sessionkey', 1, true),
+          '   and the real body')
+    check(seen and seen:find(SECRET, 1, true), 'the server received the password')
+    check(argvSeen and not argvSeen:find(SECRET, 1, true),
+          'the child argv carries no credential: ' .. tostring(argvSeen))
+    srv:stop()
+    sched.reset()
+    eq(process.count(), 0, 'the child was reaped')
 end
 
 --=============================================================================

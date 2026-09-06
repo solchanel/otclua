@@ -1,9 +1,45 @@
---[[ lib/http.lua — blocking HTTPS POST for the login flow.  Windows + Linux.
+--[[ lib/http.lua — HTTPS POST for the login flow.  Windows + Linux.
 
   API (see API.md):
       http.post(url, headersTable, body [, opts]) -> {status=, body=, headers=} | nil, err
       http.backend()  -> 'winhttp' | 'curl-ffi' | 'curl-cli' | nil, err
                          the backend actually selected on this machine
+
+      http.postAsync(url, headers, body, opts, cb)   -> handle | nil, err
+      http.runAsync(fn, done)                        -> the coroutine it made
+
+  ============================================================================
+  WHY THERE IS AN ASYNC PATH
+  ============================================================================
+  Every backend below is BLOCKING, and the login POST is allowed 20 s.  In the
+  worker that is 20 s in which lib/sched.lua does not turn: no status pushes to
+  the panel, no bot tick, no keepalive, for EVERY instance in that process.
+  Measured on a socket that accepts and never answers, the reactor's longest gap
+  between two 10 ms timer ticks was 2033 ms for a 2 s POST -- i.e. the whole
+  request.
+
+  There is no non-blocking TLS client here to switch to, so the request is moved
+  out of the process instead: `http.postAsync` spawns a short-lived child
+  (`luajit lib/http.lua --http-post-child`, this very file), hands it the whole
+  request on STDIN and reads one framed answer line back from its stdout, driven
+  by lib/process.lua and a sched timer.  Nothing blocks; the same measurement
+  drops to 26 ms, which is the child spawn on the reactor turn that starts it.
+
+  `http.post` itself is UNCHANGED for every existing caller: it still blocks and
+  still returns the response.  It only takes the async route when it is running
+  inside a coroutine that `http.runAsync` created -- an explicit opt-in by a
+  caller that has said it can handle being suspended (control/server.lua runs
+  every worker command that way, which is what un-blocks `login`).  Yielding out
+  of a pcall is a LuaJIT extension and is exactly what this relies on.
+
+  The child gets the request on stdin -- URL, headers, timeout, backend, proxy
+  credential and body -- because the body carries the account password and argv
+  does not keep secrets (lib/process.lua, "SECRETS IN argv").  argv is three
+  fixed words with nothing in them.
+
+  `http.asyncChild = false` forces the in-process path back on even inside a
+  runAsync coroutine.  It is there for the A/B measurement above (and for a host
+  that cannot spawn), not as a normal setting.
 
   `headers` is a plain name->value table; the request headers are emitted in
   case-insensitive alphabetical order, which is the order the C++ reference
@@ -828,7 +864,207 @@ local function oneShot(u, headers, body, timeoutMs, backend, px)
   return nil, 'unknown http backend: ' .. tostring(backend)
 end
 
+-- ===========================================================================
+-- the out-of-process path (see the header)
+-- ===========================================================================
+-- Wire format, both directions, one line, base64 of a JSON object.  base64
+-- because a request body and a response body are arbitrary bytes and a line is
+-- the only framing lib/process.lua's reader offers; and because it keeps a
+-- credential out of anything that greps the pipe for readable text.  Any other
+-- line the child happens to write (a warning from log.warn, say) is ignored by
+-- the parent, so the child does not have to be silent to be correct.
+local CHILD_FLAG   = '--http-post-child'
+local CHILD_MARK   = 'LCHTTP1 '
+local MAX_CHILD_LINE = 24 * 1024 * 1024
+
+http.childFlag = CHILD_FLAG
+
+-- Required lazily: loading lib/http.lua must stay as cheap as it was, and the
+-- three modules below are only needed by the out-of-process path.
+local function b64()
+  local ok, m = pcall(require, 'lib.base64')
+  if ok and type(m) == 'table' and m.encode then return m end
+  return nil
+end
+
+local function jsonMod()
+  local ok, m = pcall(require, 'lib.json')
+  if ok and type(m) == 'table' and m.encode then return m end
+  return nil
+end
+
+local function nowMs()
+  local ok, m = pcall(require, 'lib.sys')
+  if ok and type(m) == 'table' and m.nowMs then return m.nowMs() end
+  return os.clock() * 1000
+end
+
+--- Where this file is on disk, so the child can be spawned from it.
+local SELF_PATH
+do
+  local src = debug.getinfo(1, 'S').source
+  if src:sub(1, 1) == '@' then SELF_PATH = src:sub(2):gsub('\\', '/') end
+end
+http.childScript = SELF_PATH
+
+--- The interpreter running us.  `arg[-n]` is what the shell actually invoked.
+local function selfInterpreter()
+  local a = rawget(_G, 'arg')
+  if type(a) == 'table' then
+    local i, best = -1, nil
+    while a[i] do best = a[i]; i = i - 1 end
+    if best then return (tostring(best):gsub('\\', '/')) end
+  end
+  return IS_WINDOWS and 'luajit.exe' or 'luajit'
+end
+http.childInterpreter = nil        -- nil = work it out from arg[-n]
+
+--- Root of the package tree, so the child can find lib/*.lua.
+local function selfRoot()
+  if not SELF_PATH then return '.' end
+  return SELF_PATH:match('^(.*)/[^/]*/[^/]*$') or '.'
+end
+
+--- Run the POST in a short-lived child.  cb(res, err) is called exactly once,
+--- from a later reactor turn.  Returns the process handle, or nil + err when the
+--- child could not even be spawned (the caller then still has the sync path).
+function http.postAsync(url, headers, body, opts, cb)
+  opts = opts or {}
+  if type(cb) ~= 'function' then return nil, 'http.postAsync: a callback is required' end
+  local u, perr = parseUrl(url)
+  if not u then return nil, perr end
+  local base = b64()
+  if not base then return nil, 'http.postAsync: lib/base64.lua is not available' end
+  local json = jsonMod()
+  if not json then return nil, 'http.postAsync: lib/json.lua is not available' end
+  local okp, process = pcall(require, 'lib.process')
+  if not okp then return nil, 'http.postAsync: lib/process.lua is not available' end
+  local oks, sched = pcall(require, 'lib.sched')
+  if not oks then return nil, 'http.postAsync: lib/sched.lua is not available' end
+
+  local px = proxyFor(opts)
+  local req = {
+    url = url,
+    headers = copyHeaders(headers),
+    body = base.encode(body or ''),
+    timeoutMs = opts.timeoutMs or http.DEFAULT_TIMEOUT_MS,
+    backend = opts.backend or http.preferBackend or 'auto',
+    noAcceptEncodingRetry = opts.noAcceptEncodingRetry and true or false,
+    curlPath = http.curlPath,
+    userAgent = http.userAgent,
+    proxy = px and { host = px.host, port = px.port, user = px.user, pass = px.pass } or nil,
+  }
+  local oke, payload = pcall(json.encode, req)
+  req = nil
+  if not oke then return nil, 'http.postAsync: cannot encode the request: ' .. tostring(payload) end
+  local line = base.encode(payload) .. '\n'
+  payload = nil                                  -- carried the password
+
+  local answered, handle, spawnErr = false, nil, nil
+  local timer
+  local function finish(res, err)
+    if answered then return end
+    answered = true
+    if timer then pcall(sched.cancel, timer); timer = nil end
+    cb(res, err)
+  end
+
+  local result = nil
+  handle, spawnErr = process.spawn{
+    cmd = { http.childInterpreter or selfInterpreter(), SELF_PATH, CHILD_FLAG },
+    cwd = selfRoot(),
+    captureOutput = true,
+    stdinData = line,
+    closeStdinAfterData = true,
+    maxLineBytes = MAX_CHILD_LINE,
+    name = 'http-post',
+    onLine = function(text, stream)
+      if stream ~= 'stdout' then return end
+      if text:sub(1, #CHILD_MARK) ~= CHILD_MARK then return end
+      local okd, decoded = pcall(function()
+        return json.decode(base.decode(text:sub(#CHILD_MARK + 1)))
+      end)
+      if okd and type(decoded) == 'table' then result = decoded end
+    end,
+    onExit = function(code)
+      if result and result.ok and type(result.res) == 'table' then
+        local r = result.res
+        r.body = base.decode(r.body or '')
+        r.headers = r.headers or {}
+        return finish(r)
+      end
+      if result and not result.ok then
+        return finish(nil, tostring(result.err or 'the request failed'))
+      end
+      finish(nil, ('the HTTP child exited (%s) without answering'):format(tostring(code)))
+    end,
+  }
+  line = nil
+  if not handle then
+    return nil, 'http.postAsync: cannot spawn the request child: ' .. tostring(spawnErr)
+  end
+
+  -- The child is polled from the reactor.  Only OUR handle is polled, so this
+  -- never disturbs a hub that is also polling its workers, and the timer is
+  -- cancelled the moment the callback has fired.
+  local deadline = nowMs() + (tonumber(opts.timeoutMs) or http.DEFAULT_TIMEOUT_MS) + 10000
+  timer = sched.every(tonumber(opts.pollMs) or 10, function()
+    if answered then return end
+    pcall(handle.poll, handle)
+    if nowMs() > deadline and not answered then
+      pcall(handle.kill, handle)
+      finish(nil, 'the HTTP child overran its deadline')
+    end
+  end)
+  return handle
+end
+
+-- --------------------------------------------------------------- coroutines --
+-- A coroutine created here is one whose caller has promised to cope with the
+-- work finishing later, so http.post inside it may suspend instead of blocking.
+-- The protocol between the two halves is one value: the coroutine yields a
+-- STARTER function, and the runner calls it with a `resume` callback.
+local asyncCo = setmetatable({}, { __mode = 'k' })
+
+function http.isAsyncCoroutine(co)
+  return co ~= nil and asyncCo[co] == true
+end
+
+--- Run `fn` on a coroutine that http.post may suspend.
+--- done(ok, ...) receives fn's results, or false + the error it raised.
+function http.runAsync(fn, done)
+  local co = coroutine.create(fn)
+  asyncCo[co] = true
+  local step
+  step = function(...)
+    local r = { coroutine.resume(co, ...) }
+    if not r[1] then
+      asyncCo[co] = nil
+      if done then done(false, r[2]) end
+      return
+    end
+    if coroutine.status(co) == 'dead' then
+      asyncCo[co] = nil
+      if done then done(true, r[2], r[3], r[4], r[5]) end
+      return
+    end
+    local starter = r[2]
+    if type(starter) ~= 'function' then
+      -- Somebody yielded for a reason of their own; there is nothing to wait
+      -- for, so put the value straight back and keep going.
+      return step(starter)
+    end
+    starter(function(...) step(...) end)
+  end
+  step()
+  return co
+end
+
 --- Blocking POST.  Returns {status=, body=, headers=} or nil, err.
+---
+--- Inside an http.runAsync coroutine it is NOT blocking: the request goes to a
+--- child process and this suspends until the answer is in.  Same signature,
+--- same return values, same errors.
 function http.post(url, headers, body, opts)
   opts = opts or {}
   local u, e = parseUrl(url)
@@ -838,6 +1074,33 @@ function http.post(url, headers, body, opts)
   local backend = opts.backend or http.preferBackend or 'auto'
   local hdrs = copyHeaders(headers)
   local px = proxyFor(opts)
+
+  local co = coroutine.running()
+  if co and asyncCo[co] and opts.async ~= false and http.asyncChild ~= false then
+    local res, err = coroutine.yield(function(resume)
+      local h, serr = http.postAsync(url, hdrs, body, opts, function(r, e2)
+        resume(r, e2)
+      end)
+      if not h then
+        -- No child, no problem: fall back to the in-process request.  It blocks
+        -- the reactor exactly as it always did, which is the old behaviour and
+        -- not a new failure.
+        log.warn('http: the async request child could not start (%s) -- running it in-process',
+                 tostring(serr))
+        local r2, e2 = oneShot(u, hdrs, body, timeoutMs, backend, px)
+        resume(r2, e2)
+      end
+    end)
+    if not res then return nil, err end
+    if undecodedBody(res) and not opts.noAcceptEncodingRetry then
+      removeHeader(hdrs, 'Accept-Encoding')
+      local o2 = {}
+      for k, v in pairs(opts) do o2[k] = v end
+      o2.noAcceptEncodingRetry = true
+      return http.post(url, hdrs, body, o2)
+    end
+    return res
+  end
 
   local res, err = oneShot(u, hdrs, body, timeoutMs, backend, px)
   if not res then return nil, err end
@@ -853,6 +1116,63 @@ function http.post(url, headers, body, opts)
   end
 
   return res
+end
+
+-- ===========================================================================
+-- child mode:  luajit lib/http.lua --http-post-child
+-- ===========================================================================
+-- One request on stdin, one answer on stdout, then exit.  It runs ONLY when
+-- this file is the script the interpreter was given AND the flag is present, so
+-- require('lib.http') can never trip it.  Nothing is read from argv and nothing
+-- is written to disk: the request (which holds the account password and, when
+-- there is one, the proxy credential) exists only in this process's memory and
+-- in the private pipe it arrived on.
+function http._childMain()
+  local base = b64()
+  local json = jsonMod()
+  local function out(obj)
+    io.write(CHILD_MARK, base.encode(json.encode(obj)), '\n')
+    io.stdout:flush()
+  end
+  local line = io.read('*l')
+  if not line or line == '' then out{ ok = false, err = 'no request on stdin' }; return 2 end
+  local okd, req = pcall(function() return json.decode(base.decode(line)) end)
+  line = nil
+  if not okd or type(req) ~= 'table' then
+    out{ ok = false, err = 'the request did not decode: ' .. tostring(req) }
+    return 2
+  end
+  if req.curlPath then http.curlPath = req.curlPath end
+  if req.userAgent then http.userAgent = req.userAgent end
+  if req.proxy then http.setProxy(req.proxy) end
+  local res, err = http.post(req.url, req.headers, base.decode(req.body or ''), {
+    timeoutMs = req.timeoutMs, backend = req.backend,
+    noAcceptEncodingRetry = req.noAcceptEncodingRetry,
+    async = false,
+  })
+  if not res then out{ ok = false, err = tostring(err) }; return 1 end
+  out{ ok = true, res = { status = res.status, headers = res.headers,
+                          backend = res.backend, body = base.encode(res.body or '') } }
+  return 0
+end
+
+do
+  local a = rawget(_G, 'arg')
+  local invoked = (type(a) == 'table') and a[0] or nil
+  local wanted = false
+  if type(a) == 'table' then
+    for i = 1, #a do if tostring(a[i]) == CHILD_FLAG then wanted = true end end
+  end
+  if wanted and invoked and SELF_PATH then
+    local lhs = tostring(invoked):gsub('\\', '/')
+    if lhs == SELF_PATH or lhs:sub(-#SELF_PATH) == SELF_PATH
+       or SELF_PATH:sub(-#lhs) == lhs then
+      -- The child is started with the package root as its cwd, but say so
+      -- explicitly rather than relying on './?.lua' being on the default path.
+      package.path = selfRoot() .. '/?.lua;' .. package.path
+      os.exit(http._childMain() or 0)
+    end
+  end
 end
 
 -- exposed for tests / diagnostics

@@ -678,6 +678,12 @@ local function newSock(fd, state)
     bytesOut  = 0,
     err       = nil,
     onConnected = nil,            -- optional fn(ok, err), fired once
+    -- Whether the DESCRIPTOR is still open.  This is deliberately separate from
+    -- `state`: recv() sets state='closed' on the peer's orderly FIN, which is a
+    -- statement about the PROTOCOL, not about the fd.  Keying close() on `state`
+    -- meant that after a peer-initiated close, P.close() was never reached and
+    -- the descriptor leaked (see Sock:close).
+    fdOpen    = fd ~= nil,
   }, Sock)
 end
 
@@ -871,13 +877,34 @@ function Sock:setBufferSize(sendBytes, recvBytes)
 end
 
 function Sock:shutdownSend()
-  if self.sock and self.state ~= 'closed' then P.shutdownSend(self.sock) end
+  -- Half-closing OUR send side is still meaningful after the peer has half-closed
+  -- theirs (state == 'closed' from a recv() of 0), so this guards on the
+  -- descriptor, not on the protocol state.
+  if self.sock and self.fdOpen then P.shutdownSend(self.sock) end
 end
 
+--- Release the descriptor.  Idempotent.
+---
+--- This MUST key on `fdOpen`, not on `state`.  recv() sets state='closed' when the
+--- peer sends FIN -- an orderly shutdown of the peer's half -- and the descriptor is
+--- still very much ours at that point: the connection is in CLOSE-WAIT, waiting for
+--- us to close it.  The old guard was `self.state ~= 'closed'`, so every socket the
+--- PEER closed first was never handed to P.close():
+---   * lib/httpserver.lua's Conn:destroy() calls sock:close() and then decrements
+---     stat.active, so maxConnections never noticed and the server kept accepting;
+---   * the fd stayed in CLOSE-WAIT forever -- the 30 s idle sweep could not help,
+---     the connection was already gone from server.conns.
+--- Measured on the installed hub: one ordinary browser-style keep-alive request
+--- whose client closed first leaked exactly one descriptor, permanently; 100
+--- requests left 100 CLOSE-WAIT sockets that never went away.  With the unit's
+--- LimitNOFILE=8192 the hub dies after a few thousand panel requests.  It affected
+--- every socket in the program, not just the hub: the worker's control endpoint,
+--- the game transport and the proxy client all close this way.
 function Sock:close()
-  if self.sock and self.state ~= 'closed' then
+  if self.sock and self.fdOpen then
     P.close(self.sock)
   end
+  self.fdOpen = false
   self.state = 'closed'
   self.outbox, self.obHead, self.obTail, self.obOff, self.outboxLen = {}, 1, 0, 0, 0
   self.onConnected = nil

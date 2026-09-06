@@ -849,17 +849,55 @@ H['instance.botEnable'] = function(self, args, ctx)
   end)
 end
 
--- The config lists live in the worker's profile directory, so only a running
--- worker can enumerate them.  The last answer is cached IN MEMORY (hub/model.lua's
--- instances spec has no field for it, and a cache does not belong in the durable
--- record anyway); a stopped instance gets that cache back marked `stale`.
+-- Where the config lists come from, best source first:
+--
+--   1 `worker`   the RUNNING worker's own bot.listConfigs.  Authoritative: it is the
+--                only source that knows the macros, because a macro is a Lua
+--                registration inside the bot and not a file on disk.
+--   2 `scan`     hub/supervisor.lua's scanProfileConfigs -- a direct read of the
+--                instance's profile directory (cavebot_configs/*.cfg,
+--                targetbot_configs/*.json, vBot_configs/profile_*).  This is what
+--                closes PANEL.md's "Config pickers before an instance has ever run":
+--                a stopped instance -- and a brand-new one on a fresh hub -- used to
+--                offer an EMPTY picker, so an operator could not choose a cavebot
+--                config until after the first successful start.  The hub spawns its
+--                workers itself, on this machine, with a cwd it chose, so it can
+--                resolve exactly the path the worker would.
+--   3 `cache`    the last answer this hub got from a worker, kept in memory only
+--                (hub/model.lua's instance spec has no field for it, and a cache does
+--                not belong in a durable record).
+--
+-- `stale` stays true for anything but a live worker answer, and `source` says which
+-- of the three the panel is looking at.
 H['instance.configs'] = function(self, args, ctx, done)
   local inst = self:ownedInstance(ctx, args.id)
+
+  local function fromScan()
+    if not (self.sup and self.sup.scanProfileConfigs) then return nil end
+    local ok, res = pcall(self.sup.scanProfileConfigs, self.sup, inst.botProfile)
+    if not ok or type(res) ~= 'table' then return nil end
+    if #(res.cavebot or {}) + #(res.targetbot or {}) + #(res.profiles or {}) == 0 then
+      return nil
+    end
+    return res
+  end
+
   local function cached(stale)
+    local scanned = fromScan()
+    if scanned then
+      local c = self.configsCache[inst.id]
+      -- The macro list is the one thing a scan cannot produce; keep whatever a
+      -- worker told us last time rather than blanking the toggles.
+      return { cavebot = scanned.cavebot, targetbot = scanned.targetbot,
+               profiles = scanned.profiles, macros = (c and c.macros) or {},
+               stale = stale or nil, source = 'scan' }
+    end
     local c = self.configsCache[inst.id] or {}
     return { cavebot = c.cavebot or {}, targetbot = c.targetbot or {},
-             profiles = c.profiles or {}, macros = c.macros or {}, stale = stale or nil }
+             profiles = c.profiles or {}, macros = c.macros or {},
+             stale = stale or nil, source = self.configsCache[inst.id] and 'cache' or 'none' }
   end
+
   if self.sup and self.sup:isRunning(inst.id) then
     self.sup:command(inst.id, 'bot.listConfigs', {}, function(ok, res)
       if ok and type(res) == 'table' then
@@ -867,7 +905,7 @@ H['instance.configs'] = function(self, args, ctx, done)
                     profiles = res.profiles or {}, macros = res.macros or {} }
         self.configsCache[inst.id] = c
         done(true, { cavebot = c.cavebot, targetbot = c.targetbot,
-                     profiles = c.profiles, macros = c.macros })
+                     profiles = c.profiles, macros = c.macros, source = 'worker' })
       else
         done(true, cached(true))
       end
@@ -1846,5 +1884,10 @@ M.STATUS = {
   ['internal'] = 500,
 }
 function M.statusFor(code) return M.STATUS[tostring(code or '')] or 400 end
+
+-- The handler table, for tests that need to drive ONE endpoint without standing up a
+-- whole hub (storage, auth, sessions).  Not used by the hub itself -- A:dispatch closes
+-- over the local `H` -- and never exported over HTTP.
+M._handlers = H
 
 return M

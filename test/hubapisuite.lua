@@ -667,6 +667,9 @@ end
 
 local function teardown(hub)
   pcall(function() hub.server:stop() end)
+  -- The same call hub/main.lua's M.shutdown makes, so what these suites drive is
+  -- the production exit path and not a test-only shortcut.
+  pcall(function() hubMain.flushCaches(hub) end)
   pcall(function() hub.sup:shutdownAll(2000) end)
   waitFor(function() return hub.sup:allStopped() end, 6000)
   pcall(function() hub.sup:reap(2000) end)
@@ -1412,8 +1415,12 @@ runSuite('hub / restart recovers its state from disk', function()
   check(PORT and PORT > 0, 'the hub restarts on the same data directory')
   eq(hub.auth:needsBootstrap(), false, '   and does not ask to bootstrap again')
 
+  -- Sessions used to die with the process.  They no longer do -- but `jar` was
+  -- emptied above, so this hub is being asked about a cookie nobody presented,
+  -- and the answer still has to be "no session".  The cookie that DID survive is
+  -- proved in `hub / a restart does not sign everyone out` below.
   local s = rpcOk(PORT, 'auth.session', {})
-  eq(s.user, nil, 'sessions do NOT survive a restart (they are in memory by design)')
+  eq(s.user, nil, 'a client with no cookie is still anonymous after the restart')
 
   local li = rpcOk(PORT, 'auth.login', { name = ADMIN.name, password = ADMIN.password })
   eq(li.user.role, 'admin', 'the administrator signs in with the stored PBKDF2 hash')
@@ -1454,6 +1461,110 @@ runSuite('hub / restart recovers its state from disk', function()
   teardown(hub)
   local reaped = waitFor(function() return not process.isPidAlive(pid) end, 8000)
   eq(reaped, true, 'the hub shutdown reaps every child (pid ' .. tostring(pid) .. ')')
+end)
+
+-- ================================ 8b. the caches that survive a restart =====
+-- PANEL.md used to say, in two places, that a hub restart signs every operator
+-- out and leaves the panel's Console tab blank.  Both were memory-only state for
+-- no better reason than that nobody had written them down.
+runSuite('hub / a restart does not sign everyone out', function()
+  -- the previous suite ends with the hub torn down; bring one back up
+  hub = buildHub()
+  PORT = hub.port
+  -- ---- sign in, note the cookie, and leave a couple of log lines behind ----
+  jar = {}
+  local li = rpcOk(PORT, 'auth.login', { name = ADMIN.name, password = ADMIN.password })
+  eq(li.user.role, 'admin', 'the administrator signs in')
+  local sid = jar['hub_sid']
+  local csrf = jar['hub_csrf']
+  check(type(sid) == 'string' and #sid > 0, '   and holds a session cookie')
+
+  local instId = rpcOk(PORT, 'instance.list', {}).instances[1].id
+  hub.sup:restoreLogs(instId, {
+    { t = 1, level = 'info',  text = 'a line from BEFORE the restart' },
+    { t = 2, level = 'error', text = 'and the error that caused it' },
+  }, { { t = 3, channel = 'Default', from = 'Someone', text = 'chat from before' } })
+
+  -- ---- the sessions file itself ------------------------------------------
+  hubMain.flushCaches(hub)
+  local raw = storage.fs.readFile(DATA .. '/sessions.json')
+  check(type(raw) == 'string' and #raw > 0, 'sessions.json was written to the data dir')
+  check(raw and raw:find('"sum":"', 1, true), '   with the same integrity footer as the rest')
+  check(raw and not raw:find(sid, 1, true),
+        '   and NOT the session token itself -- only its SHA-256 digest')
+
+  -- ---- restart, still signed in ------------------------------------------
+  local savedJar = { hub_sid = sid, hub_csrf = csrf }
+  teardown(hub)
+  step(100)
+  hub = buildHub()
+  PORT = hub.port
+  jar = { hub_sid = savedJar.hub_sid, hub_csrf = savedJar.hub_csrf }
+  local who = rpcOk(PORT, 'auth.session', {})
+  check(who.user ~= nil, 'the cookie from before the restart is still accepted')
+  eq(who.user and who.user.name, ADMIN.name, '   and it is still the same account')
+  local list = rpc(PORT, 'instance.list', {})
+  eq(list.status, 200, '   and it can still drive the panel')
+
+  -- ---- the worker rings came back too ------------------------------------
+  local lines = hub.sup:logs(instId, 50)
+  local found, foundErr = false, false
+  for _, l in ipairs(lines) do
+    if l.text == 'a line from BEFORE the restart' then found = true end
+    if l.text == 'and the error that caused it' then foundErr = true end
+  end
+  check(found and foundErr, 'the worker log ring survived the restart (' ..
+        tostring(#lines) .. ' lines)')
+  local chat, sawChat = hub.sup:chat(instId, 50), false
+  for _, c in ipairs(chat) do
+    if c.text == 'chat from before' then sawChat = true end
+  end
+  check(sawChat, '   and so did the chat ring (' .. tostring(#chat) .. ' messages)')
+  eq(hub.sup:state(instId), 'stopped',
+     '   without claiming the instance is running (it has no process)')
+  -- and the PANEL can read them: this is the route its Console tab calls, and
+  -- the whole point is that the tab is not blank after a restart.
+  local panelLines, sawPanel = rpcOk(PORT, 'instance.logs', { id = instId, limit = 50 }), false
+  for _, l in ipairs(panelLines.lines or {}) do
+    if l.text == 'a line from BEFORE the restart' then sawPanel = true end
+  end
+  check(sawPanel, '   and the panel reads them back through instance.logs')
+
+  -- ---- revocation still wins ---------------------------------------------
+  local sessions = rpcOk(PORT, 'admin.sessions', {})
+  local mine
+  for _, s in ipairs(sessions.sessions or {}) do
+    if s.userName == ADMIN.name and s.current then mine = s.id end
+  end
+  check(mine ~= nil, 'the restored session is listed in the admin view')
+  -- Revoke it through auth directly: the point is that the REVOCATION is what
+  -- gets persisted, not that the route works (that is tested elsewhere).
+  eq(hub.auth:revoke(mine), 1, 'the administrator can revoke it')
+  local afterRevoke = rpc(PORT, 'instance.list', {}, { noCsrf = true })
+  eq(afterRevoke.status, 401, '   and the restored cookie stops working at once')
+  local rawAfter = storage.fs.readFile(DATA .. '/sessions.json') or ''
+  check(not rawAfter:find(mine, 1, true),
+        '   and the revocation reached the file immediately, without waiting for a flush ' ..
+        '(a revoked session must not come back from a crash)')
+
+  -- ---- an expired session is not resurrected ------------------------------
+  jar = {}
+  rpcOk(PORT, 'auth.login', { name = ADMIN.name, password = ADMIN.password })
+  local liveSid = jar['hub_sid']
+  local expiredJar = { hub_sid = liveSid, hub_csrf = jar['hub_csrf'] }
+  for _, s in pairs(hub.auth.byId) do s.expiresAt = 1 end        -- long past
+  hubMain.flushCaches(hub)
+  teardown(hub)
+  step(50)
+  hub = buildHub()
+  PORT = hub.port
+  jar = expiredJar
+  local dead = rpc(PORT, 'instance.list', {}, { noCsrf = true })
+  eq(dead.status, 401, 'an EXPIRED session is not restored by a restart')
+  eq(#hub.auth:sessions(), 0, '   and nothing stale is left in memory either')
+
+  jar = {}
+  rpcOk(PORT, 'auth.login', { name = ADMIN.name, password = ADMIN.password })
 end)
 
 -- ==================================== 9. against the REAL worker binary =====

@@ -81,6 +81,24 @@ Bot layer (vBot 4.8 behaviour: HealBot, AttackBot, CaveBot, TargetBot)
                            client's profiles/minimap.otmm when that file exists.
                            Read-only, never written.  --minimap=off disables it.
 
+vBot compatibility shim (docs/shim/COMPAT.md) -- runs the REAL vBot 4.8 scripts
+  --vbot                   run the user's real vBot tree through the otclient
+                           compatibility shim instead of the native bot layer.
+                           Mutually exclusive with --bot / --cavebot / --targetbot.
+  --vbot-profile=DIR       the /bot/<config> directory to run, e.g.
+                           .../otclient/profiles/bot/vBot_4.8.  Implies --vbot.
+                           The otclient checkout, the g_resources write dir and the
+                           config name are all derived from it.
+  --vbot-otroot=DIR        override the otclient checkout (READ-ONLY) the shim reads
+                           mods/game_bot and modules/ from
+  --vbot-vprofile=N        storage/profile_<N>.json    (default: --bot-vprofile, else 1)
+  --vbot-tick=MS           the executor tick in ms                    (default 10)
+  --vbot-strict            a missing API raises instead of returning an inert stub
+  --vbot-write             allow the bot to write its own storage/configs back into
+                           the profile.  OFF by default: the shim runs read-only and
+                           records every refused write, so a shim bug cannot corrupt
+                           a config the real vBot still has to read.
+
 Proxy (PANEL.md "Proxy support")
   --proxy=HOST:PORT        tunnel the game socket through this HTTP CONNECT proxy
                            and send the HTTPS login POST through it as well
@@ -180,6 +198,8 @@ local function parseArgs(argv)
         or name == 'session-key'
         or name == 'proxy' or name == 'control-port' or name == 'control-bind'
         or name == 'control-token-file' or name == 'control-token-fd'
+        or name == 'vbot-profile' or name == 'vbot-otroot'
+        or name == 'vbot-vprofile' or name == 'vbot-tick'
         or name == 'instance-name' then
             v, err = valueOf(name, inline)
             if not v then return nil, err end
@@ -227,6 +247,23 @@ local function parseArgs(argv)
         elseif name == 'cavebot'   then cfg.cavebot = v; cfg.bot = true
         elseif name == 'targetbot' then cfg.targetbot = v; cfg.bot = true
         elseif name == 'bot-status-interval' then cfg.botStatusMs = tonumber(v)
+        elseif name == 'vbot'      then cfg.vbot = true
+        elseif name == 'vbot-profile' then
+            if type(v) ~= 'string' or v == '' then
+                return nil, '--vbot-profile needs a directory'
+            end
+            for part in tostring(v):gmatch('[^/\\]+') do
+                if part == '..' then
+                    return nil, '--vbot-profile must not contain a ".." path component'
+                end
+            end
+            cfg.vbotProfile = v
+            cfg.vbot = true
+        elseif name == 'vbot-otroot' then cfg.vbotOtRoot = v; cfg.vbot = true
+        elseif name == 'vbot-vprofile' then cfg.vbotVProfile = tonumber(v)
+        elseif name == 'vbot-tick' then cfg.vbotTickMs = tonumber(v)
+        elseif name == 'vbot-strict' then cfg.vbotStrict = true
+        elseif name == 'vbot-write' then cfg.vbotWrite = true
         elseif name == 'minimap'   then cfg.minimap = v
         elseif name == 'proxy'     then
             local h, p = v:match('^%[?([^%]]-)%]?:(%d+)$')
@@ -309,6 +346,27 @@ local function resolveSecrets(cfg)
     end
     if cfg.controlToken and #cfg.controlToken < 8 then
         return nil, '--control-token: at least 8 characters, please'
+    end
+
+    -- PLAN invariant I10: exactly one bot engine at a time.  Track A (the vBot
+    -- scripts through the shim) and Track B (bot/cavebot.lua et al) both walk and
+    -- both attack; running the two together makes them fight over the character.
+    if cfg.vbot and (cfg.bot or cfg.cavebot or cfg.targetbot) then
+        -- --cavebot / --targetbot imply --bot, so naming both would be noise.
+        local which = {}
+        if cfg.cavebot then which[#which + 1] = '--cavebot' end
+        if cfg.targetbot then which[#which + 1] = '--targetbot' end
+        if #which == 0 then which[1] = '--bot' end
+        return nil, ('--vbot runs the real vBot scripts through the compatibility shim '
+                     .. 'and %s runs the native bot layer; the two engines both walk and '
+                     .. 'both attack, so exactly one may be enabled.  Drop %s, or drop '
+                     .. '--vbot.'):format(table.concat(which, ' / '), table.concat(which, ' / '))
+    end
+    if (cfg.vbotVProfile or cfg.vbotTickMs or cfg.vbotStrict or cfg.vbotWrite) and not cfg.vbot then
+        return nil, 'the --vbot-* options need --vbot (or --vbot-profile=DIR)'
+    end
+    if cfg.vbotTickMs and (cfg.vbotTickMs < 1 or cfg.vbotTickMs > 1000) then
+        return nil, '--vbot-tick must be between 1 and 1000 ms'
     end
     return cfg
 end
@@ -554,6 +612,117 @@ local function startBot(cfg)
     end
 end
 
+-- ====================================================== vBot compatibility shim
+-- Track A: the user's REAL vBot 4.8 scripts, unmodified, running on the otclient
+-- API surface synthesised in shim/ (docs/shim/COMPAT.md).  It replaces the native
+-- bot layer entirely -- never both (invariant I10, enforced in resolveSecrets).
+--
+-- `--vbot-profile=DIR` names the /bot/<config> directory.  Everything else falls
+-- out of it: config = the last path component, the g_resources write dir = its
+-- grandparent (.../profiles), and the otclient checkout = one above that.  That
+-- is exactly the layout the reference client itself uses, so pointing at the real
+-- profile is all the user has to do.
+local function resolveVBotPaths(cfg)
+    local dir = cfg.vbotProfile or defaultBotProfile()
+    dir = tostring(dir):gsub('\\', '/'):gsub('/+$', '')
+    local parent, config = dir:match('^(.*)/([^/]+)$')
+    if not config then return nil, ('--vbot-profile: %s is not a directory path'):format(dir) end
+    -- <writeDir>/bot/<config>: the shim's g_resources is rooted at the profiles dir.
+    local writeDir = parent:match('^(.*)/[Bb]ot$')
+    if not writeDir then
+        return nil, ('--vbot-profile: %s must live under a "bot" directory '
+                     .. '(the layout is <profiles>/bot/<config>)'):format(dir)
+    end
+    local otRoot = cfg.vbotOtRoot
+    if not otRoot then otRoot = writeDir:match('^(.*)/[^/]+$') end
+    if not otRoot then
+        return nil, 'cannot derive the otclient root; pass --vbot-otroot=DIR'
+    end
+    return { dir = dir, config = config, writeDir = writeDir,
+             otRoot = (tostring(otRoot):gsub('\\', '/'):gsub('/+$', '')) }
+end
+
+local function startVBot(cfg)
+    if not cfg.vbot or LC.vbot then return end
+    local paths, perr = resolveVBotPaths(cfg)
+    if not paths then
+        log.error('vbot: %s', tostring(perr))
+        return
+    end
+    local okmod, shim = pcall(require, 'shim.bootstrap')
+    if not okmod then
+        log.error('vbot: cannot load shim/bootstrap.lua: %s', tostring(shim))
+        return
+    end
+    if LC.minimap == nil and not cfg._minimapTried then
+        cfg._minimapTried = true
+        LC.minimap = loadMinimap(cfg)
+    end
+    local readOnly = (not cfg.vbotWrite) or (cfg.dryRun and true or false)
+    log.info('vbot: %s (config %s, vprofile %d) from %s -- %s, tick %d ms%s',
+             paths.dir, paths.config, cfg.vbotVProfile or cfg.botVProfile or 1,
+             paths.otRoot, readOnly and 'READ-ONLY' or 'writes allowed (--vbot-write)',
+             cfg.vbotTickMs or 10, cfg.vbotStrict and ', strict' or '')
+
+    local okb, S, serr = pcall(shim.start, LC, {
+        otRoot   = paths.otRoot,
+        writeDir = paths.writeDir,
+        config   = paths.config,
+        profile  = cfg.vbotVProfile or cfg.botVProfile or 1,
+        tickMs   = cfg.vbotTickMs or 10,
+        readOnly = readOnly,
+        strict   = cfg.vbotStrict and true or false,
+        arm      = true,
+        log      = log,
+        onForceExit = function() shutdown(0) end,
+    })
+    if not okb then
+        log.error('vbot: boot raised: %s', tostring(S))
+        return
+    end
+    if not S then
+        log.error('vbot: boot failed: %s', tostring(serr))
+        return
+    end
+    LC.vbot = shim
+    local st = shim.status()
+    log.info('vbot: %d profile files loaded (%d failed), %d runtime files, '
+             .. '%d macros (%d enabled), %d callbacks, UI backend %s',
+             st.vbotLoaded or 0, st.vbotFailed or 0, st.runtimeLoaded or 0,
+             st.macroCount or 0, st.macrosEnabled or 0, st.callbacks or 0,
+             tostring(st.ui))
+    for _, f in ipairs(st.failures or {}) do
+        log.warn('vbot: %s did not load: %s', tostring(f.name), tostring(f.err))
+    end
+    if serr then log.warn('vbot: %s', tostring(serr)) end
+end
+
+local function vbotStatusLine()
+    local shim = LC.vbot
+    if not shim then return end
+    local ok, st = pcall(shim.status)
+    if not ok or not st then return end
+    local pl = LC.state and LC.state.player or {}
+    local pos = pl.pos
+    log.info('vbot: hp %s/%s mana %s/%s pos %s | ticks %d (%d raised, slowest %d ms) | '
+             .. 'macros %d/%d ran',
+             tostring(pl.health or 0), tostring(pl.maxHealth or 0),
+             tostring(pl.mana or 0), tostring(pl.maxMana or 0),
+             pos and ('(%d,%d,%d)'):format(pos.x, pos.y, pos.z) or '(unknown)',
+             st.ticks or 0, st.tickErrors or 0, st.maxTickMs or 0,
+             st.macrosRan or 0, st.macroCount or 0)
+end
+
+local function stopVBot()
+    local shim = LC.vbot
+    if not shim then return end
+    LC.vbot = nil
+    if LC.vbotStatusTimer then
+        pcall(sched.cancel, LC.vbotStatusTimer); LC.vbotStatusTimer = nil
+    end
+    pcall(shim.stop)          -- saves storage when --vbot-write was given
+end
+
 -- Stop + persist.  Safe to call twice and safe when the bot never came up.
 local function stopBot()
     local b = LC.bot
@@ -565,8 +734,23 @@ local function stopBot()
     LC.bot = nil
 end
 LC.loadMinimap = function() return loadMinimap(LC.config or {}) end
-LC.stopBot  = stopBot
-LC.startBot = function() return startBot(LC.config or {}) end
+-- One entry point for both engines; resolveSecrets already guarantees only one of
+-- them is configured (invariant I10), so this dispatch can never start two.
+LC.stopBot  = function() stopVBot(); return stopBot() end
+LC.startBot = function()
+    local cfg = LC.config or {}
+    if cfg.vbot then
+        startVBot(cfg)
+        local every = cfg.botStatusMs or 5000
+        if LC.vbot and every > 0 and sched.every and not LC.vbotStatusTimer then
+            LC.vbotStatusTimer = sched.every(every, vbotStatusLine)
+        end
+        return
+    end
+    return startBot(cfg)
+end
+LC.startVBot = function() return startVBot(LC.config or {}) end
+LC.stopVBot  = stopVBot
 -- The control endpoint's `bot.listConfigs` has to work before the bot is running (the
 -- panel populates its pickers while the worker is still logging in), so the profile
 -- directory is resolved once here rather than only inside startBot.
@@ -881,6 +1065,33 @@ local function runDryRun(cfg)
         -- running bot.  Without one, --dry-run is a one-shot check and the bot is
         -- stopped here exactly as before.
         if not cfg.controlToken then stopBot() end
+    end
+
+    -- 5b. the same check for Track A: boot the real vBot tree through the shim and
+    --     tick it.  `--vbot --dry-run` is the offline wiring proof for the shim.
+    if cfg.vbot then
+        LC.state.player.pos = LC.state.player.pos or { x = 32369, y = 32241, z = 7 }
+        LC.inGame = true
+        startVBot(cfg)
+        if not LC.vbot then error('dry-run: the vBot shim failed to start') end
+        local st = LC.vbot.status()
+        if (st.vbotFailed or 0) > 0 then
+            local first = (st.failures or {})[1]
+            error(("dry-run: %d vBot files failed to load (first: %s -- %s)")
+                  :format(st.vbotFailed, tostring(first and first.name),
+                          tostring(first and first.err)))
+        end
+        for _ = 1, 50 do LC.vbot.tick() end
+        st = LC.vbot.status()
+        vbotStatusLine()
+        log.info('dry-run: vbot wired -- %d files, %d macros (%d enabled), %d ticks, '
+                 .. '%d tick errors, UI %s',
+                 st.loaded or 0, st.macroCount or 0, st.macrosEnabled or 0,
+                 st.ticks or 0, st.tickErrors or 0, tostring(st.ui))
+        if (st.tickErrors or 0) > 0 then
+            error('dry-run: a vBot tick raised: ' .. tostring(st.firstTickError))
+        end
+        if not cfg.controlToken then stopVBot() end
     end
 
     log.info('--dry-run OK: items, login packet, framing, parser, events and the ping rules all wired')

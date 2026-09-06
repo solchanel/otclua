@@ -14,6 +14,11 @@ browser ──HTTP/WS──► hub (hub/main.lua)
                                                         └──proxy──► game server
 ```
 
+This file is about *running and using* the hub. To put it on a Debian server as a
+service — packaged tarball, `luaclient` system user, `/opt` + `/var/lib` split,
+a hardened systemd unit, TLS in front, backup and upgrade — read **`INSTALL.md`**;
+one command does the whole thing.
+
 ---
 
 ## 1. Start it
@@ -46,8 +51,26 @@ Useful flags (`--help` prints them all):
 | `--allowed-host=NAME` | — | an extra `Host` header a non-loopback bind answers to; repeatable |
 | `--trusted-proxy=CIDR` | — | believe `X-Forwarded-For` from this front end (IPv4); repeatable |
 | `--no-autostart` | off | ignore each instance's `autoStart` flag on boot |
+| `--stop-grace-ms=N` | 8000 | how long a worker gets to **log out** and exit before it is killed |
 | `--log-file=PATH` | — | append the hub log to a file as well as stdout |
 | `--proxy-test-target=H:P` | `example.com:443` | what the **Test** button CONNECTs to |
+
+### Stopping it
+
+`Ctrl+C`, `Ctrl+Break` and closing the console window on Windows, and
+`SIGINT` / `SIGTERM` / `SIGHUP` on Linux, all stop the workers in an orderly way:
+each one is sent the control `shutdown` command first, so it sends `LeaveGame`
+and the character goes offline properly, and only a worker that will not go is
+killed. Raise `--stop-grace-ms` rather than lowering it — a worker that is merely
+killed leaves the character online for the server's own logout timeout, which
+costs you the *next* login too. The hub says what happened on the way out:
+
+```
+INFO event=hub.shutdown graceMs=8000 reason="signal 15" workers=1
+INFO event=hub.workers.stopped graceful=1 killed=0 stopped=1
+```
+
+`killed=` above zero is the line worth watching.
 
 To try the whole thing with no game server, give the workers `--dry-run`:
 
@@ -109,8 +132,16 @@ password of at least ten characters.
   `POST /api/instances/:id/exec` and `POST /api/scripts`.
 * Passwords are PBKDF2-HMAC-SHA256 at 200 000 iterations with a per-user salt.
   Nothing ever logs, echoes or stores one in the clear.
-* Sessions live in memory, so **restarting the hub signs everyone out.** That is
-  deliberate: a bearer credential on disk buys nothing.
+* Sessions **survive a restart of the hub**, so `systemctl restart luaclient-hub`
+  does not sign your operators out and does not blank the Console and Chat tabs.
+  What is written to `sessions.json` is `SHA-256(token)`, never a token, so the
+  file cannot be replayed into a login; the absolute expiry is stored with it and
+  re-checked on load, and an expired session is not resurrected. Signing out,
+  revoking a session and changing a password all flush to disk immediately, so a
+  revocation is authoritative even if the hub is killed a second later. If the
+  file is ever corrupted the hub quarantines it and starts anyway — everyone is
+  signed out, nothing else breaks. Deleting `sessions.json` by hand is safe and
+  does exactly that.
 
 A user changes their own password with the **Password** button in the header; an
 admin resets someone else's with **Reset password**. Either revokes that
@@ -206,8 +237,18 @@ scripts.json      uploaded-script metadata
 scripts/<id>.lua  the sources themselves
 history/<id>.json a rolling stats history per instance, flushed every 60 s
 audit.jsonl       the admin-only activity log (rotated, `audit.1.jsonl`, ...)
+sessions.json     live web sessions, so a restart does not sign everyone out.
+                  SHA-256(token) only -- never a token -- plus the absolute expiry
+                  and the per-session CSRF token.  0600.
+worklogs.json     the last 200 log and chat lines per instance, so the Console and
+                  Chat tabs are not blank after a restart.  0600.
 secret.key        the hub master key, 0600
 ```
+
+`sessions.json` and `worklogs.json` are caches. Deleting them is safe; deleting
+`sessions.json` just signs everyone out. Everything else is your fleet — back the
+whole directory up, `secret.key` included, or the sealed passwords in
+`accounts.json` and `proxies.json` become unreadable.
 
 Each JSON file is written atomically (write a temp file, fsync, rename) and
 carries a SHA-256 integrity footer. A truncated, empty, corrupted or
@@ -367,9 +408,25 @@ luajit test/hubapisuite.lua       # the hub internals against a fake worker
 luajit test/hubcoresuite.lua      # storage, model, auth, audit
 luajit test/controlsuite.lua      # the worker's control endpoint
 luajit test/processsuite.lua      # spawning, and what a child does NOT inherit
+luajit test/fdleaksuite.lua       # sockets the PEER closed still give their fd back
 luajit test/probe_roles.lua       # drive every admin route as a plain user, and print
 luajit test/selftest.lua          # everything below the hub
 ```
+
+Seventeen suites in all — the seven above plus `botsuite`, `statsuite`,
+`cryptosuite`, `httpserversuite`, `wssuite`, `proxysuite` and the four
+`shim_*_suite` files. All green on both platforms: **8746 assertions on Debian 13,
+8732 on Windows, 0 failures.** The counts differ only where a suite has
+platform-specific checks — `cryptosuite` and `processsuite` do more on Linux,
+`hube2esuite` has two Linux-only signal checks, and `fdleaksuite`'s descriptor
+counting needs `/proc`.
+
+`fdleaksuite` exists because none of the other sixteen could see a descriptor
+leak. `lib/socket.lua` used to skip the real `close()` for any socket whose peer
+hung up first — which is every ordinary keep-alive request — so the hub leaked one
+fd per request and would have died at `LimitNOFILE` after a few thousand. It
+counts `/proc/<pid>/fd` directly rather than trusting the connection bookkeeping
+above it; on Windows the counting checks report themselves as skipped.
 
 `probe_roles.lua` is a report rather than a test: it starts a throwaway hub, makes
 an administrator and a plain user, drives every administrator-only route plus

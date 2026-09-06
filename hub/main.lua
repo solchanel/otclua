@@ -16,6 +16,8 @@ hub/main.lua -- the hub process: CLI, first-run bootstrap, wiring, shutdown.
     --log-file=PATH       append the hub's own log there
     --no-autostart        do not start instances flagged autoStart
     --proxy-test-target=H:P   what `proxy.test` CONNECTs to  (default example.com:443)
+    --stop-grace-ms=N     how long a worker gets to log out and exit before it
+                          is killed                                (default 8000)
     --game-host=HOST      game-server address handed to every worker's `login`
     --login-url=URL      the account-login endpoint the worker POSTs to
     --game-port=N         its port.  Both optional: without them the worker uses
@@ -33,17 +35,30 @@ address unless --allow-insecure is given, in which case it logs a banner and
 tells the panel to draw one (`auth.session.insecure`).  Put nginx/Caddy or an SSH
 tunnel in front to expose it.
 
-SHUTDOWN.  Every worker is stopped before the hub exits.
+SHUTDOWN.  Every worker is asked to LOG OUT and exit before the hub goes away --
+on both platforms, which is the point.  A worker that is merely killed leaves the
+character online for the server's own logout timeout, and the next login on that
+account is answered with `session ended` (docs/live-findings.md): killing a worker
+costs the operator the NEXT login too.
   * Linux: SIGINT/SIGTERM/SIGHUP are BLOCKED at startup and collected with
     sigtimedwait(2) from the reactor loop.  No async signal handler ever enters
     the Lua VM (LuaJIT callbacks from a signal context are undefined behaviour);
-    the reactor simply notices a pending signal on its next turn and starts an
-    orderly shutdown: stop every worker, flush telemetry, close the listener.
-  * Windows: there is no safe way to run Lua from a console control handler, so
-    Ctrl+C ends the process directly -- and lib/process.lua has already put every
-    worker in a job object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, so the kernel
-    reaps them all when the hub's handle closes.  sys.atExit() covers the orderly
-    path (a normal exit, os.exit, an unhandled error).
+    the reactor notices a pending signal on its next turn and starts the orderly
+    shutdown.
+  * Windows: lib/process.lua installs a console control handler that is not Lua
+    at all -- 39 bytes of machine code that set a word and wait -- because an FFI
+    callback fired from the thread Windows injects panicked the VM outright
+    (`bad callback`) whenever the main thread was on a JIT trace.  The reactor
+    polls that word and runs the same orderly shutdown; the handler is released
+    once the workers are down, which is what buys the time on a console CLOSE.
+  * Either way the ladder is hub/supervisor.lua's: the `shutdown` COMMAND over
+    the control link (that is what makes the worker send 0x14 LeaveGame), then
+    stdin EOF / SIGTERM, then a kill -- and the hub logs `event=hub.workers.stopped
+    stopped=N graceful=N killed=N` so it is on the record which one happened.
+  * sys.atExit() still covers the paths nothing else does (os.exit, an unhandled
+    error): the supervisor's hook asks every worker to shut down and then TURNS
+    THE REACTOR BY HAND until they are gone, because a `shutdown` command needs a
+    reactor to be delivered at all.
 
 Lua 5.1 / LuaJIT: no goto, math.floor for integer division.
 ============================================================================]]
@@ -56,15 +71,163 @@ do
   package.path = ROOT .. '/?.lua;' .. package.path
 end
 
-local sys   = require('lib.sys')
-local log   = require('lib.log')
-local sched = require('lib.sched')
-local json  = require('lib.json')
+local sys     = require('lib.sys')
+local log     = require('lib.log')
+local sched   = require('lib.sched')
+local json    = require('lib.json')
+local process = require('lib.process')     -- watchConsoleCtrl on Windows
 
 local M = {}
 M.ROOT = ROOT
 
 local floor = math.floor
+
+-- ============================================== persistent volatile caches ===
+-- Two things used to die with the process for no good reason.
+--
+--   SESSIONS.  hub/auth.lua keeps them in memory, and the comment there argues
+--   that persisting a session would put a bearer credential on disk.  It would
+--   not: what a session holds is SHA-256(token), never the token, so the file
+--   below cannot be replayed into a login by anyone who reads it -- and it is
+--   written 0600 into a directory that already holds `secret.key`.  What the
+--   memory-only version actually bought was signing every operator out whenever
+--   the hub was restarted, which is a bad trade for a panel that supervises
+--   long-running workers.  Sessions come back with their ABSOLUTE deadline
+--   intact (sliding expiry cannot extend it), the user is re-checked on load
+--   and revocation is flushed immediately, so a revoked session cannot return.
+--
+--   WORKER LOGS.  hub/supervisor.lua's per-instance ring buffers, so the panel's
+--   Console and Chat tabs are not blank after a restart -- least of all for the
+--   lines that say why the restart was needed.
+--
+-- Both go in a SECOND storage.lua store over the same data dir: same atomic
+-- write-and-rename, same fsync, same SHA-256 integrity footer as every other
+-- file there.  It is a separate store for one reason -- `onCorrupt =
+-- 'quarantine'`.  These two files are caches: a corrupt one must be moved aside
+-- and reported, not refuse to start the hub, which is what the main store
+-- (rightly) does for `users.json`.
+local CACHE_COLLECTIONS = { 'sessions', 'worklogs' }
+M.CACHE_COLLECTIONS = CACHE_COLLECTIONS
+
+local LOG_TAIL_PER_INSTANCE = 200
+
+-- hub/auth.lua keys a session by the RAW 32 bytes of SHA-256(token).  Raw bytes
+-- would go into the JSON file as raw bytes -- it round-trips, but it leaves a
+-- file in the operator's data directory that is not valid UTF-8 and that no
+-- ordinary tool can open.  Hex in, hex out; anything that is not exactly 64 hex
+-- characters is not a digest and the row is dropped.
+local function toHex(s)
+  return (tostring(s):gsub('.', function(c) return string.format('%02x', c:byte()) end))
+end
+
+local function fromHex(s)
+  if type(s) ~= 'string' or #s ~= 64 or s:find('[^0-9a-fA-F]') then return nil end
+  return (s:gsub('%x%x', function(h) return string.char(tonumber(h, 16)) end))
+end
+M._toHex, M._fromHex = toHex, fromHex
+
+local function openCache(dataDir)
+  local storage = require('hub.storage')
+  return storage.open(dataDir, { log = log, collections = CACHE_COLLECTIONS,
+                                 onCorrupt = 'quarantine' })
+end
+M.openCache = openCache
+
+--- Put saved sessions back into a fresh auth object.  Returns loaded, dropped.
+function M.loadSessions(hub)
+  local cache, auth = hub.cache, hub.auth
+  if not cache or not auth then return 0, 0 end
+  local now = require('hub.storage').wallMs()
+  local loaded, dropped = 0, 0
+  for _, row in ipairs(cache:items('sessions') or {}) do
+    local digest = type(row) == 'table' and fromHex(row.hash) or nil
+    local ok = digest ~= nil and type(row.id) == 'string'
+    local user = ok and hub.db:get('users', row.userId) or nil
+    if ok and user and not user.disabled
+       and (tonumber(row.expiresAt) or 0) > now
+       and (tonumber(row.deadline) or 0) > now then
+      local sess = {
+        id = row.id, hash = digest, userId = row.userId,
+        name = user.name, role = user.role,
+        ip = tostring(row.ip or '-'), userAgent = tostring(row.userAgent or ''),
+        createdAt = tonumber(row.createdAt) or now,
+        lastSeenAt = tonumber(row.lastSeenAt) or now,
+        expiresAt = tonumber(row.expiresAt), deadline = tonumber(row.deadline),
+        -- The CSRF token has to come back with the session or the restore is
+        -- worthless: hub/api.lua mints one lazily onto the session object, the
+        -- panel holds the old one in a readable `hub_csrf` cookie, and a fresh
+        -- one would make every write 403 `csrf-invalid` until the operator
+        -- signed in again -- which is the sign-out this is meant to prevent.
+        -- It is not a bearer credential on its own: it is deliberately readable
+        -- by the panel's own JavaScript, and it proves nothing without the
+        -- HttpOnly session cookie beside it.
+        csrf = type(row.csrf) == 'string' and row.csrf or nil,
+      }
+      auth.byHash[sess.hash] = sess
+      auth.byId[sess.id] = sess
+      loaded = loaded + 1
+    else
+      dropped = dropped + 1
+    end
+  end
+  return loaded, dropped
+end
+
+--- Write the live sessions out.  Never called with a token in hand: only the
+--- digest is stored, which is all hub/auth.lua itself keeps.
+function M.saveSessions(hub)
+  local cache, auth = hub.cache, hub.auth
+  if not cache or not auth then return false end
+  local rows = {}
+  for _, s in pairs(auth.byId) do
+    rows[#rows + 1] = { id = s.id, hash = toHex(s.hash), userId = s.userId, csrf = s.csrf,
+                        ip = s.ip, userAgent = s.userAgent,
+                        createdAt = s.createdAt, lastSeenAt = s.lastSeenAt,
+                        expiresAt = s.expiresAt, deadline = s.deadline }
+  end
+  table.sort(rows, function(a, b) return a.id < b.id end)
+  cache:setItems('sessions', rows)
+  local ok, err = cache:save('sessions', true)
+  if not ok then M.slog('warn', 'sessions.save', { err = tostring(err) }) end
+  return ok and true or false
+end
+
+--- Write both caches out.  Called on every exit path (and by the test suite's
+--- teardown, so what the tests exercise is what the hub really does).
+function M.flushCaches(hub)
+  if not hub or not hub.cache then return false end
+  local a = pcall(M.saveSessions, hub)
+  local b = pcall(M.saveWorkerLogs, hub)
+  return a and b
+end
+
+function M.loadWorkerLogs(hub)
+  local cache = hub.cache
+  if not cache then return 0 end
+  local known = {}
+  for _, i in ipairs(hub.db:list('instances')) do known[i.id] = true end
+  local n = 0
+  for _, row in ipairs(cache:items('worklogs') or {}) do
+    -- An instance that has since been deleted must not be resurrected as a
+    -- phantom row in the supervisor's table.
+    if type(row) == 'table' and known[row.id] then
+      hub.sup:restoreLogs(row.id, row.logs, row.chat)
+      n = n + 1
+    end
+  end
+  return n
+end
+
+function M.saveWorkerLogs(hub)
+  local cache = hub.cache
+  if not cache then return false end
+  local ok, rows = pcall(function() return hub.sup:snapshotLogs(LOG_TAIL_PER_INSTANCE) end)
+  if not ok then return false end
+  cache:setItems('worklogs', rows)
+  local sok, err = cache:save('worklogs', true)
+  if not sok then M.slog('warn', 'worklogs.save', { err = tostring(err) }) end
+  return sok and true or false
+end
 
 -- ===================================================== structured logging ====
 --- `event=<name> k=v k=v` -- greppable, one line, no secrets.  Values that
@@ -109,6 +272,7 @@ local function usage()
   --log-file=PATH       append the hub log
   --no-autostart        ignore the autoStart flag
   --proxy-test-target=H:P  CONNECT target for proxy.test
+  --stop-grace-ms=N     worker logout+exit window before a kill  (default 8000)
   --game-host=HOST      game server the workers log in to (optional)
   --game-port=N         its port                          (optional)
   --login-url=URL       account-login endpoint the workers POST to (optional;
@@ -130,6 +294,7 @@ function M.parseArgs(argv)
     logLevel = 'info', logFile = nil, autostart = true, allowedHosts = {}, trustedProxies = {},
     proxyTestTarget = 'example.com:443',
     gameHost = nil, gamePort = nil, loginUrl = nil, workerArgs = {}, workerEnv = nil,
+    stopGraceMs = 8000,
   }
   for i = 1, #(argv or {}) do
     local a = tostring(argv[i])
@@ -150,6 +315,7 @@ function M.parseArgs(argv)
     elseif k == 'log-file' then o.logFile = tostring(v)
     elseif k == 'no-autostart' then o.autostart = false
     elseif k == 'proxy-test-target' then o.proxyTestTarget = tostring(v)
+    elseif k == 'stop-grace-ms' then o.stopGraceMs = tonumber(v) or o.stopGraceMs
     elseif k == 'game-host' then o.gameHost = tostring(v)
     elseif k == 'game-port' then o.gamePort = tonumber(v)
     elseif k == 'login-url' then o.loginUrl = tostring(v)
@@ -272,6 +438,19 @@ function M.build(o)
   local hub = { o = o, storage = store, db = db, model = db, auth = auth, audit = audit,
                 secret = box }
 
+  -- The volatile caches (sessions, worker log rings).  A failure here is never
+  -- fatal: the hub runs exactly as it did before, it just forgets more.
+  local cache, ce = openCache(o.dataDir)
+  if cache then
+    hub.cache = cache
+    local loaded, dropped = M.loadSessions(hub)
+    if loaded > 0 or dropped > 0 then
+      slog('info', 'sessions.restored', { restored = loaded, expired = dropped })
+    end
+  else
+    slog('warn', 'cache.open', { err = tostring(ce) })
+  end
+
   hub.sup = supervisor.new{
     audit = audit, log = log, sched = sched, logLevel = o.logLevel,
     luajit = o.luajit, workersDir = o.workersDir, workerScript = o.workerScript,
@@ -340,6 +519,26 @@ function M.build(o)
   -- housekeeping: expired sessions and stale rate-limiter buckets
   sched.every(60000, function() pcall(function() auth:sweep() end) end)
 
+  if hub.cache then
+    -- Revocation has to be authoritative the instant it happens: a revoked
+    -- session that came back because the hub died before the next periodic
+    -- flush would be a security bug, not a lost convenience.  So the three
+    -- calls that END a session write immediately (setPassword revokes through
+    -- revokeUser, so it is covered too), and everything else -- new sessions,
+    -- slid expiries -- rides the periodic flush.
+    local function flushNow() pcall(M.saveSessions, hub) end
+    for _, name in ipairs{ 'logout', 'revoke', 'revokeUser' } do
+      local orig = auth[name]
+      auth[name] = function(...)
+        local a, b, c = orig(...)
+        flushNow()
+        return a, b, c
+      end
+    end
+    sched.every(30000, function() pcall(M.saveSessions, hub) end)
+    sched.every(30000, function() pcall(M.saveWorkerLogs, hub) end)
+  end
+
   local ids = {}
   for _, i in ipairs(db:list('instances')) do ids[#ids + 1] = i.id end
   hub.tel:load(ids)
@@ -349,6 +548,13 @@ function M.build(o)
   hub.port = port
   hub.sup:install()
   hub.tel:install()
+
+  -- The saved log/chat tails, so the panel is not blank about what the previous
+  -- run was doing.  After :install(), because it creates supervisor records.
+  if hub.cache then
+    local n = M.loadWorkerLogs(hub)
+    if n > 0 then slog('info', 'worklogs.restored', { instances = n }) end
+  end
 
   -- Every instance starts from disk as 'stopped': a state left over from a hub
   -- that was killed describes a process that no longer exists.
@@ -390,19 +596,32 @@ function M.autostart(hub)
   return started
 end
 
-function M.shutdown(hub, why)
+--- The orderly stop.  Non-blocking: it asks, and the reactor finishes the job on
+--- its own turns (hub/supervisor.lua's ladder -- `shutdown` command, then stdin
+--- EOF/SIGTERM, then kill).  `onDone` is called once everything is down; the
+--- Windows console handler uses it to let the OS proceed.
+function M.shutdown(hub, why, onDone)
   if hub.shuttingDown then return end
   hub.shuttingDown = true
-  slog('info', 'hub.shutdown', { reason = why or 'exit', workers = hub.sup:runningCount() })
+  local graceMs = tonumber(hub.o and hub.o.stopGraceMs) or 8000
+  slog('info', 'hub.shutdown', { reason = why or 'exit', workers = hub.sup:runningCount(),
+                                 graceMs = graceMs })
   hub.server:stop()
   hub.tel:flush()
   hub.tel:uninstall()
-  hub.sup:shutdownAll(4000)
-  -- give the children their grace period on the reactor, then reap for real
-  local deadline = sys.nowMs() + 6000
+  M.flushCaches(hub)
+  hub.sup:shutdownAll(graceMs)
+  -- The workers get their whole grace window on the reactor -- that window is
+  -- what a logout happens in -- and only then is anything reaped by force.
+  local deadline = sys.nowMs() + graceMs + 2000
   sched.every(100, function()
     if hub.sup:allStopped() or sys.nowMs() > deadline then
       hub.sup:reap(2000)
+      local s = hub.sup:stopSummary()
+      slog(s.killed > 0 and 'warn' or 'info', 'hub.workers.stopped',
+           { stopped = s.total, graceful = s.graceful, killed = s.killed })
+      M.flushCaches(hub)
+      if onDone then pcall(onDone) end
       sched.stop()
     end
   end)
@@ -451,13 +670,37 @@ function M.main(argv)
     end)
     slog('debug', 'hub.signals', { mode = 'sigtimedwait', signals = 'INT,TERM,HUP' })
   else
-    slog('debug', 'hub.signals', { mode = 'atexit-only', os = sys.os })
+    -- Windows.  lib/process.lua installs a console control handler that is
+    -- MACHINE CODE, not a Lua callback -- an FFI callback fired from the thread
+    -- the OS injects killed the process outright with `bad callback` when the
+    -- main thread happened to be on a JIT trace, and a hub that crashes on
+    -- Ctrl+C stops no workers either.  The handler sets a word and waits; the
+    -- reactor reads the word here, on its own thread, and runs the same orderly
+    -- shutdown a SIGINT gets on Linux.  release() is what lets the handler
+    -- return -- for a console CLOSE that is the only reason Windows has not
+    -- killed us yet, so it is called only once the workers are down.
+    local watch, werr = process.watchConsoleCtrl{}
+    if watch then
+      local NAMES = { [0] = 'Ctrl+C', [1] = 'Ctrl+Break', [2] = 'console closed',
+                      [5] = 'logoff', [6] = 'system shutdown' }
+      sched.every(100, function()
+        local ev = watch:pending()
+        if ev then
+          M.shutdown(hub, NAMES[ev] or ('console event ' .. tostring(ev)),
+                     function() watch:release() end)
+        end
+      end)
+      slog('debug', 'hub.signals', { mode = 'console-ctrl-handler', bytes = watch.bytes })
+    else
+      slog('warn', 'hub.signals', { mode = 'atexit-only', os = sys.os, err = tostring(werr) })
+    end
   end
   sys.atExit(function() pcall(function() hub.tel:flush(); hub.sup:reap(2000) end) end)
 
   sched.run()
   hub.sup:reap(2000)
   hub.tel:flush()
+  M.flushCaches(hub)
   slog('info', 'hub.stopped', {})
   return 0
 end

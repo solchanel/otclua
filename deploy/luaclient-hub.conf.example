@@ -1,0 +1,62 @@
+# /etc/luaclient/hub.conf -- configuration for the luaclient-hub service.
+#
+# This file is read by systemd as an EnvironmentFile, so it is NOT a shell
+# script: no command substitution, no `export`, no line continuations.  One
+# NAME=VALUE per line; a value may be quoted with " or ' if it contains spaces.
+# Run `systemctl restart luaclient-hub` after editing.
+#
+# install.sh writes this file once and never touches it again, so your edits
+# survive re-running the installer and survive deploy/upgrade.sh.
+#
+# Mode 0640, root:luaclient.  Nothing secret belongs here -- the hub mints its
+# own master key in /var/lib/luaclient/secret.key and no credential is ever
+# passed on a command line -- but the mode is tight anyway because HUB_EXTRA_ARGS
+# is, in effect, part of the security policy.
+
+# ---------------------------------------------------------------- the listener
+# The hub speaks PLAIN HTTP and has no TLS of its own.  Loopback is the only
+# address it will bind without --allow-insecure, and it is the right answer:
+# put nginx or Caddy in front (deploy/nginx-luaclient.conf) or use an SSH
+# tunnel.  Do not publish this port.
+HUB_BIND=127.0.0.1
+HUB_PORT=8777
+
+# debug | info | warn | error
+HUB_LOG_LEVEL=info
+
+# ------------------------------------------------------------ everything else
+# Extra flags, appended verbatim to the command line and split on whitespace.
+# `luajit /opt/luaclient/hub/main.lua --help` prints the full list.
+#
+# Behind the nginx example in deploy/nginx-luaclient.conf, use:
+#
+#   HUB_EXTRA_ARGS="--csrf-strict --trusted-proxy=127.0.0.1/32"
+#
+#     --csrf-strict          make X-CSRF-Token mandatory on every write.  Behind
+#                            a TLS terminator that rewrites Host and Origin (it
+#                            has to -- see deploy/README.md "The Host header is
+#                            pinned"), the CSRF token is the check that still
+#                            does real work, so make it non-optional.
+#     --trusted-proxy=CIDR   believe X-Forwarded-For from the front end, and
+#                            only from there.  Without it every request behind
+#                            nginx shares one rate-limiter bucket.
+#
+# Other flags worth knowing:
+#
+#     --no-autostart         do not start instances flagged autoStart on boot
+#     --game-host=HOST --game-port=N --login-url=URL
+#                            override where every worker logs in
+#     --stop-grace-ms=N      how long a worker gets to log OUT and exit before it
+#                            is killed (default 8000).  A worker that is merely
+#                            killed leaves the character online for the server's
+#                            logout timeout and costs you the NEXT login too, so
+#                            raise this rather than lower it.
+#     --worker-arg=--dry-run boot workers with no network at all (a smoke test)
+#
+HUB_EXTRA_ARGS=""
+
+# The bot profile a worker uses when its instance names none.  It must be
+# writable by the service user, so it lives under the state directory, not under
+# the read-only /opt/luaclient.  A path only -- never a credential: a process
+# environment is readable from /proc on some configurations.
+HUB_BOT_PROFILE=/var/lib/luaclient/workers/profile_1

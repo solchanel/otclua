@@ -68,6 +68,12 @@ local IO_TIMEOUT_MS = 15000
 -- in-game, and the panel really reports `online`, for long enough to be observed.
 -- Zero (the default) is the original behaviour: end the session at once.
 local HOLD_MS = 0
+-- Extra flags appended to the client command line.  `--vbot` is the shortcut that
+-- boots the REAL vBot 4.8 tree through the compatibility shim inside the very same
+-- process that just logged in, so the whole path -- socket, login, parser, shim
+-- boot, vBot load, ticks -- is proven with no game server anywhere.
+local EXTRA_FLAGS = {}
+local VBOT = false
 
 -- ------------------------------------------------------------- assertions
 local checks, failures = 0, {}
@@ -331,6 +337,12 @@ end
 -- =============================================================== the client
 local function quoteWin(s) return '"' .. s .. '"' end
 
+-- With --vbot the client prints a few hundred lines while the shim boots and while
+-- it ticks, and NOTHING reads that pipe until serve() returns -- so the client
+-- blocks on a full pipe buffer, stops answering the ping, and the server times out.
+-- Redirect its own output to a file in that mode and splice it back in afterwards.
+local CLIENT_LOG = nil
+
 local function buildClientCommand(port)
     local interp = arg and arg[-1]
     if not interp or interp == '' then interp = sys.isWindows and 'luajit.exe' or 'luajit' end
@@ -343,16 +355,24 @@ local function buildClientCommand(port)
         '--ping=600000',
         '--log-level=info',
     }, ' ')
+    if #EXTRA_FLAGS > 0 then flags = flags .. ' ' .. table.concat(EXTRA_FLAGS, ' ') end
     -- Lua 5.1's io.popen close() cannot report a child's exit status (it only
     -- says whether pclose itself worked), so the child prints it instead.
     -- `%^ERRORLEVEL%` defeats cmd's parse-time expansion; `$?` is plain sh.
-    if sys.isWindows then
-        return ('set "LUACLIENT_TEST_XTEA=%s" && %s %s %s 2>&1 & call echo LC_EXIT=%%^ERRORLEVEL%%')
-            :format(XTEA_HEX, quoteWin(interp:gsub('/', '\\')),
-                    quoteWin((ROOT .. '/main.lua'):gsub('/', '\\')), flags)
+    local redirect = ''
+    if VBOT then
+        CLIENT_LOG = ROOT .. '/test/.tmp/fakeserver-client-' .. tostring(port) .. '.log'
+        os.remove(CLIENT_LOG)
     end
-    return ("LUACLIENT_TEST_XTEA=%s '%s' '%s' %s 2>&1; echo LC_EXIT=$?")
-        :format(XTEA_HEX, interp, ROOT .. '/main.lua', flags)
+    if sys.isWindows then
+        redirect = CLIENT_LOG and ('> ' .. quoteWin(CLIENT_LOG:gsub('/', '\\')) .. ' 2>&1') or '2>&1'
+        return ('set "LUACLIENT_TEST_XTEA=%s" && %s %s %s %s & call echo LC_EXIT=%%^ERRORLEVEL%%')
+            :format(XTEA_HEX, quoteWin(interp:gsub('/', '\\')),
+                    quoteWin((ROOT .. '/main.lua'):gsub('/', '\\')), flags, redirect)
+    end
+    redirect = CLIENT_LOG and ("> '" .. CLIENT_LOG .. "' 2>&1") or '2>&1'
+    return ("LUACLIENT_TEST_XTEA=%s '%s' '%s' %s %s; echo LC_EXIT=$?")
+        :format(XTEA_HEX, interp, ROOT .. '/main.lua', flags, redirect)
 end
 
 -- =============================================================== entry point
@@ -361,8 +381,16 @@ local function main(argv)
     for _, a in ipairs(argv) do
         if a:match('^%-%-serve=%d+$') then servePort = tonumber(a:match('(%d+)$'))
         elseif a:match('^%-%-hold%-ms=%d+$') then HOLD_MS = tonumber(a:match('(%d+)$'))
+        elseif a:match('^%-%-client%-flag=') then
+            EXTRA_FLAGS[#EXTRA_FLAGS + 1] = a:match('^%-%-client%-flag=(.*)$')
+        elseif a == '--vbot' then
+            VBOT = true
+            EXTRA_FLAGS[#EXTRA_FLAGS + 1] = '--vbot'
+            EXTRA_FLAGS[#EXTRA_FLAGS + 1] = '--bot-status-interval=300'
+            if HOLD_MS == 0 then HOLD_MS = 2500 end   -- long enough to really tick
         elseif a == '-h' or a == '--help' then
-            io.write('usage: luajit test/fakeserver.lua [--serve=PORT]\n')
+            io.write('usage: luajit test/fakeserver.lua [--serve=PORT] [--hold-ms=N] '
+                     .. '[--vbot] [--client-flag=FLAG ...]\n')
             return 0
         else
             io.write('fakeserver: unknown argument ', a, '\n'); return 1
@@ -401,6 +429,16 @@ local function main(argv)
     if child then
         clientOut = child:read('*a') or ''
         child:close()
+        if CLIENT_LOG then
+            local lf = io.open(CLIENT_LOG, 'rb')
+            if lf then
+                clientOut = lf:read('*a') .. '\n' .. clientOut
+                lf:close()
+                os.remove(CLIENT_LOG)
+            else
+                check(false, 'the client log file %s was not created', CLIENT_LOG)
+            end
+        end
         io.write('--------------- client output ---------------\n')
         io.write(clientOut)
         if clientOut ~= '' and clientOut:sub(-1) ~= '\n' then io.write('\n') end
@@ -424,6 +462,25 @@ local function main(argv)
               'client printed the server text message')
         check(clientOut:find('session ended by the server', 1, true) ~= nil,
               'client honoured SessionEnd')
+
+        -- --vbot: the compatibility shim booted inside the very same live session.
+        -- These are the only assertions that prove the shim runs on the REAL login
+        -- path rather than only under a test harness.
+        if VBOT then
+            local loaded, failed = clientOut:match('vbot: (%d+) profile files loaded %((%d+) failed%)')
+            check(loaded ~= nil, 'the vBot shim reported its load table')
+            check(tonumber(loaded or 0) >= 70,
+                  'the whole vBot tree loaded on the live path (%s files)', tostring(loaded))
+            check(failed == '0', 'no vBot file failed to load (got %s)', tostring(failed))
+            local ticks, raised = clientOut:match('ticks (%d+) %((%d+) raised')
+            check(tonumber(ticks or 0) > 0,
+                  'the shim executor really ticked in-game (%s ticks)', tostring(ticks))
+            check(raised == '0', 'no shim tick raised (got %s)', tostring(raised))
+            check(clientOut:find('UI backend shim.g_ui', 1, true) ~= nil,
+                  'the real OTML/style UI backend was used, not the provisional one')
+            check(clientOut:find('READ-ONLY', 1, true) ~= nil,
+                  'the shim ran read-only, so the user profile was not written')
+        end
     end
 
     io.write('===========================================================\n')

@@ -202,7 +202,18 @@ Api.prototype.call = function (name, args, opt) {
   try { path = rpc.buildPath(ep.path, params, query); }
   catch (e) { return Promise.reject(e); }
 
-  var sendBody = (ep.method === 'GET' || ep.method === 'DELETE') ? null : (hasBody ? body : {});
+  /* A DELETE carries its id in the PATH, so it has nothing to say in a body --
+     but it must still send one, because the hub's first CSRF check refuses any
+     state-changing request that is not `Content-Type: application/json`, and
+     panel/rpc.js only sets that header when there is a body.  Sending `null`
+     here made every DELETE the panel can issue -- delete instance / game
+     account / character / proxy / script, revoke a session, delete a web
+     account, and Sign out -- answer 415 csrf-invalid against a real hub.  The
+     test harness never saw it: test/hube2esuite.lua's `rest()` helper sets the
+     header itself for every non-GET, so it does not reproduce what the browser
+     actually sends.  An empty object is the smallest thing that satisfies the
+     check without weakening it. */
+  var sendBody = (ep.method === 'GET') ? null : (hasBody ? body : {});
   return this.http.request(ep.method, path, sendBody, opt).then(function (r) {
     return r;
   }, function (e) {

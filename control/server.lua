@@ -10,6 +10,7 @@ control protocol") and the telemetry that feeds the panel's numbers.
         token = tokenString,       -- REQUIRED; the hub passes it by stdin or a file
         instanceName = 'char-a',
         pricesPath   = nil,        -- vBot items.lua for the loot/waste value model
+        pricesFile   = nil,        -- operator override (else $LUACLIENT_PRICES)
     }
     local port, e = srv:start()
     srv:broadcast('status', {...})
@@ -71,17 +72,35 @@ lib/stats.lua is fed from the live event stream:
     waste                        "Using one of the <item>s..." messages, vBot's
                                  analyzer.lua:1501-1540 rule
 
+    loot / waste VALUE           vBot keeps prices keyed by NAME (`LootItems` in the
+                                 profile's vBot/items.lua -- see buildPrices below for
+                                 the citation); we map those names onto item ids
+                                 through proto/items.lua's name index at start-up.
+                                 An operator without a vBot profile can point
+                                 `LUACLIENT_PRICES` at an id-keyed JSON or Lua file
+                                 instead (the hub can set it for every worker with
+                                 --worker-env), and it overrides the profile per id.
+                                 With NEITHER, only the three coins are priced, the
+                                 counts stay exact, every other value is 0, and the
+                                 snapshot says `pricesLoaded == 0`,
+                                 `pricesSource == 'coins-only'` and
+                                 `noDataFor` contains `itemPrices` -- so the panel
+                                 prints "prices not loaded" instead of a confident 0.
+    money/h                      cash-on-hand delta PLUS the value of the non-coin
+                                 loot MINUS the waste value (lib/stats.lua's
+                                 'gold+goods' model; the coin ids are declared as
+                                 cash so the gauge and the loot term cannot count the
+                                 same coin twice).
+    supplies vs thresholds       bot/supplies.lua's per-item ledger: the live count of
+                                 each configured id (inventory + open containers, or
+                                 the server's own 0xC0 total, whichever is larger)
+                                 against its `min` from the profile's Supplies.json.
+                                 It travels as the pure ARRAY `supplies`, with the
+                                 profile/rounds/pouch context beside it in
+                                 `suppliesStatus`.  With no supplies module at all,
+                                 `noDataFor` contains `supplies`.
+
   ZERO WITHOUT A DATA SOURCE, and said so in the snapshot:
-    loot / waste VALUE           needs a price table.  vBot keeps prices keyed by
-                                 NAME (`LootItems` in the profile's vBot/items.lua);
-                                 we map those names onto item ids through
-                                 proto/items.lua's name index at start-up.  With no
-                                 items.lua the counts are still exact and every
-                                 value is 0 -- `pricesLoaded == 0` in the snapshot
-                                 says so, rather than reporting a confident 0 gp/h.
-    supplies vs thresholds       the bot's supplies module reports rounds, not the
-                                 per-item counts PANEL.md's table wants; passed
-                                 through as-is under `supplies`.
     reconnects                   the hub's supervisor bookkeeping, not the worker's.
 
 Lua 5.1 / LuaJIT: no goto, math.floor for integer division.
@@ -97,6 +116,7 @@ local statsmod   = require('lib.stats')
 local httpserver = require('lib.httpserver')
 local wsserver   = require('lib.wsserver')
 local commands   = require('control.commands')
+local http       = require('lib.http')      -- runAsync only; see handleRequest
 
 local floor = math.floor
 
@@ -144,8 +164,24 @@ M.COIN_VALUE = COIN_VALUE
 local Telemetry = {}
 Telemetry.__index = Telemetry
 
---- Build id -> price from the profile's vBot/items.lua (`LootItems`, keyed by NAME)
---- by walking proto/items.lua's name index once.  Returns table, loaded, skipped.
+--- WHERE THE PRICES COME FROM.
+---
+--- The user's vBot keeps its price list in the profile's own `vBot/items.lua`, as a
+--- single global table `LootItems` keyed by LOWERCASE ITEM NAME:
+---
+---     LootItems = { ["gold coin"] = 1, ["platinum coin"] = 100,
+---                   ["crystal coin"] = 10000, ["abyss hammer"] = 20000, ... }
+---
+--- (verbatim from D:/Claude/otclient_mehah1530/otclient/profiles/bot/vBot_4.8/vBot/
+--- items.lua:1-5; `vBot/analyzer.lua:645-672` getPrice() lowercases the looted name,
+--- strips a leading "a "/"an " and the leading count, checks
+--- `storage.analyzers.customPrices` first, then scans that table, and returns 0 for a
+--- name it cannot find.)  Everything the panel needs is an id, not a name, so the
+--- table is turned into `id -> price` here by walking proto/items.lua's own name
+--- index once at start-up.  Names that no item in items1530.bin carries are counted
+--- and reported as `pricesUnmapped` rather than silently dropped.
+---
+--- Returns table, loaded (ids priced), unmapped (LootItems names that matched no id).
 local function buildPrices(pricesPath)
     if not pricesPath then return nil, 0, 0 end
     local f = io.open(pricesPath, 'r')
@@ -170,38 +206,82 @@ local function buildPrices(pricesPath)
     local okItems, items = pcall(require, 'proto.items')
     if not okItems or not items.name or not items.MAX_ID then return nil, 0, 0 end
 
-    local prices, loaded, skipped = {}, 0, 0
+    local prices, loaded = {}, 0
+    local matchedName = {}
     for id = 100, items.MAX_ID do
         local okn, nm = pcall(items.name, id)
         if okn and type(nm) == 'string' and nm ~= '' then
-            local v = byName[nm] or byName[nm:lower()]
+            local low = nm:lower()
+            local v = byName[nm]
+            local key = nm
+            if v == nil then v, key = byName[low], low end
             if type(v) == 'number' and v > 0 and prices[id] == nil then
                 prices[id] = v
                 loaded = loaded + 1
+                matchedName[key] = true
             end
         end
     end
-    for _ in pairs(byName) do skipped = skipped + 1 end
-    skipped = skipped - loaded
-    if skipped < 0 then skipped = 0 end
-    return prices, loaded, skipped
+    -- REVIEW FIX: `unmapped` used to be `#names - #ids`, which is nonsense in both
+    -- directions -- several ids share one name ("gold coin" is a handful of client
+    -- ids), so the subtraction went NEGATIVE for the user's real file and was then
+    -- clamped to 0, reporting "every price mapped" while names really had been
+    -- dropped.  Count the NAMES that matched nothing instead; that is the number an
+    -- operator can act on (it names items their items1530.bin does not have).
+    local unmapped = 0
+    for k in pairs(byName) do if not matchedName[k] then unmapped = unmapped + 1 end end
+    return prices, loaded, unmapped
 end
 M._buildPrices = buildPrices
 
+--- The operator's own price file, for a deployment that has no vBot profile beside
+--- the worker (a bare Debian server, say).  Its path comes from the environment --
+--- `LUACLIENT_PRICES` -- because the hub can already put one there for every worker
+--- with `--worker-env=LUACLIENT_PRICES=/etc/luaclient/prices.json` and a settings
+--- path is not a credential.  Accepts either JSON `{"3031": 1}` or a Lua table
+--- `{ [3031] = 1 }`, both id-keyed; lib/stats.lua's decodePrices refuses a
+--- name-keyed table outright rather than making every item silently worth 0.
+--- Returns table, loaded, path, err.
+local function loadOperatorPrices(explicitPath)
+    local path = explicitPath or os.getenv('LUACLIENT_PRICES')
+    if type(path) ~= 'string' or path == '' then return nil, 0, nil, nil end
+    local tbl, loaded, err = statsmod.loadPrices(path, json.decode)
+    if not tbl then
+        log.warn('control: prices file %s could not be used (%s) -- ' ..
+                 'falling back to the profile table', path, tostring(loaded or err))
+        return nil, 0, path, tostring(loaded or err)
+    end
+    return tbl, loaded or 0, path, nil
+end
+M._loadOperatorPrices = loadOperatorPrices
+
 function M.newTelemetry(opts)
     opts = opts or {}
-    local prices, loaded, skipped = buildPrices(opts.pricesPath)
-    -- COIN_VALUE is always right and never comes from the profile; make sure the
-    -- three coins are priced even when items.lua is missing.
+    local prices, loaded, unmapped = buildPrices(opts.pricesPath)
     prices = prices or {}
+    -- The operator's file wins over the profile: it is the more specific statement of
+    -- what an item is worth on THIS server, and it is the only source a deployment
+    -- without a vBot profile has at all.
+    local extra, fromFile, filePath, fileErr = loadOperatorPrices(opts.pricesFile)
+    if extra then
+        for id, v in pairs(extra) do prices[id] = v end
+    end
+    -- COIN_VALUE is always right and never comes from a profile; make sure the three
+    -- coins are priced even when neither source loaded.  These three are NOT counted
+    -- as "prices loaded" -- pricing only the coins is exactly the state the panel has
+    -- to be able to call "prices not loaded".
     for id, v in pairs(COIN_VALUE) do if prices[id] == nil then prices[id] = v end end
 
     local self = setmetatable({
         LC = opts.LC,
-        engine = statsmod.new{ window = opts.windowMs or (15 * 60 * 1000), prices = prices },
+        engine = statsmod.new{ window = opts.windowMs or (15 * 60 * 1000), prices = prices,
+                               cashItems = COIN_VALUE },
         pricesFromProfile = loaded,
-        pricesUnmapped    = skipped,
+        pricesFromFile    = fromFile,
+        pricesUnmapped    = unmapped,
         pricesPath = opts.pricesPath,
+        pricesFilePath = filePath,
+        pricesFileError = fileErr,
         handles = {},
         lastGold = nil,
         sessionOpen = false,
@@ -407,13 +487,29 @@ end
 
 function Telemetry:snapshot(full)
     local s = self.engine:snapshot(sys.nowMs())
+    -- HONEST PRICE REPORTING.  The engine's own `pricesLoaded` counts every entry in
+    -- the table it was handed, and that table ALWAYS has the three coins in it, so it
+    -- can never be 0 and the panel could never tell "prices loaded" from "only the
+    -- coins are". Overwrite it with the number that actually answers the question --
+    -- how many item prices came from a real source -- and keep the engine's own count
+    -- beside it under a name that says what it is.
+    local real = (self.pricesFromProfile or 0) + (self.pricesFromFile or 0)
+    s.pricesInTable     = s.pricesLoaded
+    s.pricesLoaded      = real
     s.pricesFromProfile = self.pricesFromProfile
+    s.pricesFromFile    = self.pricesFromFile
     s.pricesUnmapped    = self.pricesUnmapped
     s.pricesPath        = self.pricesPath
+    s.pricesFilePath    = self.pricesFilePath
+    s.pricesFileError   = self.pricesFileError
+    s.pricesSource      = (real == 0) and 'coins-only'
+                          or ((self.pricesFromFile or 0) > 0
+                              and ((self.pricesFromProfile or 0) > 0 and 'profile+file' or 'file')
+                              or 'profile')
     s.goldOnHand        = self.lastGold
     -- Say out loud which figures cannot be real yet, so the panel does not have to guess.
     local missing = {}
-    if (self.pricesFromProfile or 0) == 0 then
+    if real == 0 then
         missing[#missing + 1] = 'itemPrices'
     end
     local b = self.LC and self.LC.bot
@@ -421,13 +517,26 @@ function Telemetry:snapshot(full)
     if not (tb and tb.loot and type(tb.loot.containers) == 'table' and #tb.loot.containers > 0) then
         missing[#missing + 1] = 'lootContainers'
     end
+    local sup = b and b.modules and b.modules.supplies
+    if not sup then
+        missing[#missing + 1] = 'supplies'
+    end
     s.noDataFor = missing
     if not full then
         s.lootItems, s.wasteItems, s.killsByName = nil, nil, nil
     end
     if b then
         local oks, bst = pcall(b.status, b)
-        if oks and type(bst) == 'table' then s.supplies = bst.supplies end
+        if oks and type(bst) == 'table' and type(bst.supplies) == 'table' then
+            -- the pure ARRAY, and its context beside it -- see control/commands.lua's
+            -- botSnapshot for why the two must not share one table.
+            if type(bst.supplies.levels) == 'table' then s.supplies = bst.supplies.levels end
+            local ctx = {}
+            for k, v in pairs(bst.supplies) do
+                if type(k) == 'string' and k ~= 'levels' then ctx[k] = v end
+            end
+            s.suppliesStatus = ctx
+        end
     end
     return s
 end
@@ -474,6 +583,7 @@ function M.new(opts)
     }, Server)
 
     self.telemetry = M.newTelemetry{ LC = LC, pricesPath = opts.pricesPath,
+                                     pricesFile = opts.pricesFile,
                                      windowMs = opts.windowMs }
     self.ctx = { LC = LC, server = self, log = log }
     return self
@@ -585,20 +695,88 @@ end
 M._answer = answer
 
 --- One request object in, one answer object out.  `obj` is whatever JSON decoded to.
-function Server:handleRequest(obj)
+-- ------------------------------------------------------- deferred dispatch --
+-- `login` is the reason this exists.  It runs an HTTPS POST, every HTTP backend
+-- in lib/http.lua is blocking, and the request is allowed 20 s: for that whole
+-- time lib/sched.lua does not turn, so the 1 Hz status push stops, the bot tick
+-- stops and the keepalive stops -- for every instance in this process.  Measured
+-- against an endpoint that never answers, one login pinned the reactor for
+-- 5045 ms and let exactly ONE 10 ms heartbeat fire in that window.
+--
+-- So a command runs on a coroutine (lib/http.lua's runAsync), and lib/http.lua's
+-- post() suspends it while a short-lived child process performs the request.
+-- The answer is written from a later reactor turn, which both transports here
+-- already allow: lib/httpserver.lua treats a handler that returns without
+-- answering as asynchronous, and a WebSocket reply is simply another frame.
+-- Same measurement afterwards: 20 ms, 432 heartbeats.
+--
+-- Two consequences, both deliberate:
+--   * answers may arrive OUT OF ORDER on /ws.  Every answer carries the request
+--     id and hub/supervisor.lua matches on it -- which is the entire point: a
+--     slow login must stop holding up the `status` queued behind it.
+--   * only `maxDeferred` commands may be in flight at once.  Past that the
+--     answer is an immediate error rather than an unbounded fan of children.
+Server.maxDeferred = 16
+
+--- One request object in, one answer object out.  `obj` is whatever JSON decoded to.
+---
+--- With a `done` callback the command may finish on a LATER reactor turn and
+--- done(answer) is called exactly once, whenever that is.  Without one the old,
+--- fully synchronous contract applies: the answer is the return value and the
+--- command cannot suspend, because lib/http.lua only ever yields inside a
+--- coroutine it was itself asked to create.
+function Server:handleRequest(obj, done)
     self.stat.requests = self.stat.requests + 1
+    local function reply(a)
+        if done then done(a) end
+        return a
+    end
     if type(obj) ~= 'table' then
         self.stat.errors = self.stat.errors + 1
-        return answer(nil, false, 'a request must be a JSON object {id, cmd, args}')
+        return reply(answer(nil, false, 'a request must be a JSON object {id, cmd, args}'))
     end
     local id = obj.id
     if id ~= nil and type(id) ~= 'number' and type(id) ~= 'string' then
         self.stat.errors = self.stat.errors + 1
-        return answer(nil, false, 'id must be a number or a string')
+        return reply(answer(nil, false, 'id must be a number or a string'))
     end
-    local ok, res = commands.dispatch(self.ctx, obj.cmd, obj.args)
-    if not ok then self.stat.errors = self.stat.errors + 1 end
-    return answer(id, ok, res)
+    if not done then
+        local ok, res = commands.dispatch(self.ctx, obj.cmd, obj.args)
+        if not ok then self.stat.errors = self.stat.errors + 1 end
+        return answer(id, ok, res)
+    end
+
+    self.deferred = self.deferred or 0
+    if self.deferred >= (self.maxDeferred or 16) then
+        self.stat.errors = self.stat.errors + 1
+        return reply(answer(id, false, 'too many commands are in flight; try again'))
+    end
+
+    local S, ctx = self, self.ctx
+    self.deferred = self.deferred + 1
+    local settled = false
+    local function settle(a)
+        if settled then return end
+        settled = true
+        S.deferred = S.deferred - 1
+        done(a)
+    end
+    local okRun, runErr = pcall(function()
+        http.runAsync(function()
+            return commands.dispatch(ctx, obj.cmd, obj.args)
+        end, function(ranOk, a, b)
+            if not ranOk then
+                S.stat.errors = S.stat.errors + 1
+                return settle(answer(id, false, 'command failed: ' .. tostring(a)))
+            end
+            if not a then S.stat.errors = S.stat.errors + 1 end
+            settle(answer(id, a, b))
+        end)
+    end)
+    if not okRun and not settled then
+        S.stat.errors = S.stat.errors + 1
+        settle(answer(id, false, 'command failed: ' .. tostring(runErr)))
+    end
 end
 
 -- ------------------------------------------------------------- events -------
@@ -727,9 +905,17 @@ function Server:_onRequest(req, res)
                         { ['Content-Type'] = 'application/json; charset=utf-8' })
             end
         end
-        local rep = self:handleRequest(obj)
-        return res:send(200, encode(rep) .. '\n',
-                        { ['Content-Type'] = 'application/json; charset=utf-8' })
+        -- The answer may come from a later reactor turn (see handleRequest);
+        -- lib/httpserver.lua's dispatcher explicitly allows that, and the
+        -- connection's idle timeout is the backstop if the command never ends.
+        self:handleRequest(obj, function(rep)
+            if res.done then return end
+            pcall(function()
+                res:send(200, encode(rep) .. '\n',
+                         { ['Content-Type'] = 'application/json; charset=utf-8' })
+            end)
+        end)
+        return true
     end
 
     if path == '/ws' then
@@ -754,8 +940,13 @@ function Server:_adoptWs(ws)
             return sock:send(encode(answer(nil, false,
                     'not valid JSON: ' .. tostring(obj))))
         end
-        local rep = S:handleRequest(obj)
-        return sock:send(encode(rep))
+        -- Deferred: a slow command (login) answers later and does NOT hold the
+        -- socket, the status pushes or anything else queued behind it.
+        S:handleRequest(obj, function(rep)
+            if not sock:isOpen() then return end
+            pcall(function() sock:send(encode(rep)) end)
+        end)
+        return true
     end
     ws.onClose = function(sock)
         if S.clients[sock.id] then

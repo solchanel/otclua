@@ -280,7 +280,26 @@ local function botSnapshot(LC)
     end
     out.healbot   = st.healbot   and { on = st.healbot.on } or nil
     out.attackbot = st.attackbot and { on = st.attackbot.on } or nil
-    out.supplies  = st.supplies
+    -- Supplies travel as TWO fields on purpose.  `supplies` is bot/supplies.lua's
+    -- pure per-item ARRAY (itemId, name, count, threshold, ok) -- the shape
+    -- hub/supervisor.lua's flattenLive forwards and panel/app.js draws.
+    -- `suppliesStatus` is the context around it (profile, rounds, pouch pages,
+    -- how many items are below their minimum).  Mixing the two in one table was
+    -- what made every encoder on the way to the browser emit an object and the
+    -- panel say "no supply data".
+    local sup = st.supplies
+    if type(sup) == 'table' then
+        if type(sup.levels) == 'table' then out.supplies = sup.levels
+        elseif sup[1] ~= nil then out.supplies = nil end   -- a pre-ledger worker: no rows
+        -- Only the STRING keys: the status table still carries the rows in its array
+        -- part for in-process readers, and copying those in here would recreate
+        -- exactly the mixed-key table this split exists to avoid.
+        local ctx = {}
+        for k, v in pairs(sup) do
+            if type(k) == 'string' and k ~= 'levels' then ctx[k] = v end
+        end
+        out.suppliesStatus = ctx
+    end
     local reg = b._controlScripts
     if reg then
         local names = {}
@@ -342,6 +361,11 @@ function M.statusSnapshot(ctx)
             lootPerHour = s.lootPerHour, wastePerHour = s.wastePerHour,
             balance = s.balance, kills = s.kills, deaths = s.deaths,
             level = s.level, sessionMs = s.sessionMs,
+            -- The panel has to be able to say "prices not loaded" rather than draw a
+            -- confident 0 gp/h, and the 1 Hz `status` push is what it has between
+            -- `stats` pushes -- so the provenance travels with the number.
+            moneySource = s.moneySource, pricesLoaded = s.pricesLoaded,
+            pricesSource = s.pricesSource, noDataFor = s.noDataFor,
         }
     end
     return out
@@ -550,6 +574,23 @@ cmds['say'] = function(ctx, args)
     if g and type(g.talk) == 'function' then
         local ok, e = pcall(g.talk, g, text)
         if not ok then return nil, tostring(e) end
+        return { said = text, channel = a.channel }
+    end
+    -- Last resort: the raw sender.  A worker started WITHOUT --bot has no bot.api
+    -- and main.lua exposes no LC.game at all, so before this the panel's Chat tab
+    -- could not speak in a perfectly healthy session -- `say` answered "there is no
+    -- game session to speak in" while the character was standing in the world.
+    -- proto/sender.lua:344 talk(mode, channelId, receiver, text) is the same packet
+    -- bot/api.lua's ctx.say ends up sending for a non-spell message.
+    local s = LC.sender
+    if s and type(s.talk) == 'function' and LC.transport and not LC.transport.dead then
+        -- proto/sender.lua's MODE: Say = 1, Channel = 7 (the only one of the two
+        -- that puts a u16 channel id on the wire).
+        local mode, channelId = 1, 0
+        if type(a.channel) == 'number' then mode, channelId = 7, a.channel end
+        local ok, e = pcall(s.talk, s, mode, channelId, '', text)
+        if not ok then return nil, tostring(e) end
+        if e == nil then return nil, 'the message was refused by the sender' end
         return { said = text, channel = a.channel }
     end
     return nil, 'there is no game session to speak in'

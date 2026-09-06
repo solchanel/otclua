@@ -10,6 +10,8 @@ the spec body and is followed here.
     sup:items()            -> { [itemId] = {min=,max=,avg=} }
     sup:additionalData()   -> { stamina=, capacity=, softBoots=, imbues=, lootPouch= }
     sup:itemAmount(id[,tier])
+    sup:levels()           -> { [itemId] = {have=, threshold=, max=, name=, ok=} }
+    sup:ledger()           -> ARRAY [{itemId, name, count, threshold, max, ok, ...}]
     sup:hasEnough()        -> true | { id=, amount= }        (vBot Supplies.hasEnough)
     sup:missing()          -> ordered list of every id below its min
     sup:buyList()          -> { {id=, amount=} }  amount = min(100, max - have)
@@ -238,6 +240,115 @@ function S:itemAmount(itemId, tier)
 end
 
 -- ---------------------------------------------------------------------------
+-- THE PER-ITEM LEDGER (PANEL.md "Supplies vs thresholds")
+-- ---------------------------------------------------------------------------
+-- `itemAmount` is one full scan of the inventory and every open container PER
+-- ITEM.  The panel wants every configured id at 1 Hz, so doing it that way is
+-- O(items x open slots) every second.  `scanCounts` walks the inventory and the
+-- containers ONCE and buckets only the ids we care about, which is O(open slots)
+-- no matter how many supply items the profile lists.
+--
+-- The result is deliberately NOT cached: `state.player.inventory` and
+-- `state.containers` are the live tables proto/parser.lua writes into, so a
+-- recount is exactly "refreshed as the containers change" with no invalidation
+-- hook to get wrong.  The cost is a few hundred table reads per second.
+--
+-- The breakdown is kept because the two halves answer different questions:
+--   inventory  what is equipped / in the purse-adjacent slots (slots 1..10)
+--   containers what is in the OPEN supply backpacks
+--   server     the server's own 0xC0 total, which also covers CLOSED bags and is
+--              the only number that does not go stale when a bag is shut
+-- `count` is max(inventory+containers, server) -- vlib.lua:822-888's rule, the one
+-- that stops a closed-but-full backpack from reading as zero and looping refills.
+function S:scanCounts(ids)
+    local inv, cont = {}, {}
+    for i = 1, #ids do inv[ids[i]] = 0; cont[ids[i]] = 0 end
+    local st = self.state
+    if not st then return inv, cont end
+    local p = st.player
+    if p and p.inventory then
+        for slot = supplies.INVENTORY_FIRST, supplies.INVENTORY_LAST do
+            local it = p.inventory[slot]
+            if it and inv[it.id] ~= nil then inv[it.id] = inv[it.id] + (it.count or 1) end
+        end
+    end
+    for _, c in pairs(st.containers or {}) do
+        for _, it in ipairs(c.items or {}) do
+            if it and cont[it.id] ~= nil then cont[it.id] = cont[it.id] + (it.count or 1) end
+        end
+    end
+    return inv, cont
+end
+
+--- Item names come from proto/items.lua when the item table was loaded (the worker
+--- loads it at boot); a bot running without it still gets a stable label instead of
+--- a nil the panel would have to guess at.  Cached because a name never changes.
+function S:itemName(id)
+    self._names = self._names or {}
+    local cached = self._names[id]
+    if cached ~= nil then return cached end
+    local name
+    local ok, items = pcall(require, 'proto.items')
+    if ok and type(items) == 'table' and items.loaded and type(items.name) == 'function' then
+        local okn, nm = pcall(items.name, id)
+        if okn and type(nm) == 'string' and nm ~= '' then name = nm end
+    end
+    if not name then name = 'item ' .. tostring(id) end
+    self._names[id] = name
+    return name
+end
+
+--- ledger() -> ARRAY, one entry per configured supply item, in the same
+--- deterministic id order the round gate uses.
+---
+--- It is an array with NO named keys on purpose.  The panel does
+--- `Array.isArray(L.supplies)`, control/server.lua's jsonSafe classifies a table
+--- with any non-integer key as a JSON OBJECT, and hub/supervisor.lua's
+--- flattenLive drops anything that is not a list -- so a status object that
+--- carried its item rows in its array part arrived at the browser as an object
+--- and the column said "no supply data".  The context (profile, rounds, pouch
+--- pages) travels beside it in status(), never inside it.
+function S:ledger()
+    local order = self._itemOrder
+    local inv, cont = self:scanCounts(order)
+    local out = {}
+    for i = 1, #order do
+        local id = order[i]
+        local v  = self._items[id]
+        local visible = (inv[id] or 0) + (cont[id] or 0)
+        local server  = self:serverCount(id)
+        local count   = max(visible, server)
+        local min     = v.min or 0
+        out[i] = {
+            itemId    = id,
+            item      = id,                  -- BOT.md's original field name
+            name      = self:itemName(id),
+            count     = count,
+            threshold = min,
+            min       = min,                 -- panel/app.js reads `min`
+            max       = v.max or 0,
+            ok        = count >= min,
+            inInventory = inv[id] or 0,
+            inContainers = cont[id] or 0,
+            serverCount = server,
+        }
+    end
+    return out
+end
+
+--- PANEL.md's requested shape: `supplies:levels() -> {[itemId]={have,threshold,name}}`.
+function S:levels()
+    local out = {}
+    local rows = self:ledger()
+    for i = 1, #rows do
+        local r = rows[i]
+        out[r.itemId] = { have = r.count, threshold = r.threshold, max = r.max,
+                          name = r.name, ok = r.ok }
+    end
+    return out
+end
+
+-- ---------------------------------------------------------------------------
 -- Supplies.hasEnough() (vBot/supplies.lua:396-497)
 -- ---------------------------------------------------------------------------
 --- true when every configured id is at or above its min; otherwise the FIRST
@@ -447,17 +558,32 @@ end
 -- ---------------------------------------------------------------------------
 -- status (BOT.md status object: supplies = {{item, count, threshold}})
 -- ---------------------------------------------------------------------------
---- BOT.md's status object spells `supplies = {{item, count, threshold}}`, i.e. an ARRAY.
---- The array part carries exactly that; the named fields are extra context for the web
---- panel and do not disturb ipairs / # over it.  Deliberately NO self-referencing alias:
---- bot/config.lua's jsonEncode would not survive a cycle.
+--- BOT.md's status object spells `supplies = {{item, count, threshold}}`, i.e. an
+--- ARRAY, and in-process callers (bot/cavebot.lua, the bot suites) read it that way --
+--- so the array part still carries exactly that, now filled from the ledger.
+---
+--- What is new is `levels`: the SAME rows in a table with no named keys.  That matters
+--- the moment the status leaves the process.  A table with both integer and string
+--- keys is a JSON *object* to every encoder on the way to the browser
+--- (control/server.lua's jsonSafe classifies it that way, and rxi-json refuses the
+--- mixture outright), so hub/supervisor.lua's flattenLive saw "not a list", demoted it
+--- to `suppliesStatus`, and the panel's supplies column said "no supply data" while
+--- the worker had the numbers all along.  control/commands.lua forwards `levels` as
+--- the wire's `supplies` and everything else as `suppliesStatus`.
+---
+--- `levels` is a sibling of the status table, not an alias of it: bot/config.lua's
+--- jsonEncode would not survive the cycle a self-reference would create.
 function S:status()
-    local st = {}
-    for _, id in ipairs(self._itemOrder) do
-        local v = self._items[id]
-        st[#st + 1] = { item = id, count = self:itemAmount(id),
-                        threshold = v.min, max = v.max }
+    local levels = self:ledger()
+    local st, low = {}, 0
+    for i = 1, #levels do
+        st[i] = levels[i]
+        if not levels[i].ok then low = low + 1 end
     end
+    st.levels     = levels
+    st.items      = #levels
+    st.low        = low
+    st.ok         = (low == 0)
     st.on         = self:isOn()
     st.profile    = self.profileName
     st.extra      = self._extra
