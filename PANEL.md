@@ -391,6 +391,8 @@ GET/POST/DELETE /api/session          POST /api/session/password   POST /api/boo
 GET/POST        /api/instances        POST /api/instances/actions  (start|stop|restart|botEnable)
 GET/PATCH/DELETE/api/instances/:id    GET  /api/instances/:id/configs|history|logs|chat
 PUT  /api/instances/:id/macros/:name  POST /api/instances/:id/reload|exec|chat
+GET/PUT         /api/instances/:id/config/:kind        (CONFIGAPI.md -- BUILT, see below)
+GET             /api/instances/:id/config/:kind/list
 GET/POST        /api/accounts         PATCH/DELETE /api/accounts/:id
 GET/POST        /api/characters       DELETE /api/characters/:id
 GET/POST        /api/proxies          PATCH/DELETE /api/proxies/:id   POST /api/proxies/:id/test
@@ -412,6 +414,29 @@ token closes the socket with **4401**, which is what tells the panel to stop ret
 frames go **only** to sockets subscribed to that instance. `POST /api/rpc` and `GET /api/events`
 remain as an older command-envelope surface for non-browser clients and the hub's own tests.
 
+## Bot configuration API (CONFIGAPI.md) — BUILT
+
+The six vBot config "kinds" (healbot, conditions, attackbot, stances, targetbot, cavebot) are
+readable and writable from the panel whether the instance is running or stopped, through
+`GET/PUT /api/instances/:id/config/:kind` and `GET .../config/:kind/list`. Routing:
+**running** → forwarded over the worker's control socket to `control/commands.lua`'s
+`config.get`/`config.set`/`config.list`, so the change applies to the live, in-memory bot
+immediately (proven: a HealBot threshold PUT changes what the very next macro tick sends, no
+restart); **stopped** → `hub/botconfig.lua` reads/writes the profile's files directly, through the
+exact same `bot/config.lua` codec the running path's `:reload()`/save calls use, so the two paths
+never diverge. Both paths validate against the one shared `bot/configschema.lua`.
+
+Security: a cavebot `function`-type waypoint carries a raw Lua chunk (equivalent to `exec`), so a
+`config.set` for `cavebot` needs the same `EXEC_CAPABILITY` (admin, or `canExec`) as `instance.exec`
+**only when the diff adds or changes a function body** — every other cavebot edit, and every other
+kind's edit, needs only the normal instance-owner permission. Proven live in both directions
+against a real running worker: a plain user with no `canExec` is refused (403) adding a function
+waypoint but can freely edit a `goto` value; granting `canExec` makes the identical PUT succeed.
+Every PUT is audited as `instance.config`, with the full new body when a function changed.
+
+See CONFIGAPI.md for the full contract (per-kind shapes, the schema module, the security rule) and
+its "As built — corrections" section for the two prose/reality mismatches this build fixed.
+
 ## Panel UI — BUILT
 
 Single page, vanilla JS, served by the hub, dark theme, no build step and no CDN.
@@ -420,8 +445,11 @@ Single page, vanilla JS, served by the hub, dark theme, no build step and no CDN
 * **Dashboard**: table of all instances — character, level, exp/h, money/h, hp/mana, state, target,
   waypoint, uptime — with bulk start/stop/restart/enable-bot actions.
 * **Instance view**: tabs for Overview (stats + canvas charts), Bot (cavebot/targetbot/profile
-  pickers, macro toggles, assigned scripts, auto-start/auto-relogin, reload), Console (log stream,
-  Lua exec), Chat.
+  pickers, macro toggles, assigned scripts, auto-start/auto-relogin, reload), **Bot Config**
+  (CONFIGAPI.md, BUILT — six lazily-loaded cards: Healing, Conditions, Attack, Stances, Targeting,
+  CaveBot; add/duplicate/remove/reorder rows, per-card Save/Revert, a CaveBot `function` waypoint
+  gated on the same `canExec` check the Console tab already uses), Console (log stream, Lua exec),
+  Chat.
 * **Characters & accounts**: add/remove game accounts and characters, assign proxies (with a Test
   button).
 * **Scripts**: upload, view, assign to instances, delete.

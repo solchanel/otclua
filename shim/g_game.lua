@@ -76,7 +76,13 @@ function M.new(LC, reg, opts)
     -- ------------------------------------------------------------------ state
     local attackingId, followingId = 0, 0
     local features   = {}
-    local fightMode, chaseMode, safeFight, pvpMode = 1, 0, false, 0
+    -- game.cpp:69-70's own construction defaults: m_fightMode = FightBalanced(unused by
+    -- this shim's own callers, which pass their own `mode`), m_chaseMode = DontChase,
+    -- m_pvpMode = WhiteDove(0), m_safeFight = true.  REVIEW FIX: this used to start
+    -- safeFight at `false`, so a ported vBot script calling g_game.isSafeFight() before
+    -- ever calling a setter itself (or before the first live 0xA7 PlayerModes update) got
+    -- the opposite of what the real client would report at the same point.
+    local fightMode, chaseMode, safeFight, pvpMode = 1, 0, true, 0
     local tileThingLuaCallback = false
     local unjustified = { killsDay = 0, killsDayRemaining = 0,
                           killsWeek = 0, killsWeekRemaining = 0,

@@ -4,8 +4,8 @@
 standalone LuaJIT client, unmodified.** 74/74 profile files, 27/27
 `mods/game_bot` runtime files, 47–48 macros, on Windows and on Debian, with no
 game client, no OpenGL and no game server — and, since the behaviour pass, with
-the exact packets HealBot / AttackBot / CaveBot / TargetBot / the looter put on
-the wire asserted byte for byte (§3.2), cross-checked against the native engines,
+the exact packets HealBot / AttackBot / CaveBot / TargetBot / the looter / Dropper
+put on the wire asserted byte for byte (§3.2), cross-checked against the native engines,
 and the whole tree run twice against the **live** server (§3.3).
 
     luajit main.lua --vbot ...                 # instead of --bot
@@ -95,7 +95,7 @@ never heals scores exactly the same as one that heals correctly — "loaded, ran
 
 ### 3.2 Verified by BEHAVIOUR — `test/shim_behaviour_suite.lua`
 
-    luajit test/shim_behaviour_suite.lua        -- 123 checks, 0 failed
+    luajit test/shim_behaviour_suite.lua        -- 131 checks, 0 failed
                                                 -- Windows LuaJIT and Debian/WSL LuaJIT
 
 For each subsystem the suite builds a world in which the correct action is
@@ -120,7 +120,8 @@ wire is much stronger evidence than either agreeing with a hand-written guess.
 |---|---|
 | **HealBot spells** | The user's real rules — `exura gran tio` at HP% ≤ 75 (210 mana), `exura gran` at HP% ≤ 95 (75 mana) — fire at the right threshold and *only* there: silence at 96%, `exura gran` from 95% down to 76%, `exura gran tio` from 75% down. Both boundaries are asserted, because vBot's `"<"` is really `<=`. The mana gate is asserted as the strict `cost < mana()` it is: at 208 mana the 210-cost heal is skipped and the cheap one fires (the bot degrades, it does not stall); at 72 mana nothing fires. A **real** 0xA4 + 0xA5 cooldown pair (2000 ms) holds every heal, is still holding at 1100 ms, and the cast resumes the tick the cooldown expires. |
 | **HealBot items** | `ultimate spirit potion` (23374) goes out as **0x84 useOnCreature on the player** at HP% ≤ 75 and at MP% ≤ 75, and not at 76% of either. The disabled `HP% < 40` rule stays disabled. The shared 1 s use-cooldown that HealBot and AttackBot both consume is asserted: a second attempt 500 ms later is silent, one 1100 ms later drinks again. |
-| **AttackBot** | Against the user's real 8-rule monk table: one monster in the pattern fires `exori mas pug` (Flurry of Blows, rule 7, count 1); two monsters fire `exori med pug` (Chained Penance, rule 3, count 2 — the earlier rule wins, which is what array order means here); a target 6 sqm away with nothing in the pattern **holds**, sending nothing at all. Auto-Turn is asserted on the wire: with the monster north and the player facing south the bot sends `0x6F turnN` and *then* the spell, in that order, in one tick. A real group-1 cooldown (2000 ms) holds the whole table and it resumes the moment the group clears. |
+| **AttackBot** | Against the user's real 8-rule monk table: one monster in the pattern fires `exori mas pug` (Flurry of Blows, rule 7, count 1); two monsters fire `exori med pug` (Chained Penance, rule 3, count 2 — the earlier rule wins, which is what array order means here); a target 6 sqm away with nothing in the pattern **holds**, sending nothing at all. Auto-Turn is asserted on the wire: with the monster north and the player facing south the bot sends `0x6F turnN` and *then* the spell, in that order, in one tick. A real group-1 cooldown (2000 ms) holds the whole table and it resumes the moment the group clears. The scenario is forced on through **`AttackBot.setOn()`** (the same public toggle a click on the panel switch calls) rather than asserted off the profile's raw `enabled` flag — that flag mirrors the user's *live* in-game toggle, which has since flipped to off outside this suite's control, and this scenario proves the firing logic, not the toggle. |
+| **Dropper** | `storage.dropper`'s cap/use/trash three-bucket scan (`vBot/Dropper.lua:127`), previously only crash-tested: a lone trash-listed item is dropped to the player's own tile (`0x78 move`); with a use-listed item *and* a trash-listed item both in the backpack the use-item wins (`0x82 use`), because the cap→use→trash scan checks bucket 2 before bucket 3; and a real starvation bug is caught and pinned down — a cap-listed item present while capacity is **fine** still consumes the macro's one `return` for that tick (the bucket's own `freecap() < 150` guard evaluates false, but the *match* already committed the return), so neither the use-item nor the trash-item one slot over gets touched that tick even though both are sitting right there. Lower capacity below the threshold on the next tick and the cap item drops as expected. |
 | **CaveBot** | A four-waypoint route (`label` / `goto` / `goto` / `gotolabel`) built through `CaveBot.addAction`: the bot walks 4 × `0x66 walkE` to the first waypoint, the program counter (`getFocusedChild`) advances on arrival, it walks south to the second, a plain `goto` with no precision marker **arrives within 1 tile** (it stops at y+3 for a y+4 waypoint — the real tolerance), the `gotolabel` jumps the counter back behind the label, and the route loops (it walks north again). The native engine walks the same route with the same step counts. |
 | **TargetBot** | With two monsters at **equal** distance — so vBot's +10 "path length 1" bonus cancels — the higher-priority config wins and `0xA1 attack` carries that creature's id. (At unequal distance the distance bonus can outrank the config priority; that is vBot's documented arithmetic, not a bug, which is why the test equalises distance.) With `keepDistance = 3` and the monster adjacent, the bot attacks and then steps **away** twice, and stops exactly 3 sqm out. |
 | **Looting** | A monster dies next to the player: `onCreatureDisappear` queues the corpse (with the creature's name), the next tick sends `0x82 use` **on the corpse tile**, and once the server answers with the opened container the listed gold coin leaves it as `0x78 move` addressed `0xFFFF,0x40+1,slot → 0xFFFF,0x40+0,slot`. An **unlisted** mana potion in the same corpse is left where it is. |
@@ -204,13 +205,14 @@ Every one of these passed the crash test and was still wrong.
 The behaviour suite closes the "no crashes ≠ correct" gap for the paths listed
 above. It does not close it everywhere, and the honest list is this:
 
-1. **Only the seven scenario families in §3.2 are behaviour-tested.** 47 macros
-   are registered; the suite drives 6 of them by their registration site
-   (HealBot ×2, AttackBot, CaveBot, TargetBot, and the looting path inside
-   TargetBot's tick). The other ~41 — Conditions, Equipper, combo, Stances,
-   Dropper, Containers, the analyzer, NaviBot, the depositor, imbuing, the
-   travel/bank/supply CaveBot extensions — are still only covered by the crash
-   test. They run; nobody has asserted *what* they send.
+1. **Only eight scenario families in §3.2 are behaviour-tested.** 47 macros
+   are registered; the suite drives 7 of them by their registration site
+   (HealBot ×2, AttackBot, CaveBot, TargetBot, the looting path inside
+   TargetBot's tick, and Dropper's cap/use/trash scan). The other ~40 —
+   Conditions, Equipper, combo, Stances, Containers, the analyzer, NaviBot,
+   the depositor, imbuing, the travel/bank/supply CaveBot extensions — are
+   still only covered by the crash test. They run; nobody has asserted *what*
+   they send.
 2. **The worlds are synthetic.** Ground, walls, creatures and containers are
    built by hand from `items1530.bin`. Real map geometry — stacked items,
    elevation, blocking corner cases, multi-floor stairs, houses, PZ borders —
@@ -642,7 +644,7 @@ it was and one of the three is C++-exact rather than missing.
 | `test/shim_ui_suite.lua` | 260 — the OTML parser, style registry and widget model, incl. the real `functions/ui*.lua` |
 | `test/shim_host_suite.lua` | 118 — the `modules.*` graph and the full boot of the real profile |
 | `test/shim_compat_suite.lua` | 89 — **that nothing crashes**: every macro, 31 otclient snippets, the callback bridge, hotkeys fired by hand, the closed gaps against the real profile, and every real `.cfg`/`.json` config |
-| **`test/shim_behaviour_suite.lua`** | **123 — that the bot does the RIGHT THING: the exact packet the real vBot code puts on the wire for HealBot spells and items, AttackBot, CaveBot, TargetBot, looting and 15 otclient idioms; 23 of those scenarios cross-checked packet-for-packet against the native `bot/*.lua` engines. See §3.2, and §3.5 for what it still does not prove** |
+| **`test/shim_behaviour_suite.lua`** | **131 — that the bot does the RIGHT THING: the exact packet the real vBot code puts on the wire for HealBot spells and items, AttackBot, CaveBot, TargetBot, looting, Dropper's cap/use/trash scan, and 15 otclient idioms; 25 of those scenarios cross-checked packet-for-packet against the native `bot/*.lua` engines. See §3.2, and §3.5 for what it still does not prove** |
 | `test/fakeserver.lua --vbot` | 44 — login over a real socket, shim boot, 240 in-game ticks |
 | `test/selftest.lua`, `test/botsuite.lua` | 2547 / 2137 — the native client and bot layer, unchanged |
 

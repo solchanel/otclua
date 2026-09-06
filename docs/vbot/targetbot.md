@@ -2,6 +2,8 @@
 
 # TargetBot — complete behavioural specification (vBot 4.8)
 
+> Implementation status per targeting/looting rule: **[docs/vbot/parity.md](parity.md) §3**.
+
 All citations are `file:line`. Source root `P = D:/Claude/otclient_mehah1530/otclient/profiles/bot/vBot_4.8`,
 `B = D:/Claude/otclient_mehah1530/otclient/mods/game_bot`, `S = D:/Claude/otclient_mehah1530/otclient/src`.
 

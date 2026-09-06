@@ -26,6 +26,7 @@
     compat.serializeJson(tbl)    -> string  (vBot's json.encode semantics)
     compat.compare(a, b)         -> ok, diffDescription
     compat.checkDirectory(dir)   -> report
+    compat.checkStancesValue(t)  -> ok, diffDescription   (work item N1, storage.stances)
 
   ===========================================================================
   PROVENANCE OF THE PARSER  (read this before changing anything below)
@@ -648,6 +649,71 @@ function M.compare(a, b, opts)
   if not ok then return false, "compare error: " .. tostring(err) end
   if #diffs == 0 then return true, nil end
   return false, table.concat(diffs, "; ")
+end
+
+-- ---------------------------------------------------------------------------
+-- storage.stances -- targeted round-trip (work item N1)
+-- ---------------------------------------------------------------------------
+-- storage/profile_N.json is a plain json.decode/json.encode blob (game_bot/bot.lua:
+-- 274-282), already covered generically by the "storage.json" sweep above -- but that
+-- only proves the FILE ON DISK survives a round trip.  It does not prove that an
+-- arbitrary stances table a CALLER constructs (bot/stances.lua's own writer, or the
+-- panel via CONFIGAPI.md's config.set) is byte-parseable by the real vBot json.lua
+-- decoder, nor that its field TYPES match what vBot/Stances.lua:50-56's defaulting and
+-- :136-156's entryMatches expect (a string where a number belongs would silently break
+-- every hp/mp/count comparison in the real client, not just ours).  This function
+-- proves both, independent of any file on disk.
+--
+--   ok, diff = M.checkStancesValue(stancesTable)
+--
+-- stancesTable is the in-memory Lua table CONFIGAPI.md calls storage.stances --
+-- { enabled, ignoreInPz, entries = { { spell, spellId, enabled, minHp, maxHp, minMana,
+-- count, orMore, monsters, range, description, ... } } }.  Extra fields (vBot's own
+-- `stanceName`/`needTarget`/`creatures`/`tooltip`) are untouched by this shape check --
+-- BOT.md requires unknown fields to survive, not to be enumerated here.
+function M.checkStancesValue(stancesTable)
+  if type(stancesTable) ~= "table" then return false, "stances value is not a table" end
+  if type(stancesTable.enabled) ~= "boolean" then return false, "enabled must be boolean" end
+  if type(stancesTable.ignoreInPz) ~= "boolean" then return false, "ignoreInPz must be boolean" end
+  if type(stancesTable.entries) ~= "table" then return false, "entries must be a table" end
+
+  for i, e in ipairs(stancesTable.entries) do
+    local p = "entries[" .. i .. "]"
+    if type(e) ~= "table" then return false, p .. " is not a table" end
+    if type(e.spell) ~= "string" then return false, p .. ".spell must be a string" end
+    if type(e.spellId) ~= "number" then return false, p .. ".spellId must be a number" end
+    if type(e.enabled) ~= "boolean" then return false, p .. ".enabled must be boolean" end
+    if type(e.minHp) ~= "number" then return false, p .. ".minHp must be a number" end
+    if type(e.maxHp) ~= "number" then return false, p .. ".maxHp must be a number" end
+    -- count/minMana/range default to 0/0/5 in vBot when absent (Stances.lua:138,141,
+    -- 144) -- but WHEN PRESENT they must be numbers, never strings, or
+    -- `entry.count or 0`-style comparisons misbehave in BOTH clients.
+    if e.count   ~= nil and type(e.count)   ~= "number" then return false, p .. ".count must be a number when present" end
+    if e.minMana ~= nil and type(e.minMana) ~= "number" then return false, p .. ".minMana must be a number when present" end
+    if e.range   ~= nil and type(e.range)   ~= "number" then return false, p .. ".range must be a number when present" end
+    if e.orMore  ~= nil and type(e.orMore)  ~= "boolean" then return false, p .. ".orMore must be boolean when present" end
+    -- `monsters` is `true` (any creature) OR an array of lowercase name strings
+    -- (Stances.lua:349-355) -- never a raw comma string once parsed.
+    if e.monsters ~= nil and e.monsters ~= true and type(e.monsters) ~= "table" then
+      return false, p .. ".monsters must be true or a table"
+    end
+  end
+
+  local ok1, ser = pcall(M.serializeJson, stancesTable)
+  if not ok1 then return false, "encode error: " .. tostring(ser) end
+  local ok2, reparsed = pcall(M.parseJsonString, ser, { lengthGuard = false })
+  if not ok2 then return false, "reparse error: " .. tostring(reparsed) end
+
+  local same, diff = M.compare(stancesTable, reparsed)
+  if not same then return false, "round-trip diff: " .. tostring(diff) end
+
+  -- Order-insensitive byte proof, same technique checkJsonFile uses.
+  local okc1, c1 = pcall(M.canonicalJson, stancesTable)
+  local okc2, c2 = pcall(M.canonicalJson, reparsed)
+  if okc1 and okc2 and c1 ~= c2 then
+    return false, "canonical json differs after round trip"
+  end
+  return true, nil
 end
 
 -- ---------------------------------------------------------------------------

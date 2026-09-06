@@ -89,6 +89,29 @@ local function loadJson(rel)
     return config.jsonDecode(text)
 end
 
+-- AttackBot.json's top-level `enabled` flag (and, it turns out, entry 1's own
+-- per-rule `enabled` flag) mirror LIVE on/off toggles in the user's own real
+-- client and drift independently of this suite (as of this session the user
+-- has turned AttackBot off in game AND disabled attackTable rule 1, so a raw
+-- read currently sees profile `enabled: false` and attackTable[1].enabled:
+-- false). Every scenario below that drives ab:tick() is proving the FIRING
+-- LOGIC against the user's real 8-rule attackTable, not either toggle -- so
+-- it loads through this helper, which forces the ACTIVE profile AND every one
+-- of its rules on in the freshly-decoded in-memory copy only (config.readFile
+-- is read-only; the file on disk is never touched). A1 loads the raw JSON
+-- directly instead, since it is specifically the "read verbatim" section.
+local function loadAttackBotJsonOn()
+    local d = loadJson('vBot_configs/profile_1/AttackBot.json')
+    if d and d.AttackBot then
+        local p = d.AttackBot[d.currentBotProfile or 1]
+        if p then
+            p.enabled = true
+            for _, entry in ipairs(p.attackTable or {}) do entry.enabled = true end
+        end
+    end
+    return d
+end
+
 -- items1530.bin: without it bot/world.lua runs degraded and walls/ground vanish.
 do
     local ok, err = pcall(items.load, ROOT .. '/assets/items1530.bin')
@@ -724,7 +747,10 @@ if ABJSON then
     eq(ABJSON.currentBotProfile, 1, 'currentBotProfile = 1')
     eq(#ABJSON.AttackBot, 5, 'exactly five profiles')
     local p = ABJSON.AttackBot[1]
-    eq(p.enabled, true, 'profile 1 enabled')
+    -- NOTE: `enabled` mirrors the user's own live in-game AttackBot toggle and
+    -- drifts independently of this suite (see loadAttackBotJsonOn above) -- so
+    -- this is read and reported, not asserted as a fixed value.
+    note('profile 1 enabled (live toggle, informational only): ' .. tostring(p.enabled))
     eq(p.ServerCooldown, true, 'ServerCooldown mode')
     eq(p.Rotate, true, 'Auto Turn on')
     eq(p.PvpSafe, false, 'PvpSafe off')
@@ -796,7 +822,7 @@ head('A3. entry priority and direction picking (the REAL profile)')
 --=============================================================================
 do
     local W = newWorld()
-    local ab = attackbot.new(W.bot, loadJson('vBot_configs/profile_1/AttackBot.json'))
+    local ab = attackbot.new(W.bot, loadAttackBotJsonOn())
     W.bot.now = now()
     layGround(W.state, 100, 100, 7, 8)
     -- ONE monster 3 sqm due EAST.  monkDirPatterns[13] (Flurry of Blows) covers
@@ -853,7 +879,7 @@ do
 
     -- the name filter gates entry 1: only a "true frost flower asura" unlocks it
     local W2 = newWorld()
-    local a2 = attackbot.new(W2.bot, loadJson('vBot_configs/profile_1/AttackBot.json'))
+    local a2 = attackbot.new(W2.bot, loadAttackBotJsonOn())
     W2.bot.now = now(); layGround(W2.state, 100, 100, 7, 8)
     local plain = placeCreature(W2.state, 22, 'Dragon', 103, 100, 7)
     a2:setTarget(plain)
@@ -872,7 +898,7 @@ head('A4. not enough monsters')
 --=============================================================================
 do
     local W = newWorld()
-    local ab = attackbot.new(W.bot, loadJson('vBot_configs/profile_1/AttackBot.json'))
+    local ab = attackbot.new(W.bot, loadAttackBotJsonOn())
     W.bot.now = now()
     layGround(W.state, 100, 100, 7, 9)
     -- one full-health monster, 8 sqm away: outside every pattern, and entry 8's
@@ -1120,7 +1146,7 @@ head('A7. mana / harmony / cooldown gates, and the optimizer flag')
 --=============================================================================
 do
     local W = newWorld()
-    local ab = attackbot.new(W.bot, loadJson('vBot_configs/profile_1/AttackBot.json'))
+    local ab = attackbot.new(W.bot, loadAttackBotJsonOn())
     W.bot.now = now(); layGround(W.state, 100, 100, 7, 8)
     -- three monsters in a vertical bar 4 sqm East (inside monkDirPatterns[16]'s
     -- East grid, outside [14]'s dy != 0 rows) plus one adjacent to the East.

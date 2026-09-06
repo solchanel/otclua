@@ -656,6 +656,7 @@ function Bot:status()
         } or nil,
         healbot   = modStatus(self.modules.healbot),
         attackbot = modStatus(self.modules.attackbot),
+        stances   = modStatus(self.modules.stances),
         cavebot   = modStatus(self.modules.cavebot),
         targetbot = modStatus(self.modules.targetbot),
         macros    = {},
@@ -757,6 +758,14 @@ function Bot:wireModules(opts)
     build('attackbot', 'bot.attackbot', function(m)
         return m.new(self, nil, mergedOpts(opts.attackbotOpts))
     end)
+    -- work item N1: the fifth module.  Registers its own 200 ms macro in its
+    -- constructor, like healbot/attackbot (always-allowed, never yields) --
+    -- see bot/stances.lua's header.  Built here, after healbot/attackbot and
+    -- before targetbot/cavebot, which sets its place in the macro list BOT.md's
+    -- "As built" macro table documents.
+    build('stances', 'bot.stances', function(m)
+        return m.new(self, nil, mergedOpts(opts.stancesOpts))
+    end)
     local tb = build('targetbot', 'bot.targetbot', function(m)
         return m.new(self, opts.targetbot, mergedOpts(opts.targetbotOpts))
     end)
@@ -777,7 +786,7 @@ function Bot:wireModules(opts)
     end
 
     self:info('modules wired: %s (world %s)',
-              table.concat({ 'healbot', 'attackbot', 'targetbot', 'cavebot' }, ', '),
+              table.concat({ 'healbot', 'attackbot', 'stances', 'targetbot', 'cavebot' }, ', '),
               tostring(self.world and self.world.itemDataLevel))
     return self.modules
 end

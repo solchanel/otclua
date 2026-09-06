@@ -1,10 +1,27 @@
 # luaclient bot layer — module contract (authoritative for implementers)
 
-> **STATUS: BUILT.** Every module below exists and is exercised offline by
-> `test/botsuite.lua`, which `--selftest` runs on Windows and Debian (2120 bot assertions,
-> 2521 in total, 0 failed as of 2026-09-06). Where the as-built code had to deviate from the
-> contract, the deviation is recorded in **[As built — contract changes](#as-built--contract-changes)**
-> at the end of this file. That section is normative for anyone writing new bot code.
+> **STATUS: BUILT AND INTEGRATED.** Every module below exists and is exercised offline by
+> `test/botsuite.lua` (2362 assertions: F1 446, F2 174, F3 281, M1 294, M2 220, M3 259 —
+> 0 failing), which `--selftest` runs on Windows and Debian (2772 assertions in total, 0 failing
+> on both, byte-identical) as of the 2026-09-06 integration pass. The six `shim_*_suite.lua`
+> compat suites (1574 assertions, 0 failing, identical on both OSes), `test/fakeserver.lua` (37
+> checks), `test/replay.lua` (4 captures) and `tools/vbot_compat_check.lua` against a scratch
+> copy of the real profile (36 files, 0 failing, never the original) all pass on both platforms
+> too. CaveBot, AttackBot and TargetBot+Looting are now a documented, honest mirror of vBot 4.8 —
+> see **[docs/vbot/parity.md](docs/vbot/parity.md)** for the full action-type/spell-category/
+> targeting-field/looting-rule parity table, with every deliberate deviation and the three
+> remaining wire-level gaps (all blocked on a `proto/sender.lua` builder nothing yet owns) called
+> out by name. A previously-flagged pair of failures (`test/bot_m1.lua` crashing, and
+> `test/botsuite.lua`'s "TargetBot picks the monster..." test going silent) was root-caused to
+> the user's own real, live `AttackBot.json` having drifted to `enabled: false` (both at the
+> profile level and on attackTable rule 1) during play while this pass ran — fixed by forcing the
+> profile on through `bot/attackbot.lua`'s own accessors in the tests' in-memory copy, never the
+> file on disk; see `docs/vbot/parity.md` §5 for the full account. Where the as-built code had to
+> deviate from the contract, the deviation is recorded in
+> **[As built — contract changes](#as-built--contract-changes)** at the end of this file. That
+> section is normative for anyone writing new bot code. CONFIGAPI.md (BUILT) extends this file
+> with a structured, panel-editable config layer over the six vBot config kinds, and adds the
+> fifth module, `bot/stances.lua`.
 
 Goal: reproduce vBot 4.8's *behaviour* in the standalone Lua client — HealBot, AttackBot, CaveBot,
 TargetBot with looting and supplies — with **no UI**, driven by the client's event bus and scheduler.
@@ -41,7 +58,7 @@ bot/api.lua        the vBot-compatible script surface (say/use/usewith/findItem/
 bot/world.lua      queries over game state (spectators, distances, sight, monster counting)
 bot/path.lua       A* pathfinding over the tile store
 bot/walker.lua     stepping, confirmation, retries, floor changes, anti-lost
-bot/healbot.lua    bot/attackbot.lua  bot/cavebot.lua  bot/targetbot.lua
+bot/healbot.lua    bot/attackbot.lua  bot/cavebot.lua  bot/targetbot.lua  bot/stances.lua
 bot/loot.lua       corpse discovery + looting state machine (used by targetbot)
 bot/supplies.lua   supply check / refill / deposit
 bot/config.lua     loading + saving the vBot config files above
@@ -156,6 +173,7 @@ a macro at the documented period, `:status()`, and `:reload(config)`.
 ```lua
 { on=, player={hp,maxHp,mana,maxMana,level,cap,pos,states},
   healbot={on,profile,lastAction}, attackbot={on,profile,lastSpell},
+  stances={on,...}, -- CONFIGAPI.md work item N1; see bot/stances.lua's :status()
   cavebot={on,config,waypointIndex,waypointCount,currentAction,status},
   targetbot={on,config,target={id,name,hpPercent,distance},danger,looting},
   macros={{name,enabled}}, supplies={{item,count,threshold}} }
@@ -210,9 +228,9 @@ order. Doing it by hand is how you get two walkers and a double-stepping charact
 
 ### 2. Macro registration is split between the constructor and `:attach()`
 
-`healbot` and `attackbot` register their macros in their constructors (four and one
-respectively). `targetbot` and `cavebot` register theirs in `:attach()`, which
-`bot:wireModules` calls after all four exist and which `onBotStart` calls as a fallback.
+`healbot`, `attackbot` and `stances` register their macros in their constructors (four, one
+and one respectively). `targetbot` and `cavebot` register theirs in `:attach()`, which
+`bot:wireModules` calls after all five exist and which `onBotStart` calls as a fallback.
 `cavebot:attach()` was split out of `cavebot:enable()` for exactly this reason: the macro
 order has to be settled independently of which modules happen to start enabled.
 
@@ -225,9 +243,17 @@ The resulting macro list, in order, is the contract:
 | 3 | healbot spells | 50 ms | *(unnamed)* |
 | 4 | healbot items | 100 ms | *(unnamed)* |
 | 5 | attackbot | 50 ms | *(unnamed)* |
-| 6 | targetbot | 100 ms | *(unnamed)* |
-| 7 | cavebot | 50 ms | `CaveBot` |
-| 8 | cavebot anti-lost | 200 ms | `CaveBot AntiLost` |
+| 6 | stances | 200 ms | *(unnamed)* |
+| 7 | targetbot | 100 ms | *(unnamed)* |
+| 8 | cavebot | 50 ms | `CaveBot` |
+| 9 | cavebot anti-lost | 200 ms | `CaveBot AntiLost` |
+
+`stances` (CONFIGAPI.md work item N1) is built in `wireModules` right after `attackbot` and
+before `targetbot`/`cavebot`, which sets its place in the table above. It is the one vBot
+subsystem with no prior native equivalent — see [CONFIGAPI.md](CONFIGAPI.md) for its
+storage shape, and `bot/stances.lua`'s header for the two deliberate deviations from
+upstream `vBot/Stances.lua` (a runtime CIP-vocation gate, and the mandatory dead/not-in-game
+guard).
 
 ### 3. CaveBot and TargetBot share ONE walker
 
@@ -391,3 +417,32 @@ Not reproduced (documented omission): vBot's `isFriend` also treats
 `vBot.BotServerMembers` as friends. luaclient has no BotServer roster, so `TB:isFriend`
 covers the friend list, the local player and — with `storage.playerList.groupMembers` set —
 party members, and nothing else.
+
+### 16. Integration pass (2026-09-06) — CaveBot/AttackBot/TargetBot parity
+
+Four work items landed the missing CaveBot action types (withdraw family, imbuing, rushlure,
+tasker), the AttackBot spell optimizers, a full re-audit of TargetBot+Looting, and a shim/
+behaviour-test pass, in parallel. This integration pass reconciled and re-ran all of it:
+
+* **Full parity table**: `docs/vbot/parity.md` — every CaveBot action type, AttackBot spell
+  category/optimizer, and TargetBot/Looting rule, marked implemented / partial / not-implemented
+  with a reason and a real-vBot source citation. Three narrow gaps remain, all blocked on a
+  `proto/sender.lua` builder (`forgeRequest`, `stashStowItem`) or a `bot/shared.lua` bookkeeping
+  addition (`S:sayAt` dedup) that no current work item owns.
+* **Regression found and fixed**: `test/bot_m1.lua` and `test/botsuite.lua` both construct
+  `bot/attackbot.lua` against the user's real, live `AttackBot.json`; its `enabled` flag (profile
+  level and, independently, attackTable rule 1) mirrors the user's actual in-game toggle and had
+  drifted to `false` during this session's parallel work, crashing one suite and silencing an
+  assertion in the other. Fixed in both test files by forcing the profile on through
+  `bot/attackbot.lua`'s own `A:profile()`/`A:enable()` accessors on the freshly-decoded in-memory
+  copy — the file on disk is never written. No `bot/*.lua` code changed as a result; this was a
+  test-fixture fix only. Full account in `docs/vbot/parity.md` §5.
+* **No CaveBot/TargetBot conflict found**: the two engines' shared touchpoints (the
+  `bot._attacking` mirror, `CaveBot.GoTo` from `TB:rePosition`, the dynamic-lure pull window vs.
+  `rushlure`'s own TargetBot on/off) were re-read together; they are gated by disjoint
+  waypoint/priority conditions and never double-handle the same tick.
+* **Full suite results, both platforms, after the fix** (verbatim numbers in `docs/vbot/parity.md`
+  §status and reproduced in this file's banner above): `test/botsuite.lua` 2362/0,
+  `main.lua --selftest` 2772/0, the six `shim_*_suite.lua` 1574/0, `test/fakeserver.lua` 37/0,
+  `test/replay.lua` 4 captures/0 failures, `tools/vbot_compat_check.lua` against `scratch-profile/`
+  36/0 — identical on Windows and Debian/WSL in every case.

@@ -23,6 +23,10 @@ Commands (exactly PANEL.md's list):
     bot.setTargetbot {name}     select targetbot_configs/<name>.json ('' = off)
     bot.listConfigs             what is on disk, and what is selected
     bot.reload                  re-read the whole profile from disk
+    config.get  {kind}          the ACTIVE config of one of the six kinds (CONFIGAPI.md)
+    config.set  {kind, data, reload=true, execCapability=false}
+                                 validate + write + hot-reload one kind's config
+    config.list {kind}          named profiles/configs for a kind, and which is active
     script.put {name, source}   write + load a script into the bot environment
     script.remove {name}        unload it and delete the file
     script.list                 loaded scripts, with sizes and load times
@@ -56,7 +60,9 @@ Lua 5.1 / LuaJIT: no goto, `setfenv`, `loadstring`.
 
 local M = {}
 
-local sys = require('lib.sys')
+local sys          = require('lib.sys')
+local cfglib        = require('bot.config')
+local configschema   = require('bot.configschema')
 
 -- lib/events.lua is BOTH a bus and a module: `events.on(name, fn)` on the module, but
 -- `bus:on(name, fn)` on an independent bus from events.new().  The worker hands us the
@@ -609,6 +615,328 @@ cmds['bot.reload'] = function(ctx)
     if not LC.bot then return nil, 'the bot layer failed to restart (see the log)' end
     return { on = true, wasRunning = was,
              note = 'scripts loaded through script.put are NOT restored by a reload' }
+end
+
+-- ============================================================== config.* ====
+-- Work item N2 / CONFIGAPI.md.  Six kinds, one currently-ACTIVE config per
+-- kind (the running module's own in-memory state -- never the filesystem
+-- directly, so a change is visible to bot.status() and the next tick before
+-- any file is even written).  bot/configschema.lua is the single source of
+-- truth for field names/types/required-ness; hub/botconfig.lua (the stopped-
+-- instance path) loads the SAME file so the two validations cannot drift.
+--
+-- Every kind's `data` shape is EXACTLY what bot/configschema.lua's `M.kinds`
+-- table documents -- not the whole vBot profile object.  healbot/attackbot in
+-- particular expose only the rule table(s) (itemTable/spellTable /
+-- attackTable); the surrounding profile switches (Cooldown, Visible, Rotate,
+-- PvpSafe, ...) are out of this contract's scope (CONFIGAPI.md's "shape"
+-- column), so config.set never touches them.
+local CONFIG_KINDS = {}
+for _, k in ipairs(configschema.KIND_NAMES) do CONFIG_KINDS[k] = true end
+
+local function requireBot(LC)
+    local b = LC.bot
+    if not b then return nil, 'the bot layer is not running (bot.enable {on:true} first)' end
+    return b
+end
+
+local function isReadOnly(LC)
+    return (LC.config and LC.config.dryRun) and true or false
+end
+
+-- ---- healbot -----------------------------------------------------------
+local function getHealbot(b)
+    local mod = b.modules and b.modules.healbot
+    if not mod then return nil, 'the healbot module is not running' end
+    local p = mod:profile()
+    local source = cfglib.fileExists(b.config:healBotPath()) and 'profile' or 'default'
+    return { itemTable = p.itemTable or {}, spellTable = p.spellTable or {} }, source
+end
+
+local function setHealbot(b, data, readOnly)
+    local mod = b.modules and b.modules.healbot
+    if not mod then return nil, 'the healbot module is not running' end
+    local p = mod:profile()
+    p.itemTable, p.spellTable = data.itemTable, data.spellTable
+    mod:reload(mod.cfg)
+    local persisted = false
+    if not readOnly then
+        local ok, err = mod:save()
+        if not ok then return nil, 'failed to save HealBot.json: ' .. tostring(err) end
+        persisted = true
+    end
+    return { kind = 'healbot', applied = true, persisted = persisted }
+end
+
+-- ---- conditions (bot/healbot.lua's ConditionPanel section) -------------
+local function getConditions(b)
+    local mod = b.modules and b.modules.healbot
+    if not mod then return nil, 'the healbot module is not running' end
+    local C = mod:conditions()
+    local out = {}
+    for k, v in pairs(C) do out[k] = v end
+    -- CONFIGAPI.md: GET always presents the canonical `curePoison`, falling
+    -- back to the misspelled on-disk key only when the canonical one is unset.
+    if out.curePoison == nil then out.curePoison = out.curePosion end
+    local source = cfglib.fileExists(b.config:healBotPath()) and 'profile' or 'default'
+    return out, source
+end
+
+local function setConditions(b, data, readOnly)
+    local mod = b.modules and b.modules.healbot
+    if not mod then return nil, 'the healbot module is not running' end
+    local old = mod:conditions() or {}
+    local C = {}
+    for k, v in pairs(data) do C[k] = v end
+    -- Keep `curePosion` in sync ONLY when it was already present on disk, or
+    -- the caller explicitly sent it -- never invent the key on a fresh file
+    -- (CONFIGAPI.md: "keep curePosion unset unless it was already present").
+    if old.curePosion ~= nil or data.curePosion ~= nil then
+        C.curePosion = (data.curePosion ~= nil) and data.curePosion or data.curePoison
+    else
+        C.curePosion = nil
+    end
+    mod.cfg.ConditionPanel = C
+    mod:reload(mod.cfg)
+    local persisted = false
+    if not readOnly then
+        local ok, err = mod:save()
+        if not ok then return nil, 'failed to save HealBot.json: ' .. tostring(err) end
+        persisted = true
+    end
+    return { kind = 'conditions', applied = true, persisted = persisted }
+end
+
+-- ---- attackbot -----------------------------------------------------------
+local function getAttackbot(b)
+    local mod = b.modules and b.modules.attackbot
+    if not mod then return nil, 'the attackbot module is not running' end
+    local p = mod:profile()
+    local source = cfglib.fileExists(b.config:attackBotPath()) and 'profile' or 'default'
+    return p.attackTable or {}, source
+end
+
+local function setAttackbot(b, data, readOnly)
+    local mod = b.modules and b.modules.attackbot
+    if not mod then return nil, 'the attackbot module is not running' end
+    local p = mod:profile()
+    p.attackTable = data
+    mod:reload(mod.cfg)
+    local persisted = false
+    if not readOnly then
+        local ok, err = mod:save()
+        if not ok then return nil, 'failed to save AttackBot.json: ' .. tostring(err) end
+        persisted = true
+    end
+    return { kind = 'attackbot', applied = true, persisted = persisted }
+end
+
+-- ---- stances ---------------------------------------------------------------
+-- bot/stances.lua is work item N1, being written concurrently (CONFIGAPI.md).
+-- Its documented shape is storage.stances = {enabled, ignoreInPz, entries}, a
+-- SHARED-STORAGE value (not a dedicated file), so persistence here always goes
+-- through bot:saveStorage() rather than a module-owned save().  When the real
+-- module is not wired yet (b.modules.stances absent, or its :reload signature
+-- differs from every other module's `:reload(cfg)` convention) this falls
+-- back to reading/writing bot.storage.stances directly, so config.get/set
+-- work against CONFIGAPI.md's documented shape even before N1 lands --
+-- see this work item's crossFileRequests.
+local function stancesDefault() return { enabled = false, ignoreInPz = true, entries = {} } end
+
+local function getStances(b)
+    local mod = b.modules and b.modules.stances
+    if mod and type(mod.cfg) == 'table' then
+        return mod.cfg, 'profile'
+    end
+    local st = b.storage and b.storage.stances
+    if type(st) ~= 'table' then return stancesDefault(), 'default' end
+    return st, 'profile'
+end
+
+local function setStances(b, data, readOnly)
+    b.storage = b.storage or {}
+    local mod = b.modules and b.modules.stances
+    if mod and type(mod.reload) == 'function' then
+        local ok, err = pcall(mod.reload, mod, data)
+        if not ok then return nil, 'stances reload failed: ' .. tostring(err) end
+        b.storage.stances = (type(mod.cfg) == 'table') and mod.cfg or data
+    else
+        b.storage.stances = data
+    end
+    local persisted = false
+    if not readOnly then
+        local ok, err = pcall(b.saveStorage, b)
+        if not ok then return nil, 'failed to save storage: ' .. tostring(err) end
+        persisted = true
+    end
+    return { kind = 'stances', applied = true, persisted = persisted }
+end
+
+-- ---- targetbot -----------------------------------------------------------
+local function getTargetbot(b)
+    local mod = b.modules and b.modules.targetbot
+    if not mod then return nil, 'the targetbot module is not running' end
+    local raw = mod.raw or {}
+    local targeting = type(raw.targeting) == 'table' and raw.targeting or {}
+    local looting = mod.loot and mod.loot:save({}) or {}
+    local source = (type(mod.configName) == 'string' and #mod.configName > 0) and 'profile' or 'default'
+    return { targeting = targeting, looting = looting }, source
+end
+
+local function setTargetbot(b, data, readOnly)
+    local mod = b.modules and b.modules.targetbot
+    if not mod then return nil, 'the targetbot module is not running' end
+    local name = mod.configName
+    if type(name) ~= 'string' or name == '' then
+        return nil, 'no targetbot config is selected (bot.setTargetbot first)'
+    end
+    mod:reload{ targeting = data.targeting, looting = data.looting or {} }
+    local persisted = false
+    if not readOnly then
+        local ok, err = mod:save()
+        if not ok then
+            return nil, ('failed to save targetbot_configs/%s: %s'):format(name, tostring(err))
+        end
+        persisted = true
+    end
+    return { kind = 'targetbot', applied = true, persisted = persisted }
+end
+
+-- ---- cavebot ---------------------------------------------------------------
+-- The one kind with the exec-capability gate (CONFIGAPI.md "Security").  This
+-- module never checks WHO is allowed to write a function body -- that lives in
+-- hub/api.lua's EXEC_CAPABILITY check -- it only reports HONESTLY whether the
+-- diff adds/changes one, via `needsExec`, so the hub can decide before (not
+-- after) anything is written.  `args.execCapability == true` is the hub's own
+-- assertion that it already ran that check; commands.lua trusts it exactly as
+-- far as it trusts the hub for every other privileged command.
+local function getCavebot(b)
+    local mod = b.modules and b.modules.cavebot
+    if not mod then return nil, 'the cavebot module is not running' end
+    local route = mod.route or {}
+    local pairs_ = (type(route.pairs) == 'table') and route.pairs
+                   or configschema.cavebotPairsFromRoute(route)
+    local out = {}
+    for i = 1, #pairs_ do
+        local p = pairs_[i]
+        out[i] = { type = configschema.cavebotPairType(p), value = configschema.cavebotPairValue(p) }
+    end
+    local source = (type(route.path) == 'string') and 'profile' or 'default'
+    return out, source
+end
+
+local function setCavebot(b, data, execCapability, readOnly)
+    local mod = b.modules and b.modules.cavebot
+    if not mod then return nil, 'the cavebot module is not running' end
+    local selected = b:configState('cavebot_configs').selected
+    if type(selected) ~= 'string' or selected == '' then
+        return nil, 'no cavebot config is selected (bot.setCavebot first)'
+    end
+
+    -- Normalise to the positional {type, value} shape encodeCfg/decodeCfg (and
+    -- our own diff/route helpers) expect.
+    local newPairs = {}
+    for i = 1, #data do
+        newPairs[i] = { configschema.cavebotPairType(data[i]), configschema.cavebotPairValue(data[i]) }
+    end
+
+    local oldRoute = mod.route or {}
+    local oldPairs = (type(oldRoute.pairs) == 'table') and oldRoute.pairs
+                     or configschema.cavebotPairsFromRoute(oldRoute)
+
+    local changed = configschema.cavebotFunctionBodyChanged(oldPairs, newPairs)
+    if changed and execCapability ~= true then
+        return { kind = 'cavebot', applied = false, needsExec = true,
+                 reason = 'this change adds or changes a function-type waypoint body; ' ..
+                          'the exec capability is required' }
+    end
+
+    local persisted = false
+    if not readOnly then
+        local ok, err = b.config:saveCavebot(selected, { pairs = newPairs })
+        if not ok then
+            return nil, ('failed to save cavebot_configs/%s: %s'):format(selected, tostring(err))
+        end
+        persisted = true
+    end
+
+    -- Re-read from disk when we actually wrote it (keeps mod.route.pairs/.path
+    -- byte-identical to the file for the next GET); apply in-memory only under
+    -- --dry-run, so the change still hot-applies without touching the profile.
+    if persisted then
+        mod:reload(selected)
+    else
+        local route = configschema.cavebotRouteFromPairs(newPairs)
+        route.name, route.pairs = selected, newPairs
+        mod:reload(route)
+    end
+
+    return { kind = 'cavebot', applied = true, needsExec = false,
+             persisted = persisted, functionBodyChanged = changed }
+end
+
+-- ---- dispatch ------------------------------------------------------------
+local CONFIG_GET = { healbot = getHealbot, conditions = getConditions, attackbot = getAttackbot,
+                     stances = getStances, targetbot = getTargetbot, cavebot = getCavebot }
+
+cmds['config.get'] = function(ctx, args)
+    local a = argTable(args); if not a then return nil, 'args must be an object' end
+    local kind = a.kind
+    if not CONFIG_KINDS[kind] then return nil, ('unknown config kind %q'):format(tostring(kind)) end
+    local b, berr = requireBot(ctx.LC)
+    if not b then return nil, berr end
+    local data, source = CONFIG_GET[kind](b)
+    if data == nil then return nil, source end   -- source carries the error message here
+    return { kind = kind, data = data, source = source or 'profile' }
+end
+
+cmds['config.list'] = function(ctx, args)
+    local a = argTable(args); if not a then return nil, 'args must be an object' end
+    local kind = a.kind
+    if not CONFIG_KINDS[kind] then return nil, ('unknown config kind %q'):format(tostring(kind)) end
+    local b, berr = requireBot(ctx.LC)
+    if not b then return nil, berr end
+
+    if kind == 'healbot' or kind == 'attackbot' then
+        local mod = b.modules and b.modules[kind]
+        if not mod then return nil, ('the %s module is not running'):format(kind) end
+        return { names = { 1, 2, 3, 4, 5 }, active = mod:getActiveProfile() }
+    end
+    if kind == 'cavebot' or kind == 'targetbot' then
+        local dir = (kind == 'cavebot') and 'cavebot_configs' or 'targetbot_configs'
+        local prof = b.config
+        local names = prof and ((kind == 'cavebot') and prof:listCavebots() or prof:listTargetbots()) or {}
+        local st = b:configState(dir)
+        return { names = names, active = st.selected or '' }
+    end
+    -- conditions / stances: a single object, no named sub-profiles.
+    return { names = {}, active = nil }
+end
+
+cmds['config.set'] = function(ctx, args)
+    local a = argTable(args); if not a then return nil, 'args must be an object' end
+    local kind = a.kind
+    if not CONFIG_KINDS[kind] then return nil, ('unknown config kind %q'):format(tostring(kind)) end
+    local LC = ctx.LC
+    local b, berr = requireBot(LC)
+    if not b then return nil, berr end
+
+    -- Validate BEFORE touching anything: "reject, don't coerce" (CONFIGAPI.md)
+    -- means a bad payload must leave the running module and the file untouched.
+    local vok, verr = configschema.validate(kind, a.data)
+    if not vok then return nil, verr end
+
+    local readOnly = isReadOnly(LC)
+    local res, err
+    if kind == 'healbot' then       res, err = setHealbot(b, a.data, readOnly)
+    elseif kind == 'conditions' then res, err = setConditions(b, a.data, readOnly)
+    elseif kind == 'attackbot' then  res, err = setAttackbot(b, a.data, readOnly)
+    elseif kind == 'stances' then    res, err = setStances(b, a.data, readOnly)
+    elseif kind == 'targetbot' then  res, err = setTargetbot(b, a.data, readOnly)
+    elseif kind == 'cavebot' then    res, err = setCavebot(b, a.data, a.execCapability == true, readOnly)
+    end
+    if not res then return nil, err or 'config.set failed' end
+    return res
 end
 
 -- ------------------------------------------------------------- scripts ------

@@ -20,7 +20,14 @@ control protocol") and the telemetry that feeds the panel's numbers.
 WIRE PROTOCOL
 ------------------------------------------------------------------------------
 Requests are JSON objects `{id, cmd, args}` and answers are `{id, ok, result}`
-or `{id, ok:false, error}`.  Two transports, one command table (control/commands.lua):
+or `{id, ok:false, error}`.  Two transports, one command table (control/commands.lua)
+-- this includes CONFIGAPI.md's `config.get` / `config.set` / `config.list`
+(work item N2): they are dispatched exactly like every other command, no
+transport-level change needed -- a rejected `config.set` (bad schema, or a
+cavebot function-body change without `execCapability`) comes back as an
+ordinary `{id, ok:false, error}` or `{id, ok:true, result={applied=false,...}}`
+depending on which the command itself chose (see control/commands.lua's
+config.* section for which is which).
 
   POST /rpc      body = one request object      -> one answer object
   GET  /ws       WebSocket; each TEXT message is one request object, each answer

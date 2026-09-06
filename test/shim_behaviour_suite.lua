@@ -577,13 +577,23 @@ if not BOOTED or not ABJSON then
     skip('section C', 'the shim did not boot or AttackBot.json is unreadable')
 else
     local p = ABJSON.AttackBot[ABJSON.currentBotProfile]
-    eq(p.enabled, true, 'AttackBot profile 1 is enabled in the user config')
+    -- NOTE: p.enabled mirrors the LIVE on/off toggle in the user's own client and
+    -- drifts independently of this suite (the user has since turned AttackBot off
+    -- in game, so this currently reads false). This scenario proves the FIRING
+    -- LOGIC given the user's real 8-rule table, not the toggle, so it is forced on
+    -- through AttackBot's own public API below rather than asserted as a fixed
+    -- value that this suite does not control.
     eq(#p.attackTable, 8, 'eight attack rules')
     eq(p.attackTable[7].spell, 'exori mas pug', 'rule 7 is Flurry of Blows, 1+ creatures')
     eq(p.attackTable[3].spell, 'exori med pug', 'rule 3 is Chained Penance, 2+ creatures')
 
     local mAtk = macroAt('/vBot/AttackBot.lua:2708')
     check(mAtk ~= nil, 'the AttackBot macro (AttackBot.lua:2708) is registered')
+    check(SH.ctx.AttackBot ~= nil, 'AttackBot.lua installs its public global table')
+    if SH.ctx.AttackBot then
+        SH.ctx.AttackBot.setOn()
+        check(SH.ctx.AttackBot.isOn(), 'AttackBot forced on through its own setOn(), independent of the live toggle')
+    end
 
     -- one monster, adjacent, targeted
     addMonster(SH.st, 0x3001, 'Rat', ORIGIN.x + 1, ORIGIN.y, ORIGIN.z, 100)
@@ -594,7 +604,12 @@ else
     local NW, nab
     if NAT.available then
         NW = nativeNew()
-        nab = attackbotmod.new(NW.bot, loadProfileJson('vBot_configs/profile_1/AttackBot.json'))
+        local nabCfg = loadProfileJson('vBot_configs/profile_1/AttackBot.json')
+        -- force on in this in-memory copy too, mirroring AttackBot.setOn() above --
+        -- the real file on disk is never touched (loadProfileJson re-decodes it
+        -- fresh every call).
+        nabCfg.AttackBot[nabCfg.currentBotProfile].enabled = true
+        nab = attackbotmod.new(NW.bot, nabCfg)
         addMonster(NW.st, 0x3001, 'Rat', ORIGIN.x + 1, ORIGIN.y, ORIGIN.z, 100)
         NW.bot._attacking = 0x3001
     end
@@ -623,6 +638,7 @@ else
         shim.stop()
         local h = shimBoot()
         check(h ~= nil, 'the shim rebooted for the hold scenario')
+        if SH.ctx.AttackBot then SH.ctx.AttackBot.setOn() end
         addMonster(SH.st, 0x3001, 'Rat', ORIGIN.x + 6, ORIGIN.y, ORIGIN.z, 100)
         shimAdvance(5000)
         SH.G.g_game.attack(SH.G.g_map.getCreatureById(0x3001))
@@ -632,7 +648,9 @@ else
         local n2
         if NAT.available then
             local W2 = nativeNew()
-            local a2 = attackbotmod.new(W2.bot, loadProfileJson('vBot_configs/profile_1/AttackBot.json'))
+            local a2Cfg = loadProfileJson('vBot_configs/profile_1/AttackBot.json')
+            a2Cfg.AttackBot[a2Cfg.currentBotProfile].enabled = true
+            local a2 = attackbotmod.new(W2.bot, a2Cfg)
             addMonster(W2.st, 0x3001, 'Rat', ORIGIN.x + 6, ORIGIN.y, ORIGIN.z, 100)
             W2.bot._attacking = 0x3001
             W2.advance(5000)
@@ -1309,6 +1327,79 @@ else
             check(ok, 'idiom: ' .. name, not ok and tostring(err) or nil)
             row('idiom', name, 'asserts pass', ok and 'asserts pass' or tostring(err), nil)
         end
+    end
+end
+
+--==============================================================================
+section('Dropper -- trash/use/cap-item disposal (vBot/Dropper.lua:127, closes COMPAT SS3.5 #1)')
+--==============================================================================
+-- Only crash-tested before this: `storage.dropper.{trashItems,useItems,capItems}`
+-- feed a THREE-BUCKET priority scan (cap > use > trash) that runs `for i=1,3`
+-- OUTSIDE the container/item loop, and the function `return`s the instant ANY
+-- item in ANY container matches bucket i -- even when that bucket's own guard
+-- (the free-capacity check on i==1) turns out false.  That means a single
+-- cap-listed item sitting in the backpack starves the WHOLE macro every tick
+-- while capacity is fine: use-items are never drunk and trash is never
+-- dropped, not because they were not found but because the cap bucket's match
+-- ate the `return` first.  This is exactly the class of bug the crash test
+-- cannot see (config.enabled and a good match still ticks with 0 errors).
+local ID_TRASH = 3577   -- worm -- distinct from every id used elsewhere in this file
+if not BOOTED then
+    skip('section Dropper', 'the shim did not boot')
+else
+    shim.stop()
+    local h = shimBoot()
+    check(h ~= nil, 'the shim rebooted for the Dropper scenario')
+    local ctx = SH.ctx
+    check(ctx.storage and ctx.storage.dropper ~= nil, 'vBot/Dropper.lua installs storage.dropper')
+    local cfg = ctx.storage and ctx.storage.dropper
+    local mDrop = macroAt('/vBot/Dropper.lua:127')
+    check(mDrop ~= nil, 'the Dropper macro (Dropper.lua:127) is registered')
+
+    if cfg and mDrop then
+        cfg.enabled = true
+        cfg.capItems   = { { id = ID_GOLD } }
+        cfg.useItems   = { { id = POTION } }
+        cfg.trashItems = { { id = ID_TRASH } }
+
+        local function backpack(items)
+            SH.st.containers[0] = { id = 0, name = 'backpack', capacity = 20, hasPages = false,
+                firstIndex = 0, size = #items, hasParent = false, isUnlocked = true,
+                item = { kind = 'item', id = ID_BP }, items = items }
+        end
+
+        -- (1) only a TRASH item present -> dropped to the player's own tile
+        backpack({ { kind = 'item', id = ID_TRASH, count = 1 } })
+        behaves('Dropper', 'only a trash item present -> dropped at the player tile',
+                ('move:%dx1 65535,64,0->%d,%d,%d'):format(ID_TRASH, ORIGIN.x, ORIGIN.y, ORIGIN.z),
+                runMacro(mDrop), nil)
+
+        -- (2) a USE item and a TRASH item both present -> USE wins (bucket i=2
+        --     is scanned, and matches, before bucket i=3 is ever reached)
+        backpack({ { kind = 'item', id = POTION, count = 1 },
+                   { kind = 'item', id = ID_TRASH, count = 1 } })
+        behaves('Dropper', 'a use-item AND a trash-item present -> the use-item wins',
+                ('use:%d@65535,64,0'):format(POTION),
+                runMacro(mDrop), nil)
+
+        -- (3) all three buckets matched, capacity FINE (>=150) -> the cap
+        --     bucket's own guard is false, but its match still owns the
+        --     `return`, so NOTHING happens this tick, not even the use-item
+        --     one slot away.  This is the starvation bug this test exists for.
+        SH.st.player.freeCapacity = 1000
+        backpack({ { kind = 'item', id = ID_GOLD, count = 5 },
+                   { kind = 'item', id = POTION, count = 1 },
+                   { kind = 'item', id = ID_TRASH, count = 1 } })
+        behaves('Dropper', 'cap-item present but capacity is FINE -> holds (starves use+trash too)',
+                '', runMacro(mDrop), nil)
+
+        -- (4) same three-item backpack, capacity now LOW -> the cap item drops
+        SH.st.player.freeCapacity = 100
+        behaves('Dropper', 'cap-item present and capacity is LOW -> drops the cap item',
+                ('move:%dx5 65535,64,0->%d,%d,%d'):format(ID_GOLD, ORIGIN.x, ORIGIN.y, ORIGIN.z),
+                runMacro(mDrop), nil)
+
+        cfg.enabled = false
     end
 end
 

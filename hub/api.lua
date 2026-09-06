@@ -76,6 +76,7 @@ local socket = require('lib.socket')
 local sha2   = require('lib.sha2')
 local proxylib = require('lib.proxy')
 local model  = require('hub.model')      -- for model.NIL, the clear-a-field sentinel
+local botconfig = require('hub.botconfig')  -- work item N3 -- CONFIGAPI.md's config.* routes
 
 local M = {}
 M.PENDING = { '<pending>' }          -- a handler that will call done() itself
@@ -184,7 +185,8 @@ local function isMutating(cmd)
   local verb = cmd:match('%.(.+)$')
   if not verb then return false end
   local readOnly = { list = true, get = true, configs = true, history = true,
-                     logs = true, chat = true, users = true, sessions = true, audit = true }
+                     logs = true, chat = true, users = true, sessions = true, audit = true,
+                     configGet = true, configList = true }
   return not readOnly[verb]
 end
 M.isMutating = isMutating
@@ -913,6 +915,214 @@ H['instance.configs'] = function(self, args, ctx, done)
     return M.PENDING
   end
   return cached(true)
+end
+
+-- =============================================================================
+-- config.* (work item N3 / CONFIGAPI.md) -- GET/PUT/list over the six vBot
+-- config kinds (healbot, conditions, attackbot, stances, targetbot, cavebot).
+--
+-- Routing: RUNNING forwards to the worker's `config.get`/`config.set`/
+-- `config.list` (control/commands.lua, work item N2) over the control socket,
+-- so the change hot-applies against the live module and the in-memory bot
+-- state stays authoritative; STOPPED reads/writes the profile directory
+-- directly through hub/botconfig.lua.  Both paths validate through the exact
+-- same bot/configschema.lua (hub/botconfig.lua requires it directly; the
+-- worker does too) -- a malformed payload is refused 400 identically either
+-- way, before it ever touches a file or a running module.
+--
+-- Security (CONFIGAPI.md): a cavebot PUT that adds or changes a `function`-
+-- type waypoint's body needs the canExec capability (EXEC_CAPABILITY, same as
+-- instance.exec / script.upload); every other cavebot edit -- reordering,
+-- editing a goto/delay/use/... value -- needs only the normal owner-or-admin
+-- check every instance route already has.  The two paths get there
+-- differently because only one of them can see LIVE state:
+--   * RUNNING:  config.set always carries `execCapability = mayExec(user)`.
+--     control/commands.lua does its own diff against the running module's
+--     in-memory route (authoritative -- it may differ from the last-saved
+--     file) and reports back `{applied=false, needsExec=true}` without
+--     writing anything when a privileged change was attempted without it.
+--   * STOPPED:  there is no running module, so this file fetches the current
+--     on-disk pairs via `botconfig.getCavebot`, diffs with
+--     `botconfig.cavebotFunctionBodyChanged` (bot/configschema.lua's own
+--     predicate, so the two paths can never disagree on what "changed"
+--     means), and refuses BEFORE calling `botconfig.setCavebot` at all.
+-- =============================================================================
+local CONFIG_KINDS = botconfig.KINDS
+
+--- cavebot/targetbot operate on "the currently selected" named config, which
+--- lives on the INSTANCE record -- CONFIGAPI.md: "switching which one is
+--- active is the existing bot.setCavebot/.../vprofile mechanism, unchanged by
+--- this contract" -- never an id the caller names in the request.
+local function selectedConfigName(inst, kind)
+  if kind == 'cavebot'   then return inst.cavebotConfig end
+  if kind == 'targetbot' then return inst.targetbotConfig end
+  return nil
+end
+local function needsSelectedName(kind) return kind == 'cavebot' or kind == 'targetbot' end
+
+--- Resolve the profile directory + a fresh Profile for a STOPPED instance, or
+--- nil plus a ready-to-`need()` error code/message.
+function A:profileForStopped(inst)
+  local dir = self.sup and self.sup:profileDir(inst.botProfile)
+  if not dir then return nil, 'conflict', 'no bot profile directory is configured for this instance' end
+  return botconfig.newProfile(dir, 1)
+end
+
+H['instance.configGet'] = function(self, args, ctx, done)
+  local inst = self:ownedInstance(ctx, args.id)
+  local kind = tostring(args.kind or '')
+  need(CONFIG_KINDS[kind], 'bad-request', 'unknown config kind: ' .. kind)
+  local canExec = self:mayExec(ctx.user)
+
+  if self.sup and self.sup:isRunning(inst.id) then
+    self.sup:command(inst.id, 'config.get', { kind = kind }, function(ok, res)
+      if ok and type(res) == 'table' then
+        done(true, { kind = kind, data = res.data, source = res.source or 'profile',
+                     editable = true, canExec = canExec })
+      else
+        done(false, res)
+      end
+    end)
+    return M.PENDING
+  end
+
+  local name = selectedConfigName(inst, kind)
+  if needsSelectedName(kind) and (not name or name == '') then
+    -- Nothing selected yet: not an error, just nothing to show (PANEL.md:
+    -- "never block the rest of the instance view").
+    return { kind = kind, data = botconfig.emptyFor(kind), source = 'default',
+             editable = true, canExec = canExec }
+  end
+  local profile, ecode, emsg = self:profileForStopped(inst)
+  need(profile, ecode or 'conflict', emsg or 'no bot profile directory is configured')
+  local data, source = botconfig.get(profile, kind, name)
+  need(data ~= nil, 'internal', tostring(source or 'failed to load config'))
+  return { kind = kind, data = data, source = source, editable = true, canExec = canExec }
+end
+
+H['instance.configList'] = function(self, args, ctx, done)
+  local inst = self:ownedInstance(ctx, args.id)
+  local kind = tostring(args.kind or '')
+  need(CONFIG_KINDS[kind], 'bad-request', 'unknown config kind: ' .. kind)
+
+  if self.sup and self.sup:isRunning(inst.id) then
+    self.sup:command(inst.id, 'config.list', { kind = kind }, function(ok, res)
+      if ok and type(res) == 'table' then
+        done(true, { names = res.names or {}, active = res.active })
+      else
+        done(false, res)
+      end
+    end)
+    return M.PENDING
+  end
+
+  local profile, ecode, emsg = self:profileForStopped(inst)
+  need(profile, ecode or 'conflict', emsg or 'no bot profile directory is configured')
+  local out, lerr = botconfig.list(profile, kind)
+  need(out ~= nil, 'internal', tostring(lerr or 'failed to list configs'))
+  -- The instance's OWN cavebotConfig/targetbotConfig field wins over whatever
+  -- storage/profile_N.json's `_configs` last recorded: that field is what
+  -- instance.configGet/configSet actually operate against for a stopped
+  -- instance (CONFIGAPI.md: "the currently selected one"), so it must also be
+  -- what `active` reports here -- a storage file can otherwise still carry an
+  -- older selection from before the instance's own field last changed (it is
+  -- only re-synced by pushing bot.setCavebot to a RUNNING worker).  Fall back
+  -- to the storage-derived value only when the instance has nothing set yet.
+  if needsSelectedName(kind) then
+    local wantName = selectedConfigName(inst, kind)
+    out.active = (wantName and wantName ~= '') and wantName or out.active
+  end
+  return out
+end
+
+H['instance.configSet'] = function(self, args, ctx, done)
+  local inst = self:ownedInstance(ctx, args.id)
+  local ch = self.model.characters:get(inst.characterId)
+  local kind = tostring(args.kind or '')
+  need(CONFIG_KINDS[kind], 'bad-request', 'unknown config kind: ' .. kind)
+  need(type(args.data) == 'table', 'bad-request', 'no data given')
+  local vok, verr = botconfig.validate(kind, args.data)
+  need(vok, 'bad-request', verr or 'invalid data')
+
+  local name = selectedConfigName(inst, kind)
+  if needsSelectedName(kind) then
+    need(name and name ~= '', 'conflict',
+         ('no %s config is selected for this instance'):format(kind))
+  end
+
+  -- Single place that applies the result: audits (full body for a cavebot
+  -- function-body change, a short diff summary otherwise -- security review
+  -- finding, was `kind=X[ name=Y]` only, with no diff at all) and replies.
+  -- `oldData` is the PRE-WRITE value (nil when it could not be fetched --
+  -- botconfig.diffSummary degrades to an honest "unavailable" note rather
+  -- than erroring; a missing pre-image must never block the write itself).
+  local function finish(applied, res, needsExec, functionBodyChanged, oldData)
+    if needsExec then
+      self:record(ctx, 'instance.config', ch and ch.name or inst.id, 'denied',
+                  'cavebot function-body change refused (canExec required)')
+      return done(false, { code = 'forbidden',
+        message = 'changing a cavebot function waypoint body requires the canExec capability' })
+    end
+    local detail
+    if functionBodyChanged then
+      local okj, txt = pcall(json.encode, args.data)
+      detail = 'kind=cavebot FUNCTION BODY CHANGED -- full new data: ' ..
+               (okj and txt:sub(1, 8000) or '(json encode failed)')
+    else
+      detail = botconfig.diffSummary(kind, oldData, args.data)
+      -- Minor finding: a pure relocation of an identical function body trips
+      -- neither `functionBodyChanged` (correctly -- no new code can run) nor
+      -- the generic field-diff above in the net-zero case, so call it out
+      -- explicitly rather than leaving it indistinguishable from a value edit.
+      if kind == 'cavebot' and oldData ~= nil and botconfig.cavebotFunctionShapeChanged(oldData, args.data) then
+        detail = detail .. '; NOTE: function-waypoint position/count changed without a body edit'
+      end
+      if name and name ~= '' then detail = detail .. ' name=' .. name end
+    end
+    self:record(ctx, 'instance.config', ch and ch.name or inst.id, applied and 'ok' or 'error', detail)
+    if applied then done(true, { kind = kind, applied = true }) else done(false, res) end
+  end
+
+  if self.sup and self.sup:isRunning(inst.id) then
+    -- Fetch the pre-write value first (best-effort -- see finish()'s oldData
+    -- doc) so the audit record can carry a real diff, then apply the write.
+    self.sup:command(inst.id, 'config.get', { kind = kind }, function(gok, gres)
+      local oldData = (gok and type(gres) == 'table') and gres.data or nil
+      self.sup:command(inst.id, 'config.set',
+        { kind = kind, data = args.data, reload = true, execCapability = self:mayExec(ctx.user) },
+        function(ok, res)
+          if ok and type(res) == 'table' and res.needsExec then
+            return finish(false, nil, true, false, oldData)
+          end
+          finish(ok and true or false, res, false,
+                 ok and type(res) == 'table' and res.functionBodyChanged, oldData)
+        end)
+    end)
+    return M.PENDING
+  end
+
+  local profile, ecode, emsg = self:profileForStopped(inst)
+  need(profile, ecode or 'conflict', emsg or 'no bot profile directory is configured')
+
+  if kind == 'cavebot' then
+    local oldData, oerr = botconfig.getCavebot(profile, name)
+    need(oldData ~= nil, 'internal', tostring(oerr or 'failed to read the current cavebot config'))
+    local changed = botconfig.cavebotFunctionBodyChanged(oldData, args.data)
+    if changed and not self:mayExec(ctx.user) then
+      finish(false, nil, true, false, oldData)
+      return M.PENDING
+    end
+    local ok3, err3 = botconfig.setCavebot(profile, name, args.data)
+    finish(ok3 and true or false, ok3 and {} or { code = 'internal', message = tostring(err3) },
+           false, changed, oldData)
+    return M.PENDING
+  end
+
+  local oldData = botconfig.get(profile, kind, name)  -- best-effort pre-image; nil is fine (see finish)
+  local ok3, err3 = botconfig.set(profile, kind, args.data, name)
+  finish(ok3 and true or false, ok3 and {} or { code = 'internal', message = tostring(err3) },
+         false, false, oldData)
+  return M.PENDING
 end
 
 H['instance.setMacro'] = function(self, args, ctx, done)
@@ -1775,6 +1985,9 @@ local ROUTES = {
   { 'PATCH',  '/api/instances/:id',          'instance.update',     idPatch },
   { 'DELETE', '/api/instances/:id',          'instance.delete',     idBody },
   { 'GET',    '/api/instances/:id/configs',  'instance.configs',    idBody },
+  { 'GET',    '/api/instances/:id/config/:kind',      'instance.configGet',  idBody },
+  { 'PUT',    '/api/instances/:id/config/:kind',      'instance.configSet',  idBody },
+  { 'GET',    '/api/instances/:id/config/:kind/list', 'instance.configList', idBody },
   { 'PUT',    '/api/instances/:id/macros/:name', 'instance.setMacro', idBody },
   { 'POST',   '/api/instances/:id/reload',   'instance.reload',     idBody },
   { 'POST',   '/api/instances/:id/exec',     'instance.exec',       idBody },

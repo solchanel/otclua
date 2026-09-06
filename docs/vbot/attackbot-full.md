@@ -5,6 +5,8 @@ its **"VERIFIER Corrections"** section is authoritative and every correction in
 it is folded into the text below. This file goes deeper on the two things the
 summary only sketched: **the data tables** (§2) and **the geometry** (§4–§7).
 
+> Implementation status of the five optimizers described in §6–7: **[docs/vbot/parity.md](parity.md) §2**.
+
 Source of truth (READ-ONLY):
 `D:\Claude\otclient_mehah1530\otclient\profiles\bot\vBot_4.8\vBot\AttackBot.lua`
 — **3105 lines**, cited below as `AB:NNNN`. Supporting: `vBot/vlib.lua` (`VL`),

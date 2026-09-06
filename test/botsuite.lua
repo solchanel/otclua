@@ -21,6 +21,9 @@ places where two modules have to agree:
   * TargetBot's attack is what makes AttackBot fire (`bot._attacking`),
   * TargetBot suspends CaveBot (`bot:isActionAllowed('cavebot')`),
   * HealBot and AttackBot share ONE use-cooldown slot (bot/shared.lua),
+  * Stances derives getStance()/getSecondaryStance() through the same
+    bot/api.lua rule the shim uses (`bot._attacking`'s sibling: one source of
+    truth instead of two),
   * the BOT.md status object,
   * storage round-trips to disk without dropping the user's unknown fields.
 
@@ -197,13 +200,19 @@ local function newSender(clock)
     s.attack        = rec('attack', { 'id' })
     s.follow        = rec('follow', { 'id' })
     s.cancelAttackAndFollow = rec('cancelAttackAndFollow', {})
-    s.setFightMode  = rec('setFightMode', { 'fight', 'chase', 'safe' })
+    s.setFightMode  = rec('setFightMode', { 'fight', 'chase', 'safe', 'pvp' })
     s.buyItem       = rec('buy',    { 'id', 'sub', 'amount' })
     s.sellItem      = rec('sell',   { 'id', 'sub', 'amount' })
     s.openContainer = rec('open',   { 'pos', 'id', 'stack', 'cid' })
     s.closeContainer= rec('close',  { 'cid' })
     s.ping          = rec('ping',   {})
     s.pingBack      = rec('pingBack', {})
+    -- work item Q1: the withdraw family only needed move/open/close (already above); the
+    -- imbuing action needs its own four builders.
+    s.applyImbuement       = rec('applyImbuement',       { 'slot', 'imbuementId', 'protection' })
+    s.clearImbuement       = rec('clearImbuement',       { 'slot' })
+    s.closeImbuingWindow   = rec('closeImbuingWindow',   {})
+    s.imbuementWindowAction= rec('imbuementWindowAction',{ 'actionType', 'itemId', 'pos', 'stackpos' })
     function s:clear() for i = #sent, 1, -1 do sent[i] = nil end end
     function s:all() return sent end
     function s:byKind(kind)
@@ -250,6 +259,7 @@ local function newHost(F, opts)
     H.tb = b.modules.targetbot
     H.hb = b.modules.healbot
     H.ab = b.modules.attackbot
+    H.stc = b.modules.stances
     H.sup = b.modules.supplies
 
     function H:advance(ms) clock.t = clock.t + ms end
@@ -313,7 +323,7 @@ do
 end
 
 -- ============================================================================
-S('wiring: one world / path / walker, four modules, BOT.md macro order')
+S('wiring: one world / path / walker, five modules, BOT.md macro order')
 do
     local F = newWorld({ '.....', '..@..', '.....' })
     local H = newHost(F)
@@ -321,6 +331,7 @@ do
 
     ok(b.modules.healbot   ~= nil, 'healbot is registered')
     ok(b.modules.attackbot ~= nil, 'attackbot is registered')
+    ok(b.modules.stances   ~= nil, 'stances is registered (work item N1)')
     ok(b.modules.targetbot ~= nil, 'targetbot is registered')
     ok(b.modules.cavebot   ~= nil, 'cavebot is registered')
     ok(b.modules.supplies  ~= nil, 'supplies is registered (through cavebot)')
@@ -332,7 +343,9 @@ do
     ok(H.cb.walker == b.walker and H.tb.walker == b.walker,
        'and the WALKER -- one step ledger, so the two can never double-step')
     ok(H.hb.sh == H.ab.sh, 'HealBot and AttackBot share ONE bot/shared.lua cooldown slot')
+    ok(H.stc.sh == H.hb.sh, 'Stances shares it too')
     ok(H.ab.world == b.world, 'AttackBot counts monsters through the same world')
+    ok(H.stc.world == b.world, 'Stances counts monsters through the same world')
 
     -- registration order == priority order == intra-tick send order
     local periods, names = {}, {}
@@ -340,15 +353,15 @@ do
         periods[i] = m.timeout
         names[i] = (#m.name > 0) and m.name or '-'
     end
-    eq(#b._macros, 8, 'eight macros are registered')
-    eqList(periods, { 500, 50, 50, 100, 50, 100, 50, 200 },
+    eq(#b._macros, 9, 'nine macros are registered')
+    eqList(periods, { 500, 50, 50, 100, 50, 200, 100, 50, 200 },
            'the periods, in registration order')
-    eqList(names, { '-', '-', '-', '-', '-', '-', 'CaveBot', 'CaveBot AntiLost' },
+    eqList(names, { '-', '-', '-', '-', '-', '-', '-', 'CaveBot', 'CaveBot AntiLost' },
            'only the two CaveBot macros are named (vBot keeps the rest unnamed)')
     -- 1-4 healbot (conditions500, conditions50, spells50, items100), 5 attackbot,
-    -- 6 targetbot, 7-8 cavebot
-    ok(b._macros[5].timeout == 50 and b._macros[6].timeout == 100,
-       'attackbot (50 ms) precedes targetbot (100 ms), which precedes CaveBot')
+    -- 6 stances, 7 targetbot, 8-9 cavebot
+    ok(b._macros[5].timeout == 50 and b._macros[6].timeout == 200 and b._macros[7].timeout == 100,
+       'attackbot (50 ms) precedes stances (200 ms), which precedes targetbot (100 ms), which precedes CaveBot')
 
     -- idempotence
     local before = #b._macros
@@ -405,6 +418,23 @@ do
                                       dontLoot = true } },
                       looting = { items = {}, containers = {} } },
         enableTargetbot = true } })
+
+    -- H.ab reads the user's REAL, live AttackBot.json (bot/init.lua's wireModules
+    -- has no synthetic-config hook for attackbot, unlike targetbot/cavebot above)
+    -- so its profile-level `enabled` and attackTable[1].enabled mirror the user's
+    -- own in-game toggles and drift independently of this suite -- as of this
+    -- session both currently read false. This test proves the TargetBot->
+    -- AttackBot bridge, not either live toggle, so force them on the same way
+    -- test/bot_m1.lua's loadAttackBotJsonOn() does, through the module's own
+    -- profile() accessor (the file on disk is never touched).
+    if H.ab then
+        H.ab:enable()
+        local p = H.ab:profile()
+        if p then
+            p.enabled = true
+            for _, entry in ipairs(p.attackTable or {}) do entry.enabled = true end
+        end
+    end
 
     eq(H.tb:isOn(), true, 'TargetBot is on')
     eq(#H.tb.targeting, 1, 'the synthetic targeting list loaded')
@@ -632,6 +662,207 @@ do
 end
 
 -- ============================================================================
+-- WORK ITEM Q3 -- full audit against the real vBot.  The port already matched vBot on
+-- every point re-checked (constants, scoring formula, luring/keepDistance/rePosition
+-- movement, the looting state machine, container/slot arithmetic) -- see the audit table
+-- in the work item report.  These assertions pin the subtle, easy-to-regress corners the
+-- audit found were CORRECT but previously untested.
+-- ============================================================================
+S('priority scoring: diamond-arrows self-count floor, and the low-HP chase quirk')
+do
+    local F = newWorld({ '@.......' })
+    local H = newHost(F, { wire = { targetbot = { targeting = {}, looting = {} } } })
+    local tb = H.tb
+
+    -- getCreaturesInArea excludes only the LOCAL PLAYER (vlib.lua:1055-1078), so a LONE
+    -- monster counts itself inside its own diamond -> mobCount >= 1 -> a FLOOR of +4 on
+    -- every diamondArrows match (creature_priority.lua:33-36, VERIFIER "Additions").
+    local mon = { id = 9500, name = 'Solo', pos = F.at(5, 0), healthPercent = 100,
+                  isMonster = true, type = 1 }
+    -- countCreaturesInArea scans the WORLD, so the creature has to actually be placed
+    -- (a bare Lua table handed to calculatePriority is not enough on its own).
+    F.st:addCreature(mon)
+    F.st:addThing(mon.pos, -2, { kind = 'creature', creatureId = mon.id, id = 0x63 })
+    local cfgDiamond = { priority = 4, maxDistance = 10, diamondArrows = true, chase = true }
+    eq(tb:calculatePriority(mon, cfgDiamond, 5), 8,
+       'turter.json (priority 4, diamondArrows true): a lone Dark Torturer scores 4+4=8')
+
+    -- the low-HP bonus is an if/ELSEIF chain (creature_priority.lua:48-58): with
+    -- chase=true a 15% monster gets +5 and the <20/<40/<60/<80 branches never run.
+    mon.healthPercent = 15
+    local cfgChase   = { priority = 0, maxDistance = 10, chase = true  }
+    local cfgNoChase = { priority = 0, maxDistance = 10, chase = false }
+    eq(tb:calculatePriority(mon, cfgChase,   5), 5,
+       'chase=true & hp<30 -> +5, the <20/<40/... elseifs never run')
+    eq(tb:calculatePriority(mon, cfgNoChase, 5), 2.5,
+       'chase=false: the same 15% monster instead falls into the <20 branch, +2.5')
+end
+
+-- ============================================================================
+S('rpSafe cancels the attack when the current target drifts out of maxDistance')
+do
+    local F = newWorld({ '@.......' })
+    local H = newHost(F, { wire = { targetbot = { targeting = {}, looting = {} } } })
+    local tb = H.tb
+    local mon = { id = 9600, name = 'Runner', pos = F.at(8, 0), healthPercent = 100,
+                  isMonster = true, type = 1 }
+    tb.attackingId = mon.id                            -- pretend we are already fighting it
+    H.sender:clear()
+    local cfg = { priority = 5, maxDistance = 3, rpSafe = true, chase = true }
+    local p = tb:calculatePriority(mon, cfg, 6)         -- 6 path steps > maxDistance 3
+    eq(p, 1, 'creature_priority.lua:12-19 -- only the +1 hysteresis survives the range gate')
+    eq(H.sender:count('cancelAttackAndFollow'), 1,
+       'rpSafe drops a target that walked out of range (0xBE)')
+    eq(tb.attackingId, nil, 'and TargetBot forgets it')
+end
+
+-- ============================================================================
+S('keepDistance: the dead band is exactly {range, range+1}, nothing else')
+do
+    local F = newWorld({ '@..........' })
+    local H = newHost(F, { wire = { targetbot = { targeting = {}, looting = {} } } })
+    local tb = H.tb
+    local cfg = { keepDistance = true, keepDistanceRange = 2, anchorRange = 3, chase = false,
+                  avoidAttacks = false, faceMonster = false, rePosition = false, anchor = false }
+
+    local function destAt(dist)
+        tb.dest, tb.anchorPos = nil, nil
+        local mon = { id = 9700, name = 'Kiter', pos = F.at(dist, 0), healthPercent = 100,
+                      isMonster = true, type = 1 }
+        tb:creatureWalk(mon, cfg, 1)
+        return tb.dest
+    end
+
+    -- creature_attack.lua:182: `#currentDistance ~= range and #currentDistance ~= range+1`
+    ok(destAt(2) == nil, 'distance == range: inside the dead band, no movement issued')
+    ok(destAt(3) == nil, 'distance == range+1: still inside the dead band')
+    ok(destAt(1) ~= nil, 'distance == range-1: below the band, TargetBot repositions')
+    ok(destAt(5) ~= nil, 'distance == range+2: above the band, TargetBot repositions')
+end
+
+-- ============================================================================
+S('loot: everyItem inverts the list into an IGNORE list')
+do
+    local F = newWorld({ '@..' })
+    local H = newHost(F)
+    local lt = H.tb.loot
+    lt:update({ items = { { id = 9636 } },                     -- now the id to IGNORE
+                containers = { { id = ID_BACKPACK } }, everyItem = true,
+                maxDanger = 10, minCapacity = 100 })
+    local bag = addContainer(F.st, 0, ID_BACKPACK, {})
+    local corpseItems = { { kind = 'item', id = 9636 }, { kind = 'item', id = 3300 } }
+    local corpse = addContainer(F.st, 1, ID_CORPSE, corpseItems)
+
+    H.sender:clear()
+    lt:lootContainer({ bag }, corpse)
+    local mv = H.sender:byKind('move')
+    eq(#mv, 1, 'exactly one item moves this call')
+    eq(mv[1].id, 3300, 'looting.lua:243 -- everyItem takes anything NOT on the (ignore) list')
+end
+
+-- ============================================================================
+S('looting: the full state machine end to end -- two corpses, a mixed list, a skip, a walk timeout')
+do
+    -- corpse1 ("Near") at distance 2 from the player, corpse2 ("Far") at distance 7
+    local F = newWorld({ '@.c....c' })
+    local H = newHost(F, { wire = {
+        targetbot = { targeting = { { name = '*', priority = 1 } },
+                      looting = { items = { { id = ID_GOLD }, { id = 3300 } },
+                                  containers = { { id = ID_BACKPACK } },
+                                  everyItem = false, maxDanger = 10, minCapacity = 100 } },
+        enableTargetbot = true } })
+    local lt = H.tb.loot
+    local function tickTime(ms) H:advance(ms); H.bot.now = H.clock.t end
+
+    addContainer(F.st, 0, ID_BACKPACK, {})             -- our own bag, already open
+
+    -- Inject the queue directly -- discovery itself (onCreatureDisappear -> the 20 ms
+    -- deferred tile check) is already exercised end to end by the single-corpse test
+    -- above.  vBot's insert-time sort is FARTHEST FIRST (looting.lua:333-338: descending
+    -- distance), and with the default lootLast=true (the real profile's stored value) the
+    -- NEAREST corpse (list[#list]) is the one actually processed first.
+    lt.list = {
+        { pos = F.corpses[2], creature = 'Far',  container = ID_CORPSE, added = 0, tries = 0, seq = 1 },
+        { pos = F.corpses[1], creature = 'Near', container = ID_CORPSE, added = 0, tries = 0, seq = 2 },
+    }
+
+    -- step 1: open the NEAR corpse first
+    H.sender:clear()
+    lt:process(0, 0)
+    local op = H.sender:byKind('open')
+    eq(#op, 1, 'the near corpse is opened (lootLast=true picks list[#list])')
+    eq(op[1].id, ID_CORPSE, 'by the corpse item id')
+    eq(op[1].pos.x, F.corpses[1].x, 'at the near corpse tile, not the far one')
+
+    -- the "server" answers: junk (not on the list), a listed unique item, and gold
+    local corpseItems = { { kind = 'item', id = 9636 },               -- skip: not on the list
+                          { kind = 'item', id = 3300 },               -- listed, non-stackable
+                          { kind = 'item', id = ID_GOLD, count = 50 } }
+    local corpse = addContainer(F.st, 1, ID_CORPSE, corpseItems)
+    lt:onContainerOpen(corpse)
+    ok(lt.isLootContainer[1] == true,
+       'onContainerOpen matched the corpse item id and flagged the window (looting.lua:303-308)')
+
+    -- step 2: the unique item leaves first -- junk at slot 1 is skipped over, not taken
+    tickTime(400); H.sender:clear()
+    lt:process(0, 0)
+    local mv = H.sender:byKind('move')
+    eq(#mv, 1, 'exactly one item moves per lootContainer call (looting.lua:237-274)')
+    eq(mv[1].id, 3300, 'the listed unique item is taken')
+    eq(mv[1].count, 1, 'a non-stackable item moves as count 1')
+    table.remove(corpseItems, 2)                        -- the "server" applies the move
+    local bag = F.st.containers[0]
+    bag.items[#bag.items + 1] = { kind = 'item', id = 3300, count = 1 }
+
+    -- step 3: gold next; the FIRST pass on a fresh stack always appends exactly ONE unit
+    -- (looting.lua:298-300), never the full source count
+    tickTime(400); H.sender:clear()
+    lt:process(0, 0)
+    mv = H.sender:byKind('move')
+    eq(#mv, 1, 'one move')
+    eq(mv[1].id, ID_GOLD, 'the gold is next (junk still left alone)')
+    eq(mv[1].count, 1, 'first pass on a fresh stack moves exactly ONE unit, verbatim vBot')
+    corpseItems[2].count = 49
+    bag.items[#bag.items + 1] = { kind = 'item', id = ID_GOLD, count = 1 }
+
+    -- step 4: the second pass finds the partial stack in the bag and MERGES the rest
+    tickTime(400); H.sender:clear()
+    lt:process(0, 0)
+    mv = H.sender:byKind('move')
+    eq(#mv, 1, 'one move')
+    eq(mv[1].count, 49, 'the merge branch moves the WHOLE remaining stack (looting.lua:288-292)')
+    table.remove(corpseItems, 2)
+    bag.items[#bag.items].count = 50
+
+    -- step 5: nothing left but junk -> close the corpse and drop the queue entry
+    tickTime(400); H.sender:clear()
+    lt:process(0, 0)
+    eq(H.sender:count('close'), 1, 'the emptied corpse window is closed (looting.lua:270-273)')
+    eq(#lt.list, 1, 'the near corpse is gone from the queue; the far one remains')
+    eq(#corpseItems, 1, 'the skipped item (9636, not on the list) is left behind forever')
+    ok(lt.isLootContainer[1] == nil, 'and the window is unflagged')
+
+    -- step 6: the far corpse can never be approached (the player never moves).
+    -- MAX_WALK_TRIES (looting.lua:152, `tries > 30`) is vBot's only real "give up"
+    -- mechanism for a corpse the looter cannot reach -- this is what a "container that
+    -- never opens" resolves to in real vBot.  A corpse whose OPEN packet is sent but never
+    -- confirmed has NO separate ack-timeout in vBot: it just re-sends g_game.open forever.
+    -- That is reproduced verbatim (not "fixed") and is deliberately NOT what this exercises.
+    H.sender:clear()
+    local droppedAt = nil
+    for i = 1, 50 do
+        tickTime(10)
+        lt:process(0, 0)
+        if #lt.list == 0 then droppedAt = i; break end
+    end
+    ok(droppedAt ~= nil and droppedAt > 30 and droppedAt <= 40,
+       'the unreachable far corpse is abandoned once tries > 30 (call '
+       .. tostring(droppedAt) .. ')')
+    eq(H.sender:count('open'), 0, 'it was never close enough to even attempt opening')
+    eq(#lt.list, 0, 'the queue is empty -- both corpses resolved')
+end
+
+-- ============================================================================
 S('supplies: the real Supplies.json thresholds drive the round gate')
 do
     local F = newWorld({ '..@..' })
@@ -776,6 +1007,7 @@ do
     ok(s.player.pos and s.player.pos.z == 7, 'player.pos')
     ok(type(s.healbot) == 'table',   'healbot block')
     ok(type(s.attackbot) == 'table', 'attackbot block')
+    ok(type(s.stances) == 'table',   'stances block (work item N1)')
     ok(type(s.cavebot) == 'table',   'cavebot block')
     ok(s.cavebot.waypointCount == 1, 'cavebot.waypointCount')
     ok(s.cavebot.waypointIndex ~= nil, 'cavebot.waypointIndex')
@@ -783,7 +1015,7 @@ do
     ok(s.targetbot.target ~= nil, 'targetbot.target is populated while fighting')
     if s.targetbot.target then eq(s.targetbot.target.name, 'Dragon', 'target name') end
     ok(type(s.targetbot.danger) == 'number', 'targetbot.danger')
-    ok(type(s.macros) == 'table' and #s.macros == 8, 'macros list')
+    ok(type(s.macros) == 'table' and #s.macros == 9, 'macros list')
     ok(type(s.supplies) == 'table', 'supplies block')
     -- it must be serialisable for the future web panel: no cycles
     local okj, js = pcall(cfgmod.jsonEncode, s)
@@ -1356,6 +1588,313 @@ do
     eq(ab.ek, true, 'the latch is frozen afterwards, as the VERIFIER requires')
 end
 
+-- ============================================================================
+-- work item Q2: the five spell optimizers, wired as the DEFAULT behaviour of
+-- A:tryOptimizedSpell (docs/vbot/attackbot-full.md section 6).  Each scenario
+-- below matches a documented example (6.2's "tight line of monsters leading
+-- away from the player" for the hop chains, the "aim at the player's own
+-- feet" case of 6.3 for TFB, and a star cluster around the SEED rather than
+-- the player for the fork spells), drives ONE ab:tick() with opts.optimizers
+-- = true and NO hook, and cross-checks the packet against the same entry run
+-- with the optimizer off (the plain per-category dispatch of section 5).
+-- ============================================================================
+local function optEntry(overrides)
+    local e = { enabled = true, itemId = 0, category = 5, patternCategory = 4,
+                pattern = 18, count = 1, orMore = true, minHp = 0, maxHp = 100,
+                mana = 10, harmony = 0, monsters = true, spell = 'exori med pug',
+                cooldown = 1, augmented = false }
+    for k, v in pairs(overrides or {}) do e[k] = v end
+    return e
+end
+
+local function talkSpells(H) return H.sender:byKind('talkSpell') end
+local function attacks(H) return H.sender:byKind('attack') end
+
+S('AttackBot optimizers (Q2): Chained Penance hops past the legacy 5 sqm cutoff')
+do
+    -- exori med pug: castRange 3, jumps 4, jumpDist 2 (bot/data/optimizers.lua).
+    -- A line of 4 monsters 2 sqm apart, seeded at distance 2 from the player:
+    -- the CHAIN reaches all four (2,4,6,8 sqm out), but the legacy chain
+    -- fallback (AB:2978-3006) only ever counts within 5 sqm of the PLAYER, so
+    -- it sees just the first two and never fires.
+    local F = newWorld({ '@.m.m.m.m' })
+    local seed = F.monsters[1]
+    local entry = optEntry({ spell = 'exori med pug', pattern = 18, count = 4, orMore = true })
+
+    -- optimizer ON
+    do
+        local H = newHost(F, { wire = { attackbotOpts = { optimizers = true } } })
+        local ab = H.ab
+        ab:profile().enabled = true
+        ab:profile().PvpSafe = false
+        ab:profile().OptPenance = true
+        ab:profile().attackTable = { entry }
+        H.bot._attacking = seed.id
+        H.sender:clear()
+        ab:tick()
+
+        local casts = talkSpells(H)
+        local hit = nil
+        for _, s in ipairs(casts) do if s.text == 'exori med pug' then hit = s end end
+        ok(hit ~= nil, 'the optimizer cast Chained Penance', casts[1] and casts[1].text)
+        eq(hit and hit.aim, 3, 'aimed at the (already current) target, not a position')
+        eq(#attacks(H), 0, 'the seed WAS already the target -> no attack(seed) retarget')
+    end
+
+    -- optimizer OFF -- same entry, same world: the legacy chain-estimate path
+    -- (pattern 18) counts only 2 of the 4 (within 5 sqm of the player) and
+    -- entry.count = 4 with orMore never gates true.
+    do
+        local H = newHost(F, { wire = { attackbotOpts = { optimizers = false } } })
+        local ab = H.ab
+        ab:profile().enabled = true
+        ab:profile().PvpSafe = false
+        ab:profile().attackTable = { entry }
+        H.bot._attacking = seed.id
+        H.sender:clear()
+        ab:tick()
+        eq(#talkSpells(H), 0, 'legacy path: the 5 sqm cutoff never sees 4 -> no cast')
+    end
+end
+
+S('AttackBot optimizers (Q2): Spiritual Outburst re-targets the better chain seed')
+do
+    -- exori gran mas nia: castRange 3, jumps 7, jumpDist 2.  TargetBot is
+    -- attacking a lone monster at distance 3; a second, un-attacked monster at
+    -- distance 2 anchors a 5-long chain reaching out to 10 sqm.  The optimizer
+    -- must pick the SECOND seed (higher `counted`), send attack(seed) for it,
+    -- THEN cast -- exactly AB:1503-1512 / 1624-1629.
+    local F = newWorld({ 'm.m.m.m.m.@..m' })
+    -- monsters, in scan order: (-10,0) (-8,0) (-6,0) (-4,0) (-2,0) (0,0)=@ ... (+3,0)
+    local chain5, chain4, chain3, chain2, chain1, bad = F.monsters[1], F.monsters[2],
+        F.monsters[3], F.monsters[4], F.monsters[5], F.monsters[6]
+    local entry = optEntry({ spell = 'exori gran mas nia', pattern = 17, count = 5, orMore = true })
+
+    do
+        local H = newHost(F, { wire = { attackbotOpts = { optimizers = true } } })
+        local ab = H.ab
+        ab:profile().enabled = true
+        ab:profile().PvpSafe = false
+        ab:profile().OptOutburst = true
+        ab:profile().attackTable = { entry }
+        H.bot._attacking = bad.id                 -- the currently-attacked monster: a bad seed
+        H.sender:clear()
+        ab:tick()
+
+        local atk = attacks(H)
+        ok(#atk > 0, 'the optimizer re-targeted', 'no attack packet went out')
+        eq(atk[#atk] and atk[#atk].id, chain1.id, 'attack(seed) picked the chain of 5, not the lone monster')
+        eq(H.bot._attacking, chain1.id, 'and bot._attacking was updated to match')
+
+        local casts = talkSpells(H)
+        local hit = nil
+        for _, s in ipairs(casts) do if s.text == 'exori gran mas nia' then hit = s end end
+        ok(hit ~= nil, 'Spiritual Outburst was cast', casts[1] and casts[1].text)
+    end
+
+    -- optimizer OFF -- the legacy path is still anchored on the ORIGINAL
+    -- target (distance 3, inside castRange) and counts within 5 sqm of the
+    -- PLAYER regardless of chain topology: bad(3) + chain1(2) + chain2(4) = 3,
+    -- never reaching entry.count = 5.
+    do
+        local H = newHost(F, { wire = { attackbotOpts = { optimizers = false } } })
+        local ab = H.ab
+        ab:profile().enabled = true
+        ab:profile().PvpSafe = false
+        ab:profile().attackTable = { entry }
+        H.bot._attacking = bad.id
+        H.sender:clear()
+        ab:tick()
+        eq(#talkSpells(H), 0, 'legacy path: only 3 within 5 sqm of the player -> no cast')
+        eq(#attacks(H), 0, 'and the legacy chain fallback never re-targets')
+    end
+end
+
+S('AttackBot optimizers (Q2): Forked Thorns stars around the SEED, not the player')
+do
+    -- exevo fur tera: castRange 4, jumps 5, jumpDist 4, mode 'star' -- every
+    -- extra hit is measured from the SEED, never chained (AB:1458-1473).  The
+    -- seed sits 4 sqm out (the edge of castRange); three more monsters cluster
+    -- 4 sqm from the SEED but 8 sqm from the player, so a self-centred legacy
+    -- area (radius 1, entered here as category 5 pattern 1) never sees them.
+    local F = newWorld({ '........m',
+                          '.........',
+                          '.........',
+                          '@...m...m',
+                          '.........',
+                          '.........',
+                          '........m' })
+    -- scan order: (8,-3) (4,0)=seed (8,0) (8,3)
+    local far1, seed, far2, far3 = F.monsters[1], F.monsters[2], F.monsters[3], F.monsters[4]
+    local entry = optEntry({ spell = 'exevo fur tera', pattern = 1, count = 4, orMore = true })
+
+    do
+        local H = newHost(F, { wire = { attackbotOpts = { optimizers = true } } })
+        local ab = H.ab
+        ab:profile().enabled = true
+        ab:profile().PvpSafe = false
+        ab:profile().OptThorns = true
+        ab:profile().attackTable = { entry }
+        H.bot._attacking = seed.id
+        H.sender:clear()
+        ab:tick()
+
+        local casts = talkSpells(H)
+        local hit = nil
+        for _, s in ipairs(casts) do if s.text == 'exevo fur tera' then hit = s end end
+        ok(hit ~= nil, 'Forked Thorns fired: the star reaches 4 (seed + 3) around the seed',
+           casts[1] and casts[1].text)
+        eq(#attacks(H), 0, 'the seed was already the target -> no retarget')
+    end
+
+    do
+        local H = newHost(F, { wire = { attackbotOpts = { optimizers = false } } })
+        local ab = H.ab
+        ab:profile().enabled = true
+        ab:profile().PvpSafe = false
+        ab:profile().attackTable = { entry }
+        H.bot._attacking = seed.id
+        H.sender:clear()
+        ab:tick()
+        eq(#talkSpells(H), 0,
+           'legacy self-area (radius 1 around the PLAYER) sees 0 of the 4 -> no cast')
+    end
+end
+
+S('AttackBot optimizers (Q2): Forked Glacier stars around the SEED, not the player')
+do
+    -- exevo fur frigo: same castRange/jumpDist as Thorns (4/4), a longer jump
+    -- cap (6) that this scenario never approaches.  Identical geometry,
+    -- different formula and profile flag, so both star spells are exercised.
+    local F = newWorld({ '........m',
+                          '.........',
+                          '.........',
+                          '@...m...m',
+                          '.........',
+                          '.........',
+                          '........m' })
+    local seed = F.monsters[2]
+    local entry = optEntry({ spell = 'exevo fur frigo', pattern = 1, count = 4, orMore = true })
+
+    do
+        local H = newHost(F, { wire = { attackbotOpts = { optimizers = true } } })
+        local ab = H.ab
+        ab:profile().enabled = true
+        ab:profile().PvpSafe = false
+        ab:profile().OptGlacier = true
+        ab:profile().attackTable = { entry }
+        H.bot._attacking = seed.id
+        H.sender:clear()
+        ab:tick()
+
+        local casts = talkSpells(H)
+        local hit = nil
+        for _, s in ipairs(casts) do if s.text == 'exevo fur frigo' then hit = s end end
+        ok(hit ~= nil, 'Forked Glacier fired', casts[1] and casts[1].text)
+    end
+
+    do
+        local H = newHost(F, { wire = { attackbotOpts = { optimizers = false } } })
+        local ab = H.ab
+        ab:profile().enabled = true
+        ab:profile().PvpSafe = false
+        ab:profile().attackTable = { entry }
+        H.bot._attacking = seed.id
+        H.sender:clear()
+        ab:tick()
+        eq(#talkSpells(H), 0, 'legacy self-area again sees 0 -> no cast')
+    end
+end
+
+S('AttackBot optimizers (Q2): Thousand Fist Blows aims at the caster\'s own feet')
+do
+    -- exori mas amp pug (tile mode, castRange 5).  Four monsters cluster
+    -- within the TFB 5x5-minus-corners area CENTRED ON THE PLAYER; the
+    -- currently-attacked monster is 6 sqm away and alone.  findBestTfbTile
+    -- seeds the player's own tile first (AB:1530-1535) and it already scores
+    -- higher than anything else on the map, so the optimizer throws at its
+    -- own feet -- the legacy pattern-15 path (centred on the far TARGET, and
+    -- gated at distanceFromPlayer(target) <= 5) never fires at all.
+    local F = newWorld({ '.............',
+                          '.............',
+                          '.............',
+                          '.............',
+                          '......m......',
+                          '.............',
+                          '....m.@.m....',
+                          '.............',
+                          '......m......',
+                          '.............',
+                          '.............',
+                          '.............',
+                          '............m' })
+    -- scan order: (0,-2) (-2,0) (2,0) (0,2) (6,6)=far/current target
+    local near1, near2, near3, near4, far = F.monsters[1], F.monsters[2], F.monsters[3],
+                                             F.monsters[4], F.monsters[5]
+    local entry = optEntry({ spell = 'exori mas amp pug', pattern = 15, count = 4, orMore = true })
+
+    do
+        local H = newHost(F, { wire = { attackbotOpts = { optimizers = true } } })
+        local ab = H.ab
+        ab:profile().enabled = true
+        ab:profile().PvpSafe = false
+        ab:profile().OptTFB = true
+        ab:profile().attackTable = { entry }
+        H.bot._attacking = far.id
+        H.sender:clear()
+        ab:tick()
+
+        local casts = talkSpells(H)
+        local hit = nil
+        for _, s in ipairs(casts) do if s.text == 'exori mas amp pug' then hit = s end end
+        ok(hit ~= nil, 'Thousand Fist Blows was thrown', casts[1] and casts[1].text)
+        eq(hit and hit.aim, 2, 'castAtPos aims at a POSITION (SpellAimCursor = 2), not the target')
+        if hit then
+            eq(hit.pos and hit.pos.x, F.start.x, 'aimed at the caster\'s own X')
+            eq(hit.pos and hit.pos.y, F.start.y, 'aimed at the caster\'s own Y')
+        end
+    end
+
+    do
+        local H = newHost(F, { wire = { attackbotOpts = { optimizers = false } } })
+        local ab = H.ab
+        ab:profile().enabled = true
+        ab:profile().PvpSafe = false
+        ab:profile().attackTable = { entry }
+        H.bot._attacking = far.id
+        H.sender:clear()
+        ab:tick()
+        eq(#talkSpells(H), 0,
+           'legacy pattern-15 (centred on the far target, range <= 5) never fires')
+    end
+end
+
+S('AttackBot optimizers (Q2): opts.optimizers = false leaves the legacy path untouched')
+do
+    -- Same Chained Penance scenario as above, with OptPenance = true in the
+    -- PROFILE (as it genuinely is on the user's real profile 1) -- proving the
+    -- MODULE-level opts.optimizers switch, not the profile flag, is the gate.
+    local F = newWorld({ '@.m.m.m.m' })
+    local seed = F.monsters[1]
+    local entry = optEntry({ spell = 'exori med pug', pattern = 18, count = 4, orMore = true })
+
+    local H = newHost(F, { wire = { attackbotOpts = { optimizers = false } } })
+    local ab = H.ab
+    ab:profile().enabled = true
+    ab:profile().PvpSafe = false
+    ab:profile().OptPenance = true
+    ab:profile().attackTable = { entry }
+    H.bot._attacking = seed.id
+
+    local handled, fired = ab:tryOptimizedSpell(entry, 30)
+    eq(handled, false, 'opts.optimizers = false -> tryOptimizedSpell never handles the entry')
+    eq(fired, false, '... and never fires it either')
+
+    H.sender:clear()
+    ab:tick()
+    eq(#talkSpells(H), 0, 'a whole tick confirms it: unchanged pre-Q2 behaviour (no cast)')
+end
+
 S('REVIEW: HealBot burst damage -- the divide-by-zero guard is a switch')
 do
     local F = newWorld({ '@..' })
@@ -1657,6 +2196,447 @@ do
     ok(pushes > 0, 'the push really was attempted (' .. pushes .. 'x)')
 end
 
+-- ============================================================================
+-- work item Q1: the six action types that were `_unimplemented` (dpwithdraw, imbuing,
+-- inwithdraw, rushlure, tasker, withdraw).  One scenario per type, asserting the exact
+-- packet/state change, per the work item's PROOF requirement.
+-- ============================================================================
+S('Q1 withdraw: source=depot box index -> exact move packet, then "enough" closes up')
+do
+    local F = newWorld({ '@.' })
+    local H = newHost(F)
+    local cb = H.cb
+    local GOLD = 3031
+    -- the depot box's own 50 gold already counts toward itemAmount() while it is open
+    -- (visibleCount scans EVERY open container, the depot box included -- a real vBot
+    -- quirk, not one introduced here), so the request has to exceed that 50 to see a move.
+    local depot = addContainer(F.st, 0, 3502, { { kind = 'item', id = GOLD, count = 50 } })
+    depot.name = 'depot box 1'
+    local bag = addContainer(F.st, 1, ID_BACKPACK, {})
+    bag.name = 'backpack'
+
+    H.sender:clear()
+    eq(cb:_actionWithdraw('1,3031,100', 0), 'retry', 'only 50 of the 100 requested -> retry')
+    local mv = H.sender:byKind('move')
+    eq(#mv, 1, 'exactly one move packet')
+    eqList({ mv[1].fromPos.x, mv[1].fromPos.y, mv[1].fromPos.z }, { 0xFFFF, 0x40, 0 },
+           'fromPos is the depot box\'s own slot 0')
+    eqList({ mv[1].toPos.x, mv[1].toPos.y, mv[1].toPos.z }, { 0xFFFF, 0x41, 0 },
+           'toPos is the backpack\'s next free slot (0)')
+    eq(mv[1].id, GOLD, 'moving the right item id')
+    eq(mv[1].count, 50, 'min(amount - have, item count) = min(100-50,50)')
+
+    -- now the player already has enough: the action closes depot/locker and reports done
+    F.st.player.inventory[1] = { id = GOLD, count = 100 }
+    H.sender:clear()
+    eq(cb:_actionWithdraw('1,3031,100', 1), true, 'enough items now -> proceeding')
+    eq(H.sender:count('close'), 1, 'and the depot box is closed (withdraw.lua:23-26)')
+end
+
+S('Q1 withdraw: a non-numeric source routes to the inbox, not a depot box')
+do
+    local F = newWorld({ '@.' })
+    local H = newHost(F)
+    local cb = H.cb
+    -- nothing named depot/inbox is open yet, and no Locker is nearby either: the action
+    -- can only call ReachAndOpenInbox() (which stalls with no locker in sight) and retry.
+    H.sender:clear()
+    eq(cb:_actionWithdraw('inbox,3031,50', 0), 'retry',
+       '"inbox" is not a number, so fromDepot is nil -> ReachAndOpenInbox, not OpenDepotBox')
+    eq(H.sender:count('open'), 0, 'no locker in sight yet, so nothing was opened')
+end
+
+S('Q1 dpwithdraw: cap limit bails out and closes depot/locker; then the real move packet')
+do
+    local F = newWorld({ '@.' })
+    local H = newHost(F)
+    local cb = H.cb
+    local BAG_ID = 21411
+    local locker = addContainer(F.st, 5, 3497, {})
+    locker.name = 'depot box'          -- stand-in "already open depot box" container
+    F.st.player.freeCapacity = 50
+
+    H.sender:clear()
+    eq(cb:_actionDpWithdraw('1, shopping bag, ' .. BAG_ID, 0), false,
+       'freecap 50 < the default 200 limit -> proceeding')
+    eq(H.sender:count('close'), 1, 'the depot box container was closed on the way out')
+    F.st.containers[5] = nil           -- the close above really did close it
+
+    F.st.player.freeCapacity = 1000
+    local dest = addContainer(F.st, 6, ID_BACKPACK, {})
+    dest.name = 'shopping bag'
+    local depotBox = addContainer(F.st, 7, 3497,
+        { { kind = 'item', id = BAG_ID, count = 1 } })
+    depotBox.name = 'depot box 1'
+    -- OpenDepotBox (new_cavebot_lib.lua:444) requires "Depot chest" to be open even when a
+    -- depot box already is -- as if it were opened by an earlier waypoint in the route.
+    local depotChest = addContainer(F.st, 8, 3502, {})
+    depotChest.name = 'Depot chest'
+
+    H.sender:clear()
+    eq(cb:_actionDpWithdraw('1, shopping bag, ' .. BAG_ID, 1), 'retry',
+       'destination found, depot box already open -> withdraw in progress')
+    local mv = H.sender:byKind('move')
+    eq(#mv, 1, 'exactly one move packet')
+    eqList({ mv[1].fromPos.x, mv[1].fromPos.y, mv[1].fromPos.z }, { 0xFFFF, 0x40 + 7, 0 },
+           'fromPos is the depot box\'s own first slot')
+    eqList({ mv[1].toPos.x, mv[1].toPos.y, mv[1].toPos.z }, { 0xFFFF, 0x40 + 6, 0 },
+           'toPos is the shopping bag\'s next free slot (0, empty so far)')
+    eq(mv[1].id, BAG_ID, 'moving the right item id')
+end
+
+S('Q1 dpwithdraw: container not found is rejected before touching anything')
+do
+    local F = newWorld({ '@.' })
+    local H = newHost(F)
+    local cb = H.cb
+    H.sender:clear()
+    eq(cb:_actionDpWithdraw('1, nope, 21411', 0), false, 'no "nope" container open -> false')
+    eq(#H.sender:all(), 0, 'nothing sent at all')
+end
+
+S('Q1 inwithdraw: moves a stackable item out of "your inbox" into a free backpack')
+do
+    local F = newWorld({ '@.' })
+    local H = newHost(F)
+    local cb = H.cb
+    local RUNE = 3155
+    local inbox = addContainer(F.st, 2, 12902, { { kind = 'item', id = RUNE, count = 5 } })
+    inbox.name = 'your inbox'
+    local bag = addContainer(F.st, 3, ID_BACKPACK, {})
+    bag.name = 'backpack'
+
+    H.sender:clear()
+    eq(cb:_actionInWithdraw(RUNE .. ',10', 0), 'retry', 'only 5 of the 10 requested -> retry')
+    local mv = H.sender:byKind('move')
+    eq(#mv, 1, 'exactly one move packet')
+    eqList({ mv[1].fromPos.x, mv[1].fromPos.y, mv[1].fromPos.z }, { 0xFFFF, 0x40 + 2, 0 },
+           'fromPos is the inbox\'s own slot 0')
+    eqList({ mv[1].toPos.x, mv[1].toPos.y, mv[1].toPos.z }, { 0xFFFF, 0x40 + 3, 0 },
+           'toPos is the backpack\'s next free slot')
+    eq(mv[1].count, 5, 'min(item count 5, amount-current 10-5) = 5')
+
+    -- already enough: no container is even touched
+    H.sender:clear()
+    F.st.player.inventory[1] = { id = RUNE, count = 10 }
+    eq(cb:_actionInWithdraw(RUNE .. ',10', 0), true, 'currentAmount already >= amount')
+    eq(#H.sender:all(), 0, 'nothing sent -- the container scan never runs')
+    F.st.player.inventory[1] = nil
+end
+
+S('Q1 imbuing: shrine use -> select item -> clear wrong imbuement -> apply -> done')
+do
+    local F = newWorld({ '@.' })
+    local H = newHost(F)
+    local cb = H.cb
+    local RING = 3081
+    F.st.player.inventory[5] = { id = RING, count = 1 }     -- some equip slot
+    F.st:addThing(F.st.player.pos, -1, { kind = 'item', id = 25060 })  -- shrine on our tile
+    H.bot.storage.autoImbue = { items = { [tostring(RING)] = {
+        minSeconds = 3600,
+        slotPicks = { ['0'] = { name = 'Powerful Vampirism', base = 'Vampirism', tier = 'Powerful' } },
+    } } }
+    F.st.imbuementTracker = nil        -- item not currently tracked (unequipped from the
+                                       -- tracker's point of view) -- attempted anyway
+
+    H.sender:clear()
+    eq(cb:_actionImbuing('config', 0), 'retry', 'nothing open yet -> use the shrine')
+    local use1 = H.sender:byKind('use')
+    eq(#use1, 1, 'exactly one use packet, on the shrine')
+    eq(use1[1].id, 25060, 'the shrine item id')
+
+    -- the server opens a window for some OTHER item first
+    local function tickTime(ms) H:advance(ms); H.bot.now = H.clock.t end
+    tickTime(2100)
+    F.st.imbuementWindow = { itemId = 99999, slots = 0, activeSlots = {}, imbuements = {} }
+    H.sender:clear()
+    eq(cb:_actionImbuing('config', 1), 'retry', 'window open, wrong item -> select ours')
+    local sel = H.sender:byKind('imbuementWindowAction')
+    eq(#sel, 1, 'exactly one select packet')
+    eq(sel[1].actionType, 1, 'SELECT_ITEM')
+    eq(sel[1].itemId, RING, 'selecting our ring')
+
+    -- the server responds with the window for OUR item, slot 0 already carrying the WRONG
+    -- imbuement
+    tickTime(900)
+    F.st.imbuementWindow = { itemId = RING, slots = 1,
+        activeSlots = { [0] = { { id = 1, name = 'Basic Void', group = 'Basic' }, 900 } },
+        imbuements = { { id = 555, name = 'Powerful Vampirism', group = 'Powerful' } } }
+    H.sender:clear()
+    eq(cb:_actionImbuing('config', 2), 'retry', 'wrong imbuement active -> clear it')
+    local clr = H.sender:byKind('clearImbuement')
+    eq(#clr, 1, 'exactly one clear packet')
+    eq(clr[1].slot, 0, 'slot 0')
+
+    -- the slot comes back empty; the offered list still has our pick -> apply it
+    tickTime(800)
+    F.st.imbuementWindow.activeSlots[0] = nil
+    H.sender:clear()
+    eq(cb:_actionImbuing('config', 3), 'retry', 'slot empty -> apply the picked imbuement')
+    local app = H.sender:byKind('applyImbuement')
+    eq(#app, 1, 'exactly one apply packet')
+    eq(app[1].slot, 0, 'slot 0')
+    eq(app[1].imbuementId, 555, 'the id offered for "Powerful Vampirism"')
+
+    -- the slot is now fresh and correct -> this item is done, window closes
+    tickTime(1000)
+    F.st.imbuementWindow.activeSlots[0] =
+        { { id = 555, name = 'Powerful Vampirism', group = 'Powerful' }, 999999 }
+    H.sender:clear()
+    eq(cb:_actionImbuing('config', 4), 'retry', 'fresh now, but still closing out this item')
+    eq(H.sender:count('closeImbuingWindow'), 1, 'the imbuement window is closed')
+
+    -- next call: nothing left to do
+    eq(cb:_actionImbuing('config', 5), true, 'all configured items are fresh -> proceeding')
+end
+
+S('Q1 imbuing: an unconfigured storage.autoImbue is a clean no-op, not an error')
+do
+    local F = newWorld({ '@.' })
+    local H = newHost(F)
+    local cb = H.cb
+    H.bot.storage.autoImbue = nil      -- the real profile's storage.json may have one; force
+                                       -- the "never configured" case regardless
+    H.sender:clear()
+    eq(cb:_actionImbuing('config', 0), false, 'no storage.autoImbue -> nothing to do')
+    eq(#H.sender:all(), 0, 'nothing sent')
+    eq(cb:_actionImbuing('1234,5678', 0), false, 'an old-format value is rejected too')
+end
+
+S('Q1 rushlure: a monster on the only path is attacked, then the spot is reached')
+do
+    local F = newWorld({ '@m.' })
+    local H = newHost(F)
+    local cb, tb = H.cb, H.tb
+    H.sup.hasEnough = function() return true end   -- the real profile's own supply mins
+                                                   -- are irrelevant to this scenario
+    local dest = F.at(2, 0)
+    local mon = F.monsters[1]
+
+    H.sender:clear()
+    eq(cb:_actionRushLure(('%d,%d,%d,500,yes'):format(dest.x, dest.y, dest.z), 0), 'retry',
+       'the corridor is 1 tile wide -- the monster blocks the real path -> attack it')
+    local atk = H.sender:byKind('attack')
+    eq(#atk, 1, 'exactly one attack packet')
+    eq(atk[1].id, mon.id, 'attacking the blocking monster')
+    eq(H.sender:count('walk'), 0, 'no walk was sent this round -- we are clearing the way first')
+
+    -- the monster is gone: the path is now clear
+    F.st:removeCreature(mon.id)
+    H.sender:clear()
+    eq(cb:_actionRushLure(('%d,%d,%d,500,yes'):format(dest.x, dest.y, dest.z), 1), 'retry',
+       'path clear now, but not on the spot yet -> walk there')
+    ok(H.sender:count('walk') > 0, 'a walk step was sent toward the lure spot')
+
+    -- arrived
+    F.st.player.pos = { x = dest.x, y = dest.y, z = dest.z }
+    H.sender:clear()
+    eq(cb:_actionRushLure(('%d,%d,%d,500,yes'):format(dest.x, dest.y, dest.z), 2), true,
+       'on the spot -> done')
+    eq(tb:isOn(), true, '"yes" (and TargetBot.setOn() unconditionally first) leaves TargetBot on')
+end
+
+S('Q1 rushlure: too far away is rejected without sending anything')
+do
+    local F = newWorld({ '@.' })
+    local H = newHost(F)
+    local cb = H.cb
+    H.sup.hasEnough = function() return true end
+    local far = { x = F.st.player.pos.x + 100, y = F.st.player.pos.y, z = F.st.player.pos.z }
+    H.sender:clear()
+    eq(cb:_actionRushLure(('%d,%d,%d'):format(far.x, far.y, far.z), 0), false,
+       'distance > 30 -> reset and give up')
+    eq(#H.sender:all(), 0, 'nothing sent')
+end
+
+S('REVIEW: chasing a blocking monster preserves the player\'s real safe-fight/pvp-mode')
+do
+    -- Game::setChaseMode (game.cpp:1295-1304) only ever touches m_chaseMode and resends
+    -- the OTHER three fields exactly as they already were.  Before the fix, both call
+    -- sites hardcoded `self.sender:setFightMode(nil, 1, nil, nil)`, and proto/sender.lua's
+    -- boolByte encodes a literal nil as 0 -- so routine "a monster is blocking my path"
+    -- chase-on packets silently reset Safe Fight OFF and PvP mode to White Dove on the
+    -- wire, no matter what the player actually had set.  self.state.safeMode/pvpMode are
+    -- exactly the two fields proto/parser.lua's S[0xA7] (PlayerModes) tracks.
+    local F = newWorld({ '@m.' })
+    local H = newHost(F)
+    local cb = H.cb
+    H.sup.hasEnough = function() return true end
+    F.st.safeMode = true
+    F.st.pvpMode  = 3   -- RedFist
+
+    -- call site 1: _actionRushLure (bot/cavebot.lua, was line 3084)
+    local dest = F.at(2, 0)
+    H.sender:clear()
+    eq(cb:_actionRushLure(('%d,%d,%d,500,yes'):format(dest.x, dest.y, dest.z), 0), 'retry',
+       'the monster blocks the lure path -> attack it and chase')
+    local fm1 = H.sender:byKind('setFightMode')
+    eq(#fm1, 1, 'exactly one setFightMode packet')
+    eq(fm1[1].chase, 1, 'chase is turned on')
+    eq(fm1[1].safe, true, 'the real safeMode (ON) is echoed back, not hardcoded off')
+    eq(fm1[1].pvp, 3, 'the real pvpMode (RedFist) is echoed back, not hardcoded WhiteDove')
+
+    -- call site 2: _attackBlockingMonster, the general goTo/walkTo pathing helper
+    -- (bot/cavebot.lua, was line 1625) -- exercised directly, the same way every ordinary
+    -- CaveBot goto callback reaches it at actions.lua:452-479 / cavebot.lua's own step 7.
+    F.st:removeCreature(F.monsters[1].id)
+    local F2 = newWorld({ '@m.' })
+    local H2 = newHost(F2)
+    local cb2 = H2.cb
+    F2.st.safeMode = false
+    F2.st.pvpMode  = 2   -- YellowHand
+    local pp = F2.st.player.pos
+    local path = cb2.path:getPath(pp, F2.at(2, 0), 30,
+                                  { ignoreNonPathable = true, precision = 1,
+                                    ignoreCreatures = true, allowUnseen = true,
+                                    allowOnlyVisibleTiles = false })
+    ok(path ~= nil, 'a creature-ignoring path exists through the corridor')
+    H2.sender:clear()
+    eq(cb2:_attackBlockingMonster(pp, path), true, 'the monster on the path is engaged')
+    local fm2 = H2.sender:byKind('setFightMode')
+    eq(#fm2, 1, 'exactly one setFightMode packet')
+    eq(fm2[1].chase, 1, 'chase is turned on')
+    eq(fm2[1].safe, false, 'the real safeMode (OFF) is echoed back, not hardcoded off-by-nil')
+    eq(fm2[1].pvp, 2, 'the real pvpMode (YellowHand) is echoed back, not hardcoded WhiteDove')
+
+    -- and the fallback when no PlayerModes packet has arrived yet (self.state.safeMode/
+    -- pvpMode still nil) matches game.cpp's own construction defaults (game.cpp:69-70):
+    -- m_safeFight = true, m_pvpMode = WhiteDove(0).
+    local F3 = newWorld({ '@m.' })
+    local H3 = newHost(F3)
+    local cb3 = H3.cb
+    eq(F3.st.safeMode, nil, 'sanity: no PlayerModes packet applied to this fresh state')
+    eq(F3.st.pvpMode, nil, 'sanity: same for pvpMode')
+    local pp3 = F3.st.player.pos
+    local path3 = cb3.path:getPath(pp3, F3.at(2, 0), 30,
+                                   { ignoreNonPathable = true, precision = 1,
+                                     ignoreCreatures = true, allowUnseen = true,
+                                     allowOnlyVisibleTiles = false })
+    H3.sender:clear()
+    eq(cb3:_attackBlockingMonster(pp3, path3), true, 'the monster is engaged')
+    local fm3 = H3.sender:byKind('setFightMode')
+    eq(fm3[1].safe, true, 'pre-PlayerModes fallback is safe=true, matching game.cpp default')
+    eq(fm3[1].pvp, 0, 'pre-PlayerModes fallback is pvp=0 (WhiteDove), matching game.cpp default')
+end
+
+S('Q1 tasker: start / check / Loot-of counter / report, gated on an NPC in range')
+do
+    local F = newWorld({ '@.' })
+    local H = newHost(F)
+    local cb = H.cb
+    -- tasker.lua initialises storage.caveBotTasker unconditionally at load time (not lazily
+    -- per call), so its presence proves nothing either way; only inProgress/count matter,
+    -- and this resets them to a clean slate regardless of what the real profile carries.
+    H.bot.storage.caveBotTasker = { inProgress = false, monster = '', monster2 = '',
+                                    taskName = '', count = 0, max = 0 }
+    -- marker 1/3 refuse without an NPC within 3 tiles
+    H.sender:clear()
+    eq(cb:_actionTasker('1,medusae,500,medusa', 0), false, 'no NPC in range -> refused')
+    eq(#H.sender:all(), 0, 'and nothing was said yet')
+    eq(H.bot.storage.caveBotTasker.inProgress, false,
+       'the refused attempt did not start a task')
+
+    F.st:addCreature({ id = 9001, name = 'Gryzzly Adams', type = 2, isNpc = true,
+                       pos = F.at(1, 0) })
+    H.sender:clear()
+    eq(cb:_actionTasker('1,medusae,500,medusa', 0), true, 'task taken')
+    local talk = H.sender:byKind('talk')
+    ok(#talk >= 1, 'at least the first conversation phrase was sent')
+    eq(talk[1].text, 'hi', 'the first phrase is "hi" (CaveBot.Conversation)')
+    local t = H.bot.storage.caveBotTasker
+    ok(t ~= nil, 'storage.caveBotTasker exists')
+    eq(t.inProgress, true, 'task is now in progress')
+    eq(t.monster, 'medusa', 'tracked monster name (lower-cased)')
+    eq(t.max, 500, 'tracked target count')
+    eq(t.count, 0, 'starts at zero')
+
+    -- Loot-of counter, independent of the waypoint loop
+    H.bus:emit('textMessage', { text = 'Loot of a medusa: 5 gold.' })
+    eq(t.count, 1, 'a matching "Loot of" message increments the counter')
+    H.bus:emit('textMessage', { text = 'Loot of a rat: 1 gold.' })
+    eq(t.count, 1, 'a NON-matching monster name does not')
+
+    -- marker 2: check status
+    eq(cb:_actionTasker('2,keepHunting,taskDone', 0), true, 'check always returns true')
+    eq(cb.lastLabel, '', 'gotoLabel does not touch lastLabel (only the `label` action does)')
+
+    t.count = 500
+    eq(cb:_actionTasker('2,keepHunting,taskDone', 0), true, 'still true once the task is done')
+
+    -- marker 3: report
+    H.sender:clear()
+    eq(cb:_actionTasker('3', 0), true, 'report task')
+    eq(H.sender:byKind('talk')[1].text, 'hi', 'reporting also opens with "hi"')
+    eq(H.bot.storage.caveBotTasker.inProgress, false, 'resetTaskData() cleared it')
+    eq(H.bot.storage.caveBotTasker.count, 0, 'counter reset too')
+end
+
+S('Q1 tasker: an out-of-range marker is a silent nil, exactly like the real script')
+do
+    local F = newWorld({ '@.' })
+    local H = newHost(F)
+    local cb = H.cb
+    H.sender:clear()
+    eq(cb:_actionTasker('9,whatever', 0), nil, 'marker 9 matches neither dispatch block')
+    eq(#H.sender:all(), 0, 'nothing sent')
+end
+
+S('Q1 config round-trip: a .cfg carrying all six new action types still loads')
+do
+    -- encode -> decode through the REAL production path (bot/config.lua's
+    -- encodeCfg/decodeCfg, byte-for-byte the same functions Profile:loadCavebot and
+    -- CaveBot's own save/reload use), THEN feed the decoded waypoints into a live CaveBot.
+    local pairsList = {
+        { 'goto',       '400,400,7' },
+        { 'withdraw',   '1,3031,50' },
+        { 'dpwithdraw', '1, shopping bag, 21411' },
+        { 'inwithdraw', '3155,10' },
+        { 'imbuing',    'config' },
+        { 'rushlure',   '400,400,7,500,yes' },
+        { 'tasker',     '3' },
+    }
+    local text = cfgmod.encodeCfg(pairsList)
+    local decoded = cfgmod.decodeCfg(text)
+    eq(#decoded, #pairsList, 'every pair survives encodeCfg -> decodeCfg')
+    for i, p in ipairs(pairsList) do
+        eq(decoded[i][1], p[1], 'key ' .. i .. ' round-trips')
+        eq(decoded[i][2], p[2], 'value ' .. i .. ' round-trips')
+    end
+
+    local waypoints = {}
+    for i, p in ipairs(decoded) do waypoints[i] = { action = p[1], value = p[2], index = i } end
+
+    local F = newWorld({ '@.' })
+    local H = newHost(F)
+    local cb = H.cb
+    cb:reload({ waypoints = waypoints })
+    eq(#cb.waypoints, #pairsList, 'CaveBot accepted the whole decoded route')
+    for _, w in ipairs(cb.waypoints) do
+        ok(cb.actions[w.action] ~= nil,
+           'action "' .. w.action .. '" has a live handler (not "Invalid cavebot action")')
+    end
+
+    -- and the SAME text round-trips through tools/vbot_compat_check.lua's independent
+    -- transcription of the real decoder (that tool is out of scope to modify for this work
+    -- item -- see crossFileRequests -- so this loads it as the library it documents itself
+    -- as: `local compat = dofile("tools/vbot_compat_check.lua")`).
+    local okc, compat = pcall(dofile, ROOT .. '/tools/vbot_compat_check.lua')
+    if okc and type(compat) == 'table' and type(compat.parseCfgString) == 'function' then
+        local parsed = compat.parseCfgString(text, 'q1-test')
+        eq(#parsed.waypoints, #pairsList, 'vbot_compat_check also decodes all seven lines')
+        for i, p in ipairs(pairsList) do
+            eq(parsed.waypoints[i].type,  p[1], 'vbot_compat_check key ' .. i)
+            eq(parsed.waypoints[i].value, p[2], 'vbot_compat_check value ' .. i)
+        end
+        local reText = compat.serializeCfg(parsed)
+        eq(reText, text, 'and re-serializes byte-identical to what bot/config.lua wrote')
+    else
+        io.write('        (tools/vbot_compat_check.lua could not be loaded as a library -- ',
+                 'see crossFileRequests; the bot/config.lua round trip above stands on its own: ',
+                 tostring(compat), ')\n')
+    end
+end
+
 S('REVIEW: the walker paces on the PREVIOUS step direction')
 do
     local F = newWorld({ '....', '....', '....' }, { baseX = 1000, baseY = 1000 })
@@ -1929,6 +2909,330 @@ do
        'a crash in the swap window recovers from storage/profile_9.json.bak')
     os.remove(spath .. '.bak')
     os.remove(pdir .. '/storage'); os.remove(pdir)      -- best effort; both are empty now
+end
+
+-- ============================================================================
+-- WORK ITEM N1 -- Stances, the one vBot subsystem with no native module before
+-- this work item.  Every scenario below disables the OTHER four modules first
+-- (their real HealBot/AttackBot/CaveBot/TargetBot config is the user's own
+-- live-hunting profile, loaded read-only by "the profile the whole suite
+-- reads" above) so only Stances' own talkSpell packets show up on the wire.
+-- ============================================================================
+local stancesmod = require('bot.stances')
+local STANCE_BY_NAME = {}
+for _, s in ipairs(stancesmod.STANCES) do STANCE_BY_NAME[s.name] = s end
+
+--- Build a storage.stances entry the way vBot's panel.addEntry.onClick does
+--- (Stances.lua:363-379), keyed by stance NAME for readability in the tests.
+local function stanceEntry(name, extra)
+    local s = STANCE_BY_NAME[name]
+    if not s then error('unknown stance: ' .. tostring(name), 2) end
+    local e = {
+        spell = s.words, spellId = s.id, stanceName = s.name, needTarget = s.needTarget,
+        monsters = true, minHp = 0, maxHp = 100, minMana = 0, count = 0, range = 5,
+        orMore = true, enabled = true,
+    }
+    for k, v in pairs(extra or {}) do e[k] = v end
+    e.description = e.description or (s.name .. ' (' .. s.words .. ')')
+    return e
+end
+
+--- Only Stances runs: the other four modules' real (user) config must never
+--- contribute a packet to these assertions.
+local function onlyStances(H)
+    H.hb:disable(); H.ab:disable(); H.tb:setOff(); H.cb:disable()
+    return H.stc
+end
+
+--- Drive the bot far enough (jitter max 100 ms + the 200 ms macro period) that
+--- the NEXT tick is guaranteed to run Stances' macro at least once.
+local function tickStances(H) H:tick(1, 400) end
+
+S('Stances (N1): getStance()/getSecondaryStance() derivation (bot/api.lua)')
+do
+    local F = newWorld({ '@..' })
+    local H = newHost(F)
+    eq(H.bot.api.getStance(), 0, 'no virtues yet -> 0 (not 132/311/...)')
+    eq(H.bot.api.getSecondaryStance(), 0, 'and no secondary either')
+    eqList(H.bot.api.getVirtues(), {}, 'getVirtues() is empty too')
+
+    -- protocolgameparse.cpp:5385-5404: 311/312 ALWAYS take the secondary slot,
+    -- the first OTHER id is primary, the next free slot takes secondary.
+    F.st.player.virtues = { 132 }
+    eq(H.bot.api.getStance(), 132, 'a single non-aura id is primary')
+    eq(H.bot.api.getSecondaryStance(), 0, 'secondary stays empty')
+    eqList(H.bot.api.getVirtues(), { 132 }, 'getVirtues() mirrors the raw array')
+
+    F.st.player.virtues = { 311, 132 }
+    eq(H.bot.api.getStance(), 132, '311 is skipped for primary...')
+    eq(H.bot.api.getSecondaryStance(), 311, '...because it always owns the secondary slot')
+
+    F.st.player.virtues = { 132, 133, 311 }
+    eq(H.bot.api.getStance(), 132, 'first non-aura id is primary')
+    eq(H.bot.api.getSecondaryStance(), 311, 'aura still claims secondary over a third id')
+
+    -- a future wire change that sets .stance/.secondaryStance directly wins outright
+    F.st.player.stance, F.st.player.secondaryStance = 999, 998
+    eq(H.bot.api.getStance(), 999, 'an explicit .stance short-circuits the derivation')
+    eq(H.bot.api.getSecondaryStance(), 998, 'so does .secondaryStance')
+    F.st.player.stance, F.st.player.secondaryStance = nil, nil
+end
+
+S('Stances (N1): top-down short-circuit, and HP-threshold reordering')
+do
+    -- 4 monsters within range 5 of '@' -- Blood Rage's gate is satisfiable
+    -- throughout, so ONLY the HP band decides which entry wins.
+    local F = newWorld({
+        'mm...',
+        'mm@..',
+        '.....',
+    }, { vocation = 11, hp = 30, maxHp = 100, mana = 1000, maxMana = 1000 })
+    local H = newHost(F)
+    local st = onlyStances(H)
+    st:reload({ enabled = true, ignoreInPz = true, entries = {
+        stanceEntry('Protector',  { minHp = 0, maxHp = 40 }),
+        stanceEntry('Blood Rage', { minHp = 0, maxHp = 100, count = 4, orMore = true, range = 5 }),
+    } })
+
+    H.sender:clear()
+    tickStances(H)
+    local casts = H.sender:byKind('talkSpell')
+    eq(#casts, 1, 'exactly one cast')
+    eq(casts[1] and casts[1].text, 'utamo tempo',
+       'Protector (0-40% HP) wins at 30% even though Blood Rage also matches (4+ monsters up)')
+    eq(casts[1] and casts[1].aim, 3, 'a known formula is aimed (SpellAimTarget)')
+
+    -- clear HP out of Protector's band; Blood Rage gets a look with the SAME
+    -- monsters still up.  Reset the lockout so the second tick is free to cast.
+    st.lastCastAt = -1000000
+    F.st.player.health = 90   -- 90% (maxHealth is 100 in this fixture)
+    H.sender:clear()
+    tickStances(H)
+    casts = H.sender:byKind('talkSpell')
+    eq(#casts, 1, 'exactly one cast')
+    eq(casts[1] and casts[1].text, 'utito tempo', 'Blood Rage fires once HP clears the Protector band')
+end
+
+S('Stances (N1): mana gate blocks a cast (canCastStance)')
+do
+    local F = newWorld({ '@..' }, { vocation = 3, hp = 1000, maxHp = 1000,
+                                    mana = 1000, maxMana = 2000 })
+    local H = newHost(F)
+    local st = onlyStances(H)
+    -- Aura of Sapped Strength costs 1500 mana (sorcerer/master sorcerer, voc {1,5}).
+    st:reload({ enabled = true, entries = {
+        stanceEntry('Aura of Sapped Strength', { minHp = 0, maxHp = 100 }),
+    } })
+
+    H.sender:clear()
+    tickStances(H)
+    eq(H.sender:count('talkSpell'), 0, "1000 mana < the spell's 1500 cost -> no cast")
+
+    F.st.player.mana = 1600
+    st.lastCastAt = -1000000
+    H.sender:clear()
+    tickStances(H)
+    local casts = H.sender:byKind('talkSpell')
+    eq(#casts, 1, 'with enough mana the SAME entry casts')
+    eq(casts[1] and casts[1].text, 'exori moe tempo', 'Aura of Sapped Strength')
+end
+
+S('Stances (N1): cooldown blocks a repeat cast (getSpellCoolDown)')
+do
+    local F = newWorld({ '@..' }, { vocation = 11, hp = 1000, maxHp = 1000,
+                                    mana = 1000, maxMana = 1000 })
+    local H = newHost(F)
+    local st = onlyStances(H)
+    st:reload({ enabled = true, entries = {
+        stanceEntry('Protector', { minHp = 0, maxHp = 100 }),
+    } })
+
+    H.sender:clear()
+    tickStances(H)
+    eq(H.sender:count('talkSpell'), 1, 'first cast goes out')
+
+    -- past the 1500 ms lockout, but the SERVER now reports the spell (protocol
+    -- id 132) on cooldown -- getSpellCoolDown must block the repeat cast even
+    -- though the entry still wins the tick.
+    st.lastCastAt = -1000000
+    H.bus:emit('spellCooldown', { spellId = 132, delay = 30000 })
+    H.sender:clear()
+    tickStances(H)
+    eq(H.sender:count('talkSpell'), 0, 'on cooldown -> no repeat cast')
+    eq(st.counts.blocked >= 1, true, 'the block is counted (status() diagnostics)')
+end
+
+S('Stances (N1): the 1500 ms cast lockout')
+do
+    local F = newWorld({ '@..' }, { vocation = 11, hp = 1000, maxHp = 1000,
+                                    mana = 1000, maxMana = 1000 })
+    local H = newHost(F)
+    local st = onlyStances(H)
+    st:reload({ enabled = true, entries = {
+        stanceEntry('Protector', { minHp = 0, maxHp = 100 }),
+    } })
+
+    H.sender:clear()
+    tickStances(H)
+    eq(H.sender:count('talkSpell'), 1, 'first cast')
+
+    -- well under the 1500 ms lockout: the entry still wins the tick (it still
+    -- matches), but the lockout check runs BEFORE the entry loop, so no
+    -- second cast goes out regardless of whether the server has confirmed
+    -- the stance yet.
+    H.sender:clear()
+    H:tick(1, 250)   -- one more macro pass, well under the 1500 ms lockout
+    eq(H.sender:count('talkSpell'), 0, 'still locked out, no repeat cast')
+end
+
+S('Stances (N1): needTarget gating')
+do
+    -- Sharpshooter (paladin/royal paladin, voc {3,7}) needs a target.
+    local F = newWorld({ '@..' }, { vocation = 2, hp = 1000, maxHp = 1000,
+                                    mana = 1000, maxMana = 1000 })
+    local H = newHost(F)
+    local st = onlyStances(H)
+    st:reload({ enabled = true, entries = {
+        stanceEntry('Sharpshooter', { minHp = 0, maxHp = 100 }),
+    } })
+
+    H.bot._attacking = nil
+    H.sender:clear()
+    tickStances(H)
+    eq(H.sender:count('talkSpell'), 0, 'needTarget=true, no target attacking -> no cast')
+
+    H.bot._attacking = 9001
+    st.lastCastAt = -1000000
+    H.sender:clear()
+    tickStances(H)
+    local casts = H.sender:byKind('talkSpell')
+    eq(#casts, 1, 'with a target attacking, the SAME entry casts')
+    eq(casts[1] and casts[1].text, 'utori con', 'Sharpshooter')
+end
+
+S('Stances (N1): vocation filtering via the CIP pairs')
+do
+    -- Protector is knight/elite knight only (CIP {4,8}).  Client vocation 2 is
+    -- Paladin -> CIP {3,7}: the pairs share no id, so it must never fire, even
+    -- though every hp/mana/cooldown gate is wide open.
+    local F = newWorld({ '@..' }, { vocation = 2, hp = 1000, maxHp = 1000,
+                                    mana = 1000, maxMana = 1000 })
+    local H = newHost(F)
+    local st = onlyStances(H)
+    st:reload({ enabled = true, entries = {
+        stanceEntry('Protector', { minHp = 0, maxHp = 100 }),
+    } })
+
+    H.sender:clear()
+    tickStances(H)
+    eq(H.sender:count('talkSpell'), 0, 'Paladin cannot cast a Knight stance -> no cast')
+
+    -- Elite Knight (client vocation 11) -> CIP {4,8}: now it matches.
+    F.st.player.vocation = 11
+    st.lastCastAt = -1000000
+    H.sender:clear()
+    tickStances(H)
+    local casts = H.sender:byKind('talkSpell')
+    eq(#casts, 1, 'same entry, now the RIGHT vocation -> one cast')
+    eq(casts[1] and casts[1].text, 'utamo tempo', 'Protector')
+
+    -- vocation 0 (never received 0x9F yet) fails OPEN, same as vBot's
+    -- myVocationPair() returning nil for an unknown player.
+    F.st.player.vocation = 0
+    st.lastCastAt = -1000000
+    H.sender:clear()
+    tickStances(H)
+    eq(H.sender:count('talkSpell'), 1, 'vocation 0 (unknown) matches everything')
+end
+
+S('Stances (N1): ignoreInPz')
+do
+    local F = newWorld({ '@..' }, { vocation = 11, hp = 1000, maxHp = 1000,
+                                    mana = 1000, maxMana = 1000 })
+    local H = newHost(F)
+    local st = onlyStances(H)
+    st:reload({ enabled = true, ignoreInPz = true, entries = {
+        stanceEntry('Protector', { minHp = 0, maxHp = 100 }),
+    } })
+
+    -- bot/stances.lua reads statesLo (like attackbot/healbot's isInPz, test/
+    -- bot_m1.lua H5's own convention) -- NOT the raw .states CaveBot reads --
+    -- since 0xA2 sends the pz bit split across statesLo/statesHigh.
+    F.st.player.statesLo = 16384   -- PlayerStates.Pz
+    H.sender:clear()
+    tickStances(H)
+    eq(H.sender:count('talkSpell'), 0, 'ignoreInPz + inside a PZ -> no cast')
+
+    F.st.player.statesLo = 0
+    H.sender:clear()
+    tickStances(H)
+    eq(H.sender:count('talkSpell'), 1, 'outside the PZ the same entry casts')
+end
+
+S('Stances (N1): reload() defaulting matches vBot/Stances.lua:50-56 verbatim')
+do
+    local F = newWorld({ '@..' })
+    local H = newHost(F)
+    local st = H.stc
+
+    local cfg = st:reload({})
+    eq(cfg.enabled, false, 'missing enabled defaults to false')
+    eq(cfg.ignoreInPz, true, 'missing ignoreInPz defaults to true')
+    eqList(cfg.entries, {}, 'missing entries defaults to {}')
+    ok(H.bot.storage.stances == cfg, ':reload() adopts the table as bot.storage.stances')
+
+    -- an existing entries array with an UNKNOWN field (a real vBot save might
+    -- carry one this module has never heard of) survives untouched.
+    local entry = stanceEntry('Protector', { someFutureField = 'kept' })
+    local cfg2 = st:reload({ entries = { entry } })
+    eq(cfg2.entries[1].someFutureField, 'kept', 'unknown per-entry fields are never dropped')
+    eq(cfg2.enabled, false, 'top-level defaulting still applies alongside a real entries array')
+end
+
+S('Stances (N1): storage.stances round-trips through the REAL vBot json.lua codec')
+do
+    local compat = dofile(ROOT .. '/tools/vbot_compat_check.lua')
+    -- M.DEFAULT_JSON_LUA is a hardcoded Windows path; derive the SAME checkout's
+    -- json.lua from the PROFILE this suite already found, so this test passes on
+    -- both Windows and the WSL/Debian mount (docs/vbot's own convention above).
+    local jsonLua = PROFILE and PROFILE:gsub('/profiles/bot/vBot_4%.8$', '/modules/corelib/json.lua')
+    local jok, jerr = compat.loadJson(jsonLua)
+    ok(jok ~= nil, "the real client's modules/corelib/json.lua loaded", jerr)
+
+    -- exactly what bot/stances.lua's :reload()/tick() produce and consume.
+    local written = {
+        enabled = true, ignoreInPz = true,
+        entries = {
+            stanceEntry('Protector', { minHp = 0, maxHp = 40 }),
+            stanceEntry('Blood Rage', { minHp = 0, maxHp = 100, count = 4, orMore = true, range = 5 }),
+        },
+    }
+    local okShape, diff = compat.checkStancesValue(written)
+    ok(okShape, 'our own writer produces a shape the real vBot decoder accepts', diff)
+
+    -- and the REVERSE direction: the user's real storage/profile_1.json already
+    -- HAS a stances block (this suite reads that very file read-only above) --
+    -- prove OUR module accepts exactly what the real vBot wrote.
+    if PROFILE then
+        local prof = cfgmod.new{ profileDir = PROFILE, vprofile = 1 }
+        local real = prof:loadStorage()
+        if type(real) == 'table' and type(real.stances) == 'table' then
+            local okReal, diffReal = compat.checkStancesValue(real.stances)
+            ok(okReal, "the user's REAL storage.stances round-trips through the real codec too", diffReal)
+
+            local F = newWorld({ '@..' })
+            local H = newHost(F)
+            local st = onlyStances(H)
+            local okReload = pcall(function() st:reload(real.stances) end)
+            ok(okReload, 'bot/stances.lua reloads the REAL file without erroring')
+            eq(#st.cfg.entries, #real.stances.entries,
+               'and keeps every one of its entries (none silently dropped)')
+        else
+            ok(true, "the real profile's storage has no stances block yet (nothing to cross-check)")
+        end
+    else
+        ok(true, 'no real vBot profile on this machine -- skipped')
+    end
 end
 
 -- ============================================================================

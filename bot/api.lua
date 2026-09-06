@@ -214,6 +214,46 @@ function api.new(b)
     ctx.vocation = ctx.voc
     ctx.bless  = function() local p = player(); return p and p.blessings or 0 end
     ctx.blessings = ctx.bless
+
+    -- CONFIGAPI.md work item N1: getStance()/getSecondaryStance() are not stored on the
+    -- wire as such -- they are derived from state.player.virtues by
+    -- protocolgameparse.cpp:5385-5404 (311/312 always occupy the secondary slot, the
+    -- first OTHER id seen is primary, the next free slot takes secondary, and a third id
+    -- is discarded).  Ported verbatim from shim/creature.lua's local `stances()` helper
+    -- so the sandbox and bot/stances.lua (the native module) derive the SAME answer from
+    -- the SAME rule -- one source of truth, as CONFIGAPI.md asks.  proto/parser.lua's
+    -- 0xC1 sub=2 handler only ever writes `.virtues`, never `.stance`/`.secondaryStance`
+    -- directly, but a future wire change that does IS honoured first, exactly like the
+    -- shim.
+    local function deriveStances()
+        local p = player()
+        if type(p) == 'table' and type(p.stance) == 'number' then
+            local sec = p.secondaryStance
+            return p.stance, (type(sec) == 'number' and sec or 0)
+        end
+        local v = p and p.virtues
+        local primary, secondary = 0, 0
+        if type(v) == 'table' then
+            for i = 1, #v do
+                local id = v[i]
+                if id == 311 or id == 312 then secondary = id
+                elseif primary == 0 then primary = id
+                elseif secondary == 0 then secondary = id end
+            end
+        end
+        return primary, secondary
+    end
+    ctx.getStance = function() return (deriveStances()) end
+    ctx.getSecondaryStance = function() local _, secondary = deriveStances(); return secondary end
+    ctx.getVirtues = function()
+        local p = player()
+        local v = p and p.virtues
+        if type(v) ~= 'table' then return {} end
+        local out = {}
+        for i = 1, #v do out[i] = v[i] end
+        return out
+    end
+
     -- REVIEW FIX: the wire only writes the player's facing onto
     -- state.creatures[<playerId>] (proto/parser.lua applyCreature); state.player.direction
     -- is touched only by 0xB5 walkCancel.

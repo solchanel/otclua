@@ -46,7 +46,12 @@ DELIBERATE DEVIATIONS (each with a switch)
     honoured -- the work item requires the flag and requires it to default off.
     The real profile 1 on disk has three of them true, so this is load-bearing:
     with the flag off every optimized spell takes its legacy path, which the
-    spec confirms always exists.
+    spec confirms always exists.  When the flag IS on, `A:tryOptimizedSpell`
+    runs the real algorithm of docs/vbot/attackbot-full.md section 6 (chain/
+    star simulation via bot/data/optimizers.lua's parameters, or the TFB tile
+    scan) as the DEFAULT -- `opts.optimizerHook` remains available to override
+    it (tests only), but it is no longer required for the optimizers to do
+    anything.
  3. `Kills` PASSES BY DEFAULT.  killsToRs() needs g_game.getUnjustifiedPoints();
     no 1530 opcode for it is parsed, and vBot has no guard at all (VERIFIER).
     We return a large number, keeping killsOk() true -- the common case.
@@ -78,6 +83,17 @@ local ok_pat, PAT = pcall(require, 'data.attackpatterns1530')
 if not ok_pat or type(PAT) ~= 'table' then
     PAT = { spellPatterns = { {}, {}, {}, {} }, monkDirPatterns = {},
             waveAugments = {}, quadrant = { knight = {}, other = {} } }
+end
+
+-- Work item Q2: the five spell optimizers.  Pure data (chain/hop distances,
+-- cast ranges, the augment mapping) -- docs/vbot/attackbot-full.md secs 6-7.
+local ok_opt, OPT = pcall(require, 'bot.data.optimizers')
+if not ok_opt or type(OPT) ~= 'table' then
+    OPT = { spells = {}, chain = { pvpSafeRadius = {} },
+            tile = { areaPatternCategory = 4, areaPatternId = 15, pvpSafeRadius = 3 },
+            waveAugments = {}, defFor = function() return nil end,
+            normalizeWords = function(s) return type(s) == 'string' and s:lower() or nil end,
+            augmentedPattern = function(entry) return entry.pattern end }
 end
 
 local attackbot = {}
@@ -771,16 +787,258 @@ end
 
 -- ---------------------------------------------------------------------------
 -- optimizers (deviation 2) -- OFF unless opts.optimizers
+-- The five spell optimizers -- docs/vbot/attackbot-full.md section 6.
 -- ---------------------------------------------------------------------------
 --- Returns handled, fired.  With the flag off nothing is ever handled, so every
 --- entry takes its legacy path -- which the spec confirms always exists.
+--- opts.optimizerHook, when supplied, OVERRIDES the algorithm below entirely
+--- (tests only); the algorithm is the fallback, not the other way round, per
+--- the work item.
 function A:tryOptimizedSpell(entry, executeCooldown)
     if not self.optimizers then return false, false end
     if self.opts.optimizerHook then
         local ok, handled, fired = pcall(self.opts.optimizerHook, self, entry, executeCooldown)
         if ok then return handled and true or false, fired and true or false end
     end
-    return false, false
+    return self:_defaultOptimizedSpell(entry, executeCooldown)
+end
+
+--- tryOptimizedSpell -- AB:1584-1631.  `attackData` is entry.itemId (a number)
+--- when the entry is a rune, entry.spell (a string) otherwise; runes are never
+--- optimized (AB:1585).
+function A:_defaultOptimizedSpell(entry, executeCooldown)
+    local isRune = (entry.itemId or 0) > 100
+    if isRune or type(entry.spell) ~= 'string' then return false, false end
+
+    local def = OPT.defFor(entry.spell)
+    local p = self:profile()
+    if not def or not p[def.opt] then return false, false end
+
+    -- cheap pre-gate (AB:1593-1603): count filter-matching, non-summon,
+    -- hp-known monsters ANYWHERE on screen.  Uses entry.count even when
+    -- entry.orMore is false -- an exact-count entry is skipped only when
+    -- FEWER than entry.count are on screen.
+    local t = nameList(entry)
+    local minHp, maxHp = entry.minHp or 0, entry.maxHp or 100
+    local onScreen = 0
+    do
+        local specs = self:onScreen()
+        for i = 1, #specs do
+            local c = specs[i]
+            local hp = c.healthPercent
+            if isRealMonster(c) and hp ~= nil and hp >= minHp and hp <= maxHp
+               and inList(t, tostring(c.name or ''):lower()) then
+                onScreen = onScreen + 1
+            end
+        end
+    end
+    if onScreen < (entry.count or 0) then return true, false end
+
+    if def.mode == 'tile' then return self:_optTile(entry, def, executeCooldown) end
+    return self:_optChain(entry, def, executeCooldown)
+end
+
+--- collectChainWorld -- AB:1412-1427.  Every on-screen monster (type < 3, hp
+--- known) becomes a candidate; the entry's hp%/name filters do NOT remove a
+--- monster from the world -- the server does not consult them when chaining --
+--- they only set `counted`, which is what the count gate measures.
+function A:_chainWorld(entry)
+    local t = nameList(entry)
+    local minHp, maxHp = entry.minHp or 0, entry.maxHp or 100
+    local out = {}
+    local specs = self:onScreen()
+    for i = 1, #specs do
+        local c = specs[i]
+        if isRealMonster(c) and c.healthPercent ~= nil then
+            local counted = c.healthPercent >= minHp and c.healthPercent <= maxHp
+                        and inList(t, tostring(c.name or ''):lower())
+            out[#out + 1] = { c = c, pos = c.pos, hp = c.healthPercent, counted = counted }
+        end
+    end
+    return out
+end
+
+--- creature:canShoot(range) -- sight AND within `range` (Chebyshev) from the
+--- PLAYER.  Used only for seed eligibility (AB:1494-1495).
+function A:_canShootFromPlayer(c, range)
+    local me = self:ppos()
+    if not (me and c and c.pos) then return false end
+    if self:distFromPlayer(c.pos) > range then return false end
+    return self:isSightClear(me, c.pos)
+end
+
+--- simulateHopChain -- AB:1431-1455.  Each jump is measured from the LAST
+--- creature hit (not the player, not the seed); the server prefers the
+--- highest remaining hp% (strict `>`, so the first candidate in world order
+--- wins a tie); sight is from the last link.  Returns counted, #hits.
+function A:_simulateHopChain(seed, world, jumpDist, maxJumps)
+    local hits, hitSet = { seed }, { [seed] = true }
+    local cur = seed
+    for _ = 1, maxJumps do
+        local bestM = nil
+        for i = 1, #world do
+            local m = world[i]
+            if not hitSet[m] and chebyshev(cur.pos, m.pos) <= jumpDist
+               and self:isSightClear(cur.pos, m.pos) then
+                if not bestM or m.hp > bestM.hp then bestM = m end
+            end
+        end
+        if not bestM then break end
+        hitSet[bestM] = true
+        hits[#hits + 1] = bestM
+        cur = bestM
+    end
+    local counted = 0
+    for i = 1, #hits do if hits[i].counted then counted = counted + 1 end end
+    return counted, #hits
+end
+
+--- starChainScore -- AB:1458-1473.  Every extra hit is measured from the
+--- SEED, never chained; both tallies are clamped to `cap` and the seed is
+--- added afterwards, so the max returned total is `jumps + 1`.
+function A:_starChainScore(seed, world, jumpDist, cap)
+    local total, counted = 0, 0
+    for i = 1, #world do
+        local m = world[i]
+        if m ~= seed and chebyshev(seed.pos, m.pos) <= jumpDist
+           and self:isSightClear(seed.pos, m.pos) then
+            total = total + 1
+            if m.counted then counted = counted + 1 end
+        end
+    end
+    if total > cap then total = cap end
+    if counted > cap then counted = cap end
+    return counted + (seed.counted and 1 or 0), total + 1
+end
+
+--- findBestChainSeed -- AB:1488-1512.  A seed must itself be `counted`, within
+--- def.castRange of the player, and pass creature:canShoot(castRange).  Best
+--- replacement order: higher counted -> tie: higher total -> tie: the seed
+--- that IS the current attack target -> otherwise keep the first candidate
+--- seen (world iteration order).
+function A:_findBestChainSeed(entry, def, world)
+    local cur = self:target()
+    local best = nil
+    for i = 1, #world do
+        local m = world[i]
+        if m.counted and self:distFromPlayer(m.pos) <= def.castRange
+           and self:_canShootFromPlayer(m.c, def.castRange) then
+            local counted, total
+            if def.mode == 'hop' then
+                counted, total = self:_simulateHopChain(m, world, def.jumpDist, def.jumps)
+            else
+                counted, total = self:_starChainScore(m, world, def.jumpDist, def.jumps)
+            end
+            local isCurrent = (cur ~= nil and m.c.id == cur.id)
+            if not best
+               or counted > best.counted
+               or (counted == best.counted and total > best.total)
+               or (counted == best.counted and total == best.total
+                   and isCurrent and not best.isCurrent)
+            then
+                best = { creature = m.c, counted = counted, total = total, isCurrent = isCurrent }
+            end
+        end
+    end
+    return best
+end
+
+--- Chain modes (hop: Chained Penance/Spiritual Outburst; star: Forked
+--- Thorns/Forked Glacier) -- AB:1616-1631.
+function A:_optChain(entry, def, executeCooldown)
+    local p = self:profile()
+    if p.PvpSafe then
+        local radius = OPT.chain.pvpSafeRadius[OPT.normalizeWords(entry.spell)]
+                    or (def.castRange + def.jumpDist * 2 + 1)
+        if self:nonPartyPlayerNear(self:ppos(), radius) then return true, false end
+    end
+
+    local world = self:_chainWorld(entry)
+    local best = self:_findBestChainSeed(entry, def, world)
+    if not best or not self:countGate(entry, best.counted) then return true, false end
+    if not self:guardsPass() then return true, false end
+
+    -- attack(seed) BEFORE the cast, only when the winning seed is not already
+    -- the attack target (AB:1624-1629).
+    if not best.isCurrent then
+        self:setTarget(best.creature)
+        if self.sender and self.sender.attack then self.sender:attack(best.creature.id) end
+    end
+    self:fireEntry(entry, executeCooldown)
+    return true, true
+end
+
+--- findBestTfbTile -- AB:1525-1551 (Thousand Fist Blows).  Deliberately
+--- different from getBestTileByPattern in all four ways OPT.tile documents:
+--- creatures do NOT block the aim tile, the range is `0 < dist <= castRange`
+--- (not `< 4`), the player's own tile is seeded first, and ties break toward
+--- the tile NEAREST the player instead of map-iteration order.
+function A:_findBestTfbTile(entry, def)
+    local p = self:profile()
+    local safeCheck = p.PvpSafe
+    local myPos = self:ppos()
+    if not myPos then return nil end
+    local minHp, maxHp = entry.minHp or 0, entry.maxHp or 100
+    local grid = (PAT.spellPatterns[OPT.tile.areaPatternCategory] or {})[OPT.tile.areaPatternId]
+    grid = grid and grid[1]
+    if not grid then return nil end
+    local pvpRadius = OPT.tile.pvpSafeRadius or 3
+
+    local best = { counted = 0, pos = nil, dist = 999 }
+
+    -- (1) the player's OWN tile, seeded first and unconditionally.
+    if not (safeCheck and self:nonPartyPlayerNear(myPos, pvpRadius)) then
+        local n = self:getMonstersInArea(2, myPos, grid, minHp, maxHp, false, entry.monsters, myPos)
+        if n > 0 then best = { counted = n, pos = myPos, dist = 0 } end
+    end
+
+    -- (2) every other known tile on this floor.
+    local st, w = self.state, self.world
+    if st and st.map and w then
+        for key, tile in pairs(st.map) do
+            local tp = tile.pos
+            if not tp then
+                local x, y, z = tostring(key):match('^(-?%d+),(-?%d+),(-?%d+)$')
+                if x then tp = { x = tonumber(x), y = tonumber(y), z = tonumber(z) } end
+            end
+            if tp and tp.z == myPos.z then
+                local dist = self:distFromPlayer(tp)
+                if dist > 0 and dist <= def.castRange
+                   and self:isSightClear(myPos, tp)
+                   and w:isWalkable(tile, true) then          -- ignoreCreatures = TRUE
+                    if not (safeCheck and self:nonPartyPlayerNear(tp, pvpRadius)) then
+                        local n = self:getMonstersInArea(2, tp, grid, minHp, maxHp, false,
+                                                         entry.monsters, tp)
+                        if n > best.counted
+                           or (n == best.counted and n > 0 and dist < best.dist) then
+                            best = { counted = n, pos = tp, dist = dist }
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return best.pos and best or nil
+end
+
+--- Tile mode -- Thousand Fist Blows.  Casts with castAtPos (SpellAimCursor =
+--- 2, a position) rather than at the current target.
+function A:_optTile(entry, def, executeCooldown)
+    local best = self:_findBestTfbTile(entry, def)
+    if not best or not self:countGate(entry, best.counted) then return true, false end
+    if not self:guardsPass() then return true, false end
+
+    local sent = self.sh:sayAt(entry.spell, best.pos)
+    if not sent then
+        -- AB:1605-1614: castAtPos's own delay gate refused -- de-escalate to
+        -- the legacy face-the-target pattern-15 path IN THE SAME TICK.
+        return false, false
+    end
+    self.counts.casts = self.counts.casts + 1
+    self.lastSpell = { spell = entry.spell, category = entry.category, pos = best.pos,
+                       amount = best.counted, at = self:now() }
+    return true, true
 end
 
 -- ===========================================================================
@@ -961,10 +1219,12 @@ function A:_dispatch(entry, tg, bestSide, executeCooldown, isRune)
     -- ---- category 5: Absolute (AB:2932-3070) --------------------------------
     if cat == 5 then
         local pCat = entry.patternCategory or 4
-        local pat = entry.pattern
-        if entry.augmented then
-            pat = PAT.waveAugments[tostring(entry.spell or ''):lower()] or pat
-        end
+        -- AB:1296-1301 (augmentedWavePattern): entry.augmented truthy, entry.spell
+        -- a string, and its LOWERED+TRIMMED form a key of WAVE_AUGMENTS -- all
+        -- three, or the base entry.pattern is kept.  Category 5 only (AB:2937);
+        -- category 2 area runes never call this (§7.2).  OPT.augmentedPattern
+        -- (bot/data/optimizers.lua) is the single source of truth for the trim.
+        local pat = OPT.augmentedPattern(entry)
         local grids = (PAT.spellPatterns[pCat] or {})[pat]
         if not grids then return nil end
         local safe = (p.PvpSafe and grids[2]) or false

@@ -213,6 +213,179 @@ DB.instances.forEach(function (i) {
   });
 });
 
+/* -------------------- bot config (CONFIGAPI.md) ------------------ */
+/* One CFG[instanceId] = { healbot, conditions, attackbot, stances, targetbot, cavebot }
+   holding the six kinds' `data` shapes verbatim (byte-for-byte what a real
+   hub/botconfig.lua would read out of the profile). Built lazily per instance
+   so the generated fleet does not need 200 hand-authored configs; i_1..i_5
+   below get hand-authored, multi-row examples for the demo. */
+
+var CFG = {};
+var CFG_SOURCE = {};   // instanceId -> kind -> 'profile' | 'default'
+
+var STANCES_CATALOG = [
+  { id: 132, words: 'utamo tempo',     name: 'Protector',                needTarget: false },
+  { id: 133, words: 'utito tempo',     name: 'Blood Rage',               needTarget: false },
+  { id: 274, words: 'utori virtu',     name: 'Virtue of Harmony',        needTarget: false },
+  { id: 275, words: 'utito virtu',     name: 'Virtue of Justice',        needTarget: false },
+  { id: 276, words: 'utura tio',       name: 'Virtue of Sustain',        needTarget: false },
+  { id: 304, words: 'uteta flam',      name: 'Master of Flames',         needTarget: false },
+  { id: 305, words: 'uteta vis',       name: 'Master of Thunder',        needTarget: false },
+  { id: 306, words: 'uteta mort',      name: 'Master of Decay',          needTarget: false },
+  { id: 309, words: 'utura sio',       name: 'Shared Conservation',      needTarget: false },
+  { id: 311, words: 'exori moe tempo', name: 'Aura of Sapped Strength',  needTarget: false },
+  { id: 312, words: 'exori kor tempo', name: 'Aura of Exposed Weakness', needTarget: false },
+  { id: 313, words: 'utori con',       name: 'Sharpshooter',             needTarget: true  },
+  { id: 314, words: 'utori hur',       name: 'Divine Defiance',          needTarget: true  },
+  { id: 319, words: 'utito dru',       name: 'Elemental Synthesis',      needTarget: false }
+];
+
+/* bot/configschema.lua's `healbot` kind is `top = 'object'` with EXACTLY
+   {itemTable, spellTable} -- an extra top-level key (name/enabled/Visible/...,
+   which live on the PROFILE, not this kind) is rejected by the real
+   hub/botconfig.lua's getHealbot() projection. Mirror that narrow shape here
+   so a panel built against this mock behaves identically against the real
+   hub -- hub/api.lua and bot/configschema.lua are already built (work items
+   N2/N3) and this mock is kept byte-shape-compatible with them. */
+function blankHealbotData() { return { spellTable: [], itemTable: [] }; }
+function defaultConditionPanel() {
+  /* Real hub/botconfig.lua's getConditions() merges onto this same default,
+     then STRIPS curePosion and guarantees curePoison -- never both. */
+  return { enabled: false,
+           curePoison: false,  poisonCost: 20,
+           cureCurse: false,    curseCost: 80,
+           cureBleed: false,    bleedCost: 45,
+           cureBurn: false,     burnCost: 30,
+           cureElectrify: false, electrifyCost: 22,
+           cureParalyse: false, paralyseCost: 40, paralyseSpell: 'utani hur',
+           holdHaste: false,    hasteCost: 40,    hasteSpell: 'utani hur',
+           holdUtamo: false,    utamoCost: 40,
+           holdUtana: false,    utanaCost: 440,
+           holdUtura: false,    uturaType: '',    uturaCost: 100,
+           ignoreInPz: true,    stopHaste: false };
+}
+
+function defaultCfgFor(kind) {
+  if (kind === 'healbot')   return blankHealbotData();
+  if (kind === 'conditions') return defaultConditionPanel();
+  /* attackbot is `top = 'array'` -- the kind's data IS the bare attackTable. */
+  if (kind === 'attackbot') return [];
+  if (kind === 'stances')   return { enabled: false, ignoreInPz: true, entries: [] };
+  if (kind === 'targetbot') return { targeting: [], looting: { items: [], containers: [],
+                                     everyItem: false, maxDanger: 10, minCapacity: 100 } };
+  if (kind === 'cavebot')   return [];
+  throw E('bad-request', 'unknown config kind: ' + kind);
+}
+
+/* i_1 -- rich, hand-authored, multi-row example data for every kind */
+CFG.i_1 = {
+  /* {itemTable, spellTable} ONLY -- see blankHealbotData()'s comment. The
+     profile-level flags (name/enabled/Visible/Cooldown/...) are not part of
+     this kind's data and are never round-tripped through the panel. */
+  healbot: {
+    spellTable: [
+      { index: 2, spell: 'exura gran tio', sign: '<', origin: 'HP%', value: 75, cost: 210, enabled: true },
+      { index: 1, spell: 'exura gran',     sign: '<', origin: 'HP%', value: 95, cost: 75,  enabled: true }
+    ],
+    itemTable: [
+      { index: 2, item: 23374, sign: '<', origin: 'HP%', value: 40, enabled: false },
+      { index: 3, item: 23374, sign: '<', origin: 'HP%', value: 75, enabled: true },
+      { index: 1, item: 23374, sign: '<', origin: 'MP%', value: 75, enabled: true }
+    ]
+  },
+  conditions: (function () {
+    var c = defaultConditionPanel();
+    c.enabled = true; c.cureParalyse = true; c.paralyseCost = 200; c.paralyseSpell = 'utani gran hur';
+    c.holdHaste = true; c.hasteCost = 200; c.hasteSpell = 'utani gran hur';
+    return c;
+  })(),
+  /* bare attackTable array -- see defaultCfgFor('attackbot')'s comment. */
+  attackbot: [
+    { spell: 'exori mas res', itemId: 0, category: 5, patternCategory: 4, pattern: 19,
+      count: 1, orMore: true, minHp: 0, maxHp: 100, mana: 10, cooldown: 1, harmony: 0,
+      monsters: ['true frost flower asura'], augmented: false, enabled: true,
+      description: '[Balanced Brawl] 1+ true frost flower asura' },
+    { spell: 'exori gran mas nia', itemId: 0, category: 5, patternCategory: 4, pattern: 17,
+      count: 5, orMore: true, minHp: 0, maxHp: 100, mana: 20, cooldown: 1, harmony: 5,
+      monsters: true, augmented: false, enabled: true,
+      description: '[Spiritual Outburst] 5+ any creature' },
+    { spell: '', itemId: 3200, category: 2, patternCategory: 2, pattern: 3,
+      count: 3, orMore: true, minHp: 0, maxHp: 100, mana: 0, cooldown: 2, harmony: 0,
+      monsters: true, augmented: false, enabled: true, description: 'GFB rune, 3+' }
+  ],
+  stances: {
+    enabled: true, ignoreInPz: true,
+    entries: [
+      { spell: 'utamo tempo', spellId: 132, stanceName: 'Protector', needTarget: false,
+        monsters: true, minHp: 0, maxHp: 40, minMana: 0, count: 0, range: 5, orMore: true,
+        enabled: true, description: 'Protector below 40% hp' },
+      { spell: 'utito tempo', spellId: 133, stanceName: 'Blood Rage', needTarget: false,
+        monsters: true, minHp: 41, maxHp: 100, minMana: 0, count: 4, range: 5, orMore: true,
+        enabled: true, description: 'Blood Rage vs 4+ creatures' }
+    ]
+  },
+  targetbot: {
+    targeting: [
+      { name: 'Dark Torturer', regex: '^dark torturer$', priority: 4, danger: 1, maxDistance: 8,
+        chase: true, keepDistance: false, keepDistanceRange: 1, anchor: false, anchorRange: 3,
+        avoidAttacks: false, faceMonster: false, rePosition: true, rePositionAmount: 7,
+        lure: false, lureCount: 1, lureCavebot: false, dynamicLure: true, lureMin: 3, lureMax: 9,
+        dynamicLureDelay: true, lureDelay: 655, delayFrom: 4, closeLure: true, closeLureAmount: 6,
+        dontLoot: false, diamondArrows: true, rpSafe: false },
+      { name: '*', regex: '^.*$', priority: 1, danger: 1, maxDistance: 10,
+        chase: true, keepDistance: false, keepDistanceRange: 1, anchor: false, anchorRange: 3,
+        avoidAttacks: false, faceMonster: false, rePosition: false, rePositionAmount: 5,
+        lure: false, lureCount: 1, lureCavebot: false, dynamicLure: false, lureMin: 1, lureMax: 3,
+        dynamicLureDelay: false, lureDelay: 250, delayFrom: 2, closeLure: false, closeLureAmount: 3,
+        dontLoot: true, diamondArrows: false, rpSafe: false }
+    ],
+    looting: {
+      items: [ { id: 16131, count: 0 }, { id: 9636, count: 0 } ],
+      containers: [ { id: 23721, count: 0 } ],
+      everyItem: false, maxDanger: 10, minCapacity: 100
+    }
+  },
+  cavebot: [
+    { type: 'goto', value: '32359,32226,7' },
+    { type: 'label', value: 'hunt' },
+    { type: 'use', value: '32321,32211,7' },
+    { type: 'delay', value: '500' },
+    { type: 'function', value: 'TargetBot.setOn()\n\nreturn true\n' },
+    { type: 'supplycheck', value: 'hunt,32894,32356,9' },
+    { type: 'gotolabel', value: 'hunt' }
+  ]
+};
+Object.keys(CFG.i_1).forEach(function (k) { (CFG_SOURCE.i_1 = CFG_SOURCE.i_1 || {})[k] = 'profile'; });
+
+function ensureCfg(instId, kind) {
+  CFG[instId] = CFG[instId] || {};
+  CFG_SOURCE[instId] = CFG_SOURCE[instId] || {};
+  if (CFG[instId][kind] === undefined) {
+    CFG[instId][kind] = defaultCfgFor(kind);
+    CFG_SOURCE[instId][kind] = 'default';
+  }
+  return CFG[instId][kind];
+}
+var CFG_KINDS = { healbot: 1, conditions: 1, attackbot: 1, stances: 1, targetbot: 1, cavebot: 1 };
+
+/* Security mirror of hub/api.lua's EXEC_CAPABILITY gate (CONFIGAPI.md "Security"):
+   a cavebot PUT needs canExec ONLY when the diff adds or changes a function-type
+   waypoint's BODY. Reordering, editing a goto/delay/... value, or removing a
+   function waypoint needs only the normal owner-or-admin permission. */
+function cavebotDiffNeedsExec(oldArr, newArr) {
+  var oldFns = {};
+  (oldArr || []).forEach(function (w) {
+    if (w && String(w.type).toLowerCase() === 'function') oldFns[w.value] = (oldFns[w.value] || 0) + 1;
+  });
+  var flagged = false;
+  (newArr || []).forEach(function (w) {
+    if (w && String(w.type).toLowerCase() === 'function') {
+      if (oldFns[w.value] > 0) oldFns[w.value]--; else flagged = true;
+    }
+  });
+  return flagged;
+}
+
 /* rolling logs / chat / history */
 var LOGS = {}, CHAT = {}, HIST = {};
 DB.instances.forEach(function (i) { LOGS[i.id] = []; CHAT[i.id] = []; HIST[i.id] = []; });
@@ -565,6 +738,21 @@ function needExec() {
        'this account the canExec capability');
 }
 
+/* Mirrors bot/configschema.lua's per-kind top-level shape (work item N2):
+   healbot/conditions/stances/targetbot are `top = 'object'`, STRICT about
+   their own top-level keys (an extra one is rejected, not tolerated);
+   attackbot is `top = 'array'` -- its `data` IS the bare attackTable. */
+var CFG_TOP_KEYS = {
+  healbot:    { itemTable: 1, spellTable: 1 },
+  conditions: { enabled: 1, curePoison: 1, curePosion: 1, poisonCost: 1, cureCurse: 1, curseCost: 1,
+    cureBleed: 1, bleedCost: 1, cureBurn: 1, burnCost: 1, cureElectrify: 1, electrifyCost: 1,
+    cureParalyse: 1, paralyseCost: 1, paralyseSpell: 1, holdHaste: 1, hasteCost: 1, hasteSpell: 1,
+    holdUtamo: 1, utamoCost: 1, holdUtana: 1, utanaCost: 1, holdUtura: 1, uturaType: 1, uturaCost: 1,
+    ignoreInPz: 1, stopHaste: 1 },
+  stances:    { enabled: 1, ignoreInPz: 1, entries: 1 },
+  targetbot:  { targeting: 1, looting: 1 }
+};
+
 /* ---------------------- the route handlers ---------------------- */
 /* Keys are '<METHOD> <path template>' and match api.js's ENDPOINTS
    one for one; a handler gets ({params, query, body}).             */
@@ -813,6 +1001,78 @@ var ROUTES = {
   CHAT[i.id].push(m);
   emitTo('chat', i.id, 'chat', m);
   return {};
+},
+
+/* ---- bot config (CONFIGAPI.md) ---- */
+
+'GET /api/instances/:id/config/:kind': function (c) {
+  needAuth();
+  var i = findInstance(c.params.id);
+  var kind = c.params.kind;
+  need(CFG_KINDS[kind], 'bad-request', 'unknown config kind: ' + kind);
+  var data = ensureCfg(i.id, kind);
+  return { kind: kind, data: data, source: CFG_SOURCE[i.id][kind], editable: true };
+},
+
+'PUT /api/instances/:id/config/:kind': function (c) {
+  needAuth();
+  var i = findInstance(c.params.id);
+  var kind = c.params.kind;
+  need(CFG_KINDS[kind], 'bad-request', 'unknown config kind: ' + kind);
+  var data = (c.body || {}).data;
+  need(data !== undefined && data !== null, 'bad-request', 'missing data');
+  if (kind === 'cavebot') {
+    need(Array.isArray(data), 'bad-request', 'cavebot data must be an array of {type,value}');
+    for (var w = 0; w < data.length; w++) {
+      var wp = data[w];
+      need(wp && typeof wp.type === 'string' && wp.type.length,
+           'bad-request', 'cavebot[' + (w + 1) + ']: type must be a non-empty string');
+      need(wp.type === wp.type.toLowerCase(), 'bad-request',
+           'cavebot[' + (w + 1) + ']: type "' + wp.type + '" must be lowercase');
+      need(typeof wp.value === 'string' && wp.value.length, 'bad-request',
+           'cavebot[' + (w + 1) + '] (' + wp.type + '): value must not be empty');
+    }
+    if (cavebotDiffNeedsExec(ensureCfg(i.id, 'cavebot'), data)) {
+      audit('instance.config', i.characterName, 'denied', 'cavebot function-body change refused (canExec required)');
+      throw E('forbidden', 'changing a cavebot function waypoint body requires the canExec capability');
+    }
+  } else if (kind === 'attackbot') {
+    need(Array.isArray(data), 'bad-request', 'attackbot data must be an array (the attackTable itself)');
+  } else {
+    need(typeof data === 'object' && !Array.isArray(data), 'bad-request', kind + ' data must be an object');
+    var allowed = CFG_TOP_KEYS[kind];
+    for (var k in data) {
+      if (Object.prototype.hasOwnProperty.call(data, k) && !allowed[k]) {
+        throw E('bad-request', kind + ' has an unknown field "' + k + '"');
+      }
+    }
+    if (kind === 'conditions') {
+      need(typeof data.curePoison === 'boolean', 'bad-request', 'conditions.curePoison is required');
+    }
+  }
+  CFG[i.id] = CFG[i.id] || {};
+  CFG_SOURCE[i.id] = CFG_SOURCE[i.id] || {};
+  CFG[i.id][kind] = data;
+  CFG_SOURCE[i.id][kind] = 'profile';
+  var detail = kind === 'cavebot' ? kind + ': ' + data.length + ' waypoint(s)' : kind + ' updated';
+  audit('instance.config', i.characterName, 'ok', detail);
+  pushLog(i, 'info', 'config: ' + kind + ' saved by ' + session.name);
+  return { kind: kind, applied: true };
+},
+
+'GET /api/instances/:id/config/:kind/list': function (c) {
+  needAuth();
+  var i = findInstance(c.params.id);
+  var kind = c.params.kind;
+  need(CFG_KINDS[kind], 'bad-request', 'unknown config kind: ' + kind);
+  /* Matches hub/botconfig.lua's listConfigs exactly: numbers for healbot/
+     attackbot (their own numbered profiles), file names for cavebot/
+     targetbot, and an empty {names:[],active:null} for conditions/stances --
+     those two are single-object kinds with no numbered/named alternative. */
+  if (kind === 'cavebot') return { names: CAVEBOTS.slice(), active: i.cavebotConfig };
+  if (kind === 'targetbot') return { names: TARGETBOT.slice(), active: i.targetbotConfig };
+  if (kind === 'healbot' || kind === 'attackbot') return { names: [1, 2, 3, 4, 5], active: 1 };
+  return { names: [], active: null };
 },
 
 /* ---- game accounts ---- */

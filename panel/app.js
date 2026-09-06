@@ -668,7 +668,8 @@ function ViewInstance(params) {
   }
 
   var tabName = params.tab || readTab(id) || 'overview';
-  var TABS = [['overview', 'Overview'], ['bot', 'Bot'], ['console', 'Console'], ['chat', 'Chat']];
+  var TABS = [['overview', 'Overview'], ['bot', 'Bot'], ['config', 'Bot Config'],
+              ['console', 'Console'], ['chat', 'Chat']];
   var pane = h('div');
   var sub = null;
 
@@ -723,6 +724,7 @@ function ViewInstance(params) {
   ws.subscribe(tabName === 'console' ? id : null, tabName === 'chat' ? id : null);
 
   if (tabName === 'bot') sub = TabBot(id);
+  else if (tabName === 'config') sub = TabBotConfig(id);
   else if (tabName === 'console') sub = TabConsole(id);
   else if (tabName === 'chat') sub = TabChat(id);
   else sub = TabOverview(id);
@@ -1145,6 +1147,618 @@ function TabChat(id) {
       }
     }
   };
+}
+
+/* ==================================================================
+   9.2b Bot Config (CONFIGAPI.md)
+   ------------------------------------------------------------------
+   Six card editors -- Healing (itemTable/spellTable), Conditions,
+   Attack (attackTable), Stances, Targeting (+ looting), CaveBot
+   (waypoints). Each card GETs its kind on tab open, edits an in-memory
+   copy of `data`, Saves by PUTting the whole kind, and Reverts by
+   re-fetching. A row keeps every key the server sent -- only the
+   fields a control is bound to are ever touched -- so a field this
+   editor does not know about still round-trips unchanged, per
+   CONFIGAPI.md's compatibility acceptance rule.
+   ================================================================== */
+
+/** Mirrors the Console/Scripts tabs' own check, verbatim -- one
+ *  capability flag, never a second one. */
+function hasExec() { return !(S.me && S.me.canExec === false); }
+
+function nf(value, w) {
+  return h('input', { type: 'number', step: 'any',
+    value: (value === undefined || value === null) ? '' : value, style: { width: (w || '64px') } });
+}
+function cf(checked) { return h('input', { type: 'checkbox', checked: !!checked }); }
+function tf(value, w, placeholder) {
+  return h('input', { type: 'text', value: (value === undefined || value === null) ? '' : value,
+    placeholder: placeholder || '', style: { width: (w || '140px') } });
+}
+function taInput(value, rows, w) {
+  return h('textarea', { rows: String(rows || 3), spellcheck: 'false',
+    style: { width: (w || '100%'), fontSize: '12px' }, value: value === undefined ? '' : value });
+}
+function bindChk(el, obj, key) { el.addEventListener('change', function () { obj[key] = el.checked; }); return el; }
+
+function numF(row, key, label, w) {
+  var el = nf(row[key], w);
+  el.addEventListener('change', function () {
+    var v = el.value === '' ? 0 : Number(el.value);
+    row[key] = isNaN(v) ? 0 : v;
+  });
+  return field(label, el);
+}
+function chkF(row, key, label, onToggle) {
+  var el = cf(row[key]);
+  el.addEventListener('change', function () { row[key] = el.checked; if (onToggle) onToggle(el.checked); });
+  return h('label.check', { style: { marginBottom: '8px' } }, el, txt(label));
+}
+function txtF(row, key, label, w, placeholder) {
+  var el = tf(row[key], w, placeholder);
+  el.addEventListener('change', function () { row[key] = el.value; });
+  return field(label, el);
+}
+/** options: [{value, label}] with `value` already the right TYPE (number or string) --
+ *  a <select>'s own .value is always a string, so the change handler looks the
+ *  original option back up rather than trusting sel.value directly. */
+function enumF(row, key, label, options) {
+  var sel = selectOf(options, row[key], function (o) { return o; });
+  sel.addEventListener('change', function () {
+    var hit = options.filter(function (o) { return String(o.value) === sel.value; })[0];
+    row[key] = hit ? hit.value : sel.value;
+  });
+  return field(label, sel);
+}
+
+/** The `true | [names...]` monster filter shared by attackbot entries and
+ *  stance entries: a checkbox for "any creature" plus a comma-separated
+ *  names box that is only live when it is unchecked. */
+function monsterFilterF(row, key) {
+  var isAny = row[key] === true;
+  var any = cf(isAny);
+  var names = tf(Array.isArray(row[key]) ? row[key].join(', ') : '', '220px', 'comma-separated names');
+  names.disabled = isAny;
+  function fromText() {
+    return names.value.split(',').map(function (s) { return s.trim().toLowerCase(); }).filter(Boolean);
+  }
+  any.addEventListener('change', function () {
+    names.disabled = any.checked;
+    row[key] = any.checked ? true : fromText();
+  });
+  names.addEventListener('change', function () { if (!any.checked) row[key] = fromText(); });
+  return h('div', { style: { marginBottom: '8px' } },
+    h('label.check', { style: { marginBottom: '4px' } }, any, txt('any creature')),
+    field('Monster names', names));
+}
+
+/**
+ * Generic list-of-entries editor over `rows`, mutated in place.
+ * opts: { makeRow(row,i,redraw)->Node, newRow()->row, reorder:bool, orderNote,
+ *         addLabel, rowTitle(row,i)->string, emptyText, canDuplicate(row)->bool }
+ */
+function listEditor(rows, opts) {
+  var list = h('div.cfglist');
+  function redraw() {
+    clear(list);
+    if (!rows.length) list.appendChild(h('div.hint', { text: opts.emptyText || 'No entries yet.' }));
+    rows.forEach(function (row, i) {
+      var canDup = !opts.canDuplicate || opts.canDuplicate(row);
+      var up = h('button.btn.sm', { text: '↑', title: 'Move up', disabled: i === 0,
+        onclick: function () { var t = rows[i - 1]; rows[i - 1] = rows[i]; rows[i] = t; redraw(); } });
+      var down = h('button.btn.sm', { text: '↓', title: 'Move down', disabled: i === rows.length - 1,
+        onclick: function () { var t = rows[i + 1]; rows[i + 1] = rows[i]; rows[i] = t; redraw(); } });
+      var dup = h('button.btn.sm', { text: 'Duplicate', disabled: !canDup,
+        onclick: function () { rows.splice(i + 1, 0, JSON.parse(JSON.stringify(row))); redraw(); } });
+      var del = h('button.btn.sm.danger', { text: 'Remove',
+        onclick: function () { rows.splice(i, 1); redraw(); } });
+      var head = h('div.row', { style: { marginBottom: '6px' } },
+        h('span.cfghead', { text: opts.rowTitle ? opts.rowTitle(row, i) : ('#' + (i + 1)) }),
+        h('span.spacer'),
+        opts.reorder ? up : null, opts.reorder ? down : null, dup, del);
+      list.appendChild(h('div.cfgrow', null, head, opts.makeRow(row, i, redraw)));
+    });
+  }
+  redraw();
+  var addBtn = h('button.btn.sm', { text: opts.addLabel || '+ Add row',
+    onclick: function () { rows.push(opts.newRow()); redraw(); } });
+  return {
+    el: h('div', null,
+      opts.orderNote ? h('div.hint', { style: { marginBottom: '8px' }, text: opts.orderNote }) : null,
+      list,
+      h('div.row', { style: { marginTop: '8px' } }, addBtn)),
+    redraw: redraw
+  };
+}
+
+/** One card: header (title, source badge, active-profile hint, Revert, Save),
+ *  a lazily-GETted body built by `buildEditor(data, ctx) -> {el, getData()}`,
+ *  and a 400 -> inline warnbox + toast on Save. Independent of every other
+ *  card: its own load() promise, never awaited by the tab that hosts it. */
+function configCard(id, kind, title, buildEditor) {
+  var sourceTag = h('span.tag', { text: '' });
+  var listHint = h('span.hint');
+  var saveBtn = h('button.btn.sm.primary', { text: 'Save' });
+  var revertBtn = h('button.btn.sm', { text: 'Revert' });
+  var errBox = h('div');
+  var body = h('div', null, h('div.hint', { text: 'Loading ' + title + '…' }));
+  var card = h('div.card', null,
+    h('div.cfgcard-foot', null,
+      h('h3', { text: title, style: { margin: '0' } }), sourceTag, listHint, h('span.spacer'),
+      revertBtn, saveBtn),
+    errBox, body);
+
+  var editor = null, lastEditable = true;
+
+  api.call('config.list', { id: id, kind: kind }).then(function (r) {
+    var names = r.names || [];
+    listHint.textContent = names.length ? ('active: ' + r.active + ' (' + names.length + ' known)') : '';
+  }).catch(function () { listHint.textContent = ''; });
+
+  function load() {
+    saveBtn.disabled = true;
+    clear(errBox);
+    clear(body);
+    body.appendChild(h('div.hint', { text: 'Loading ' + title + '…' }));
+    return api.call('config.get', { id: id, kind: kind }).then(function (r) {
+      clear(body);
+      sourceTag.className = 'tag' + (r.source === 'default' ? ' default' : '');
+      sourceTag.textContent = r.source === 'default' ? 'new / default' : 'from profile';
+      lastEditable = r.editable !== false;
+      editor = buildEditor(r.data, { instanceId: id, kind: kind });
+      body.appendChild(editor.el);
+      saveBtn.disabled = !lastEditable;
+    }).catch(function (e) {
+      clear(body);
+      body.appendChild(emptyBox('Could not load ' + title.toLowerCase() + ': ' + e.message));
+      failed(title, e);
+    });
+  }
+
+  saveBtn.addEventListener('click', function () {
+    if (!editor) return;
+    saveBtn.disabled = true;
+    clear(errBox);
+    api.call('config.set', { id: id, kind: kind, data: editor.getData() }).then(function () {
+      Toast.ok(title + ' saved');
+      return load();
+    }).catch(function (e) {
+      if (e && e.code === 'bad-request') {
+        errBox.appendChild(h('div.warnbox', { text: 'Not saved: ' + e.message }));
+      }
+      failed('Save ' + title, e);
+      saveBtn.disabled = !lastEditable;
+    });
+  });
+  revertBtn.addEventListener('click', load);
+
+  load();
+  return card;
+}
+
+/* ---- Healing: itemTable + spellTable (bot/healbot.lua) ---- */
+function buildHealbotEditor(data) {
+  data.itemTable = Array.isArray(data.itemTable) ? data.itemTable : [];
+  data.spellTable = Array.isArray(data.spellTable) ? data.spellTable : [];
+
+  var ORIGINS = ['HP%', 'HP', 'MP%', 'MP', 'burst'].map(function (v) { return { value: v, label: v }; });
+  var SIGNS = [
+    { value: '<', label: '< or = (inclusive)' },
+    { value: '>', label: '> or = (inclusive)' },
+    { value: '=', label: '= exactly' }
+  ];
+
+  var items = listEditor(data.itemTable, {
+    reorder: true, addLabel: '+ Add item rule',
+    orderNote: 'Array order = priority. The first ENABLED rule whose condition matches uses an item; ' +
+      'one item use per 100 ms tick.',
+    emptyText: 'No item rules yet.',
+    rowTitle: function (row) { return 'Item ' + (row.item || '—'); },
+    newRow: function () {
+      return { enabled: true, origin: 'HP%', sign: '<', value: 50, item: 0, index: data.itemTable.length + 1 };
+    },
+    makeRow: function (row) {
+      return h('div', null,
+        chkF(row, 'enabled', 'Enabled'),
+        h('div.row', null,
+          enumF(row, 'origin', 'Trigger on', ORIGINS),
+          enumF(row, 'sign', 'Comparison', SIGNS),
+          numF(row, 'value', 'Threshold', '80px'),
+          numF(row, 'item', 'Item id', '90px'),
+          numF(row, 'index', 'Index (widget only)', '70px')));
+    }
+  });
+
+  var spells = listEditor(data.spellTable, {
+    reorder: true, addLabel: '+ Add spell rule',
+    orderNote: 'Array order = priority. The first ENABLED rule whose condition matches casts; ' +
+      'one spell cast per 50 ms tick.',
+    emptyText: 'No spell rules yet.',
+    rowTitle: function (row) { return row.spell || '—'; },
+    newRow: function () {
+      return { enabled: true, origin: 'HP%', sign: '<', value: 50, spell: '', cost: 0,
+        index: data.spellTable.length + 1 };
+    },
+    makeRow: function (row) {
+      return h('div', null,
+        chkF(row, 'enabled', 'Enabled'),
+        h('div.row', null,
+          enumF(row, 'origin', 'Trigger on', ORIGINS),
+          enumF(row, 'sign', 'Comparison', SIGNS),
+          numF(row, 'value', 'Threshold', '80px'),
+          txtF(row, 'spell', 'Spell words', '160px'),
+          numF(row, 'cost', 'Mana cost', '80px'),
+          numF(row, 'index', 'Index (widget only)', '70px')));
+    }
+  });
+
+  return {
+    el: h('div', null,
+      h('div.cfggroup', { text: 'Spells (spellTable) — checked every 50 ms' }), spells.el,
+      h('div.cfggroup', { text: 'Items (itemTable) — checked every 100 ms' }), items.el),
+    /* bot/configschema.lua's `healbot` kind is `top = 'object'` with EXACTLY
+       these two fields (rejectUnknown at the top level) -- unlike an entry's
+       own fields, an extra top-level key here (e.g. the profile's `name`/
+       `enabled`/`Visible`) is REJECTED, not tolerated. Emit only the two. */
+    getData: function () { return { itemTable: data.itemTable, spellTable: data.spellTable }; }
+  };
+}
+
+/* ---- Conditions: the ConditionPanel block (bot/healbot.lua) ---- */
+function buildConditionsEditor(data) {
+  var d = data;
+  var DEF = { enabled: false, curePosion: false, poisonCost: 20, cureCurse: false, curseCost: 80,
+    cureBleed: false, bleedCost: 45, cureBurn: false, burnCost: 30, cureElectrify: false, electrifyCost: 22,
+    cureParalyse: false, paralyseCost: 40, paralyseSpell: 'utani hur', holdHaste: false, hasteCost: 40,
+    hasteSpell: 'utani hur', holdUtamo: false, utamoCost: 40, holdUtana: false, utanaCost: 440,
+    holdUtura: false, uturaType: '', uturaCost: 100, ignoreInPz: true, stopHaste: false };
+  Object.keys(DEF).forEach(function (k) { if (d[k] === undefined) d[k] = DEF[k]; });
+
+  /* curePoison / curePosion compat, per CONFIGAPI.md: read curePoison, falling
+     back to the misspelled curePosion; always WRITE curePoison, and keep
+     curePosion in sync only when the loaded file already carried it.
+     bot/configschema.lua makes curePoison REQUIRED -- fix it up to a real
+     boolean right here, not only inside the checkbox's change handler, so a
+     card the user never touches still saves a valid payload. */
+  var hadPosion = d.curePosion !== undefined;
+  d.curePoison = d.curePoison !== undefined ? !!d.curePoison : !!d.curePosion;
+  var poison = cf(d.curePoison);
+  poison.addEventListener('change', function () {
+    d.curePoison = poison.checked;
+    if (hadPosion) d.curePosion = poison.checked;
+  });
+
+  function cureRow(label, chkEl, costKey, spellKey, spellLabel) {
+    var cost = numF(d, costKey, 'Cost', '70px');
+    var spell = spellKey ? txtF(d, spellKey, spellLabel || 'Spell words', '150px') : null;
+    return h('div.row', { style: { alignItems: 'flex-end', marginBottom: '2px' } },
+      h('label.check', { style: { minWidth: '150px' } }, chkEl, txt(label)), cost, spell);
+  }
+
+  var top = h('div.row', { style: { marginBottom: '10px' } },
+    chkF(d, 'enabled', 'Conditions master switch'),
+    chkF(d, 'ignoreInPz', 'Ignore in protection zone'),
+    chkF(d, 'stopHaste', 'Stop haste while attacking'));
+
+  var cures = h('div', null,
+    h('div.cfggroup', { text: 'Cure (fires on the matching player-state bit)' }),
+    cureRow('Poison', poison, 'poisonCost'),
+    cureRow('Curse', bindChk(cf(d.cureCurse), d, 'cureCurse'), 'curseCost'),
+    cureRow('Bleed', bindChk(cf(d.cureBleed), d, 'cureBleed'), 'bleedCost'),
+    cureRow('Burn', bindChk(cf(d.cureBurn), d, 'cureBurn'), 'burnCost'),
+    cureRow('Electrify', bindChk(cf(d.cureElectrify), d, 'cureElectrify'), 'electrifyCost'),
+    cureRow('Paralyse', bindChk(cf(d.cureParalyse), d, 'cureParalyse'), 'paralyseCost', 'paralyseSpell'));
+
+  var holds = h('div', null,
+    h('div.cfggroup', { text: 'Hold (keep the buff up while it is affordable)' }),
+    cureRow('Haste', bindChk(cf(d.holdHaste), d, 'holdHaste'), 'hasteCost', 'hasteSpell'),
+    cureRow('Utamo vita', bindChk(cf(d.holdUtamo), d, 'holdUtamo'), 'utamoCost'),
+    cureRow('Utana vid', bindChk(cf(d.holdUtana), d, 'holdUtana'), 'utanaCost'),
+    cureRow('Utura', bindChk(cf(d.holdUtura), d, 'holdUtura'), 'uturaCost', 'uturaType', 'Type'));
+
+  return { el: h('div', null, top, cures, holds), getData: function () { return d; } };
+}
+
+/* ---- Attack: attackTable entries (bot/attackbot.lua, AttackBot.json) ----
+   bot/configschema.lua declares attackbot as `top = 'array'`: the kind's
+   `data` IS the bare attackTable, not an object wrapping it -- unlike
+   healbot/conditions/stances/targetbot, there is no profile-level object
+   here (Rotate/Kills/PvpSafe/... stay on the hub's side, untouched). */
+function buildAttackEditor(data) {
+  var rows = Array.isArray(data) ? data : [];
+  var CATS = [
+    { value: 1, label: '1 — Targeted spell' },
+    { value: 2, label: '2 — Area rune' },
+    { value: 3, label: '3 — Targeted rune' },
+    { value: 4, label: '4 — Empowerment' },
+    { value: 5, label: '5 — Absolute (waves / beams / monk)' }
+  ];
+
+  var table = listEditor(rows, {
+    reorder: true, addLabel: '+ Add attack entry',
+    orderNote: 'Array order = priority; index 1 fires first. AttackBot fires at most one action per ~50 ms tick.',
+    emptyText: 'No attack entries yet.',
+    rowTitle: function (row) {
+      return row.description || row.spell || (row.itemId ? ('rune ' + row.itemId) : 'entry');
+    },
+    newRow: function () {
+      return { spell: '', itemId: 0, category: 5, patternCategory: 4, pattern: 1, count: 1, orMore: true,
+        minHp: 0, maxHp: 100, mana: 0, cooldown: 1, harmony: 0, monsters: true, augmented: false,
+        enabled: true, description: '' };
+    },
+    makeRow: function (row) {
+      return h('div', null,
+        h('div.row', null, chkF(row, 'enabled', 'Enabled'), txtF(row, 'description', 'Label', '260px')),
+        h('div.row', null,
+          enumF(row, 'category', 'Category', CATS),
+          numF(row, 'pattern', 'Pattern', '70px'),
+          numF(row, 'patternCategory', 'Pattern category', '90px')),
+        h('div.row', null,
+          txtF(row, 'spell', 'Spell words (empty for a rune)', '220px'),
+          numF(row, 'itemId', 'Rune item id (> 100)', '110px')),
+        monsterFilterF(row, 'monsters'),
+        h('div.row', null,
+          numF(row, 'count', 'Count', '60px'), chkF(row, 'orMore', 'or more'),
+          numF(row, 'minHp', 'Min HP%', '70px'), numF(row, 'maxHp', 'Max HP%', '70px'),
+          numF(row, 'mana', 'Min mana%', '70px')),
+        h('div.row', null,
+          numF(row, 'cooldown', 'Cooldown (ms spell / s rune)', '110px'),
+          numF(row, 'harmony', 'Min harmony', '70px'),
+          chkF(row, 'augmented', 'Augmented')));
+    }
+  });
+
+  return { el: table.el, getData: function () { return rows; } };
+}
+
+/* ---- Stances: storage.stances (bot/stances.lua, vBot/Stances.lua reference) ---- */
+var STANCES_CATALOG = [
+  { id: 132, words: 'utamo tempo',     name: 'Protector',                needTarget: false },
+  { id: 133, words: 'utito tempo',     name: 'Blood Rage',               needTarget: false },
+  { id: 274, words: 'utori virtu',     name: 'Virtue of Harmony',        needTarget: false },
+  { id: 275, words: 'utito virtu',     name: 'Virtue of Justice',        needTarget: false },
+  { id: 276, words: 'utura tio',       name: 'Virtue of Sustain',        needTarget: false },
+  { id: 304, words: 'uteta flam',      name: 'Master of Flames',         needTarget: false },
+  { id: 305, words: 'uteta vis',       name: 'Master of Thunder',        needTarget: false },
+  { id: 306, words: 'uteta mort',      name: 'Master of Decay',          needTarget: false },
+  { id: 309, words: 'utura sio',       name: 'Shared Conservation',      needTarget: false },
+  { id: 311, words: 'exori moe tempo', name: 'Aura of Sapped Strength',  needTarget: false },
+  { id: 312, words: 'exori kor tempo', name: 'Aura of Exposed Weakness', needTarget: false },
+  { id: 313, words: 'utori con',       name: 'Sharpshooter',             needTarget: true  },
+  { id: 314, words: 'utori hur',       name: 'Divine Defiance',          needTarget: true  },
+  { id: 319, words: 'utito dru',       name: 'Elemental Synthesis',      needTarget: false }
+];
+
+function buildStancesEditor(data) {
+  data.entries = Array.isArray(data.entries) ? data.entries : [];
+  if (typeof data.enabled !== 'boolean') data.enabled = false;
+  if (typeof data.ignoreInPz !== 'boolean') data.ignoreInPz = true;
+
+  var STANCE_OPTIONS = STANCES_CATALOG.map(function (s) {
+    return { value: s.words, label: s.name + ' (' + s.words + ')' };
+  });
+
+  var top = h('div.row', { style: { marginBottom: '10px' } },
+    chkF(data, 'enabled', 'Stances enabled'),
+    chkF(data, 'ignoreInPz', 'Ignore in protection zone'));
+
+  var list = listEditor(data.entries, {
+    reorder: true, addLabel: '+ Add stance',
+    orderNote: 'Evaluated STRICTLY top to bottom — the FIRST entry whose conditions match wins the ' +
+      'whole tick, even if a lower entry would also match. Put emergency stances first.',
+    emptyText: 'No stances configured.',
+    rowTitle: function (row) { return row.stanceName || row.spell || 'stance'; },
+    newRow: function () {
+      var s = STANCES_CATALOG[0];
+      return { spell: s.words, spellId: s.id, stanceName: s.name, needTarget: s.needTarget,
+        monsters: true, minHp: 0, maxHp: 100, minMana: 0, count: 0, range: 5, orMore: true,
+        enabled: true, description: s.name };
+    },
+    makeRow: function (row) {
+      var pick = selectOf(STANCE_OPTIONS, row.spell, function (o) { return o; });
+      pick.addEventListener('change', function () {
+        var cat = STANCES_CATALOG.filter(function (s) { return s.words === pick.value; })[0];
+        if (cat) { row.spell = cat.words; row.spellId = cat.id; row.stanceName = cat.name; row.needTarget = cat.needTarget; }
+      });
+      return h('div', null,
+        h('div.row', null,
+          chkF(row, 'enabled', 'Enabled'),
+          field('Known stance', pick),
+          txtF(row, 'spell', 'Spell words (free text overrides the picker)', '200px')),
+        txtF(row, 'description', 'Label', '260px'),
+        monsterFilterF(row, 'monsters'),
+        h('div.row', null,
+          numF(row, 'minHp', 'Min HP%', '70px'), numF(row, 'maxHp', 'Max HP%', '70px'),
+          numF(row, 'minMana', 'Min mana%', '70px')),
+        h('div.row', null,
+          numF(row, 'count', 'Monster count', '80px'), chkF(row, 'orMore', 'or more'),
+          numF(row, 'range', 'Search range', '70px')));
+    }
+  });
+
+  return { el: h('div', null, top, list.el), getData: function () { return data; } };
+}
+
+/* ---- Targeting: targeting[] + looting (bot/targetbot.lua, docs/vbot/targetbot.md) ---- */
+function buildTargetbotEditor(data) {
+  data.targeting = Array.isArray(data.targeting) ? data.targeting : [];
+  data.looting = (data.looting && typeof data.looting === 'object' && !Array.isArray(data.looting))
+    ? data.looting : {};
+  var L = data.looting;
+  if (typeof L.everyItem !== 'boolean') L.everyItem = false;
+  if (L.maxDanger === undefined) L.maxDanger = 10;
+  if (L.minCapacity === undefined) L.minCapacity = 100;
+  L.items = Array.isArray(L.items) ? L.items : [];
+  L.containers = Array.isArray(L.containers) ? L.containers : [];
+
+  var targeting = listEditor(data.targeting, {
+    reorder: true, addLabel: '+ Add creature entry',
+    orderNote: 'List order is a TIE-BREAK only: every matching entry is considered, and when two score an ' +
+      'equal priority for the same monster the earlier one in this list wins.',
+    emptyText: 'No creature entries yet — TargetBot ignores every monster.',
+    rowTitle: function (row) { return row.name || '*'; },
+    newRow: function () {
+      return { name: '*', priority: 1, danger: 1, maxDistance: 10, chase: true,
+        keepDistance: false, keepDistanceRange: 1, anchor: false, anchorRange: 3,
+        avoidAttacks: false, faceMonster: false, rePosition: false, rePositionAmount: 5,
+        lure: false, lureCount: 1, lureCavebot: false, dynamicLure: false, lureMin: 1, lureMax: 3,
+        dynamicLureDelay: false, lureDelay: 250, delayFrom: 2, closeLure: false, closeLureAmount: 3,
+        dontLoot: false, diamondArrows: false, rpSafe: false };
+    },
+    makeRow: function (row) {
+      return h('div', null,
+        txtF(row, 'name', 'Name patterns (comma-separated, * and ? wildcards)', '280px'),
+        h('div.cfggroup', { text: 'Priority / range' }),
+        h('div.row', null,
+          numF(row, 'priority', 'Priority (0-10)', '80px'),
+          numF(row, 'danger', 'Danger (0-10)', '80px'),
+          numF(row, 'maxDistance', 'Max distance', '80px')),
+        h('div.cfggroup', { text: 'Movement' }),
+        h('div.row', null,
+          chkF(row, 'chase', 'Chase'),
+          chkF(row, 'keepDistance', 'Keep distance'), numF(row, 'keepDistanceRange', 'Range', '60px'),
+          chkF(row, 'anchor', 'Anchor'), numF(row, 'anchorRange', 'Anchor range', '80px')),
+        h('div.row', null,
+          chkF(row, 'avoidAttacks', 'Avoid attacks'),
+          chkF(row, 'faceMonster', 'Face monster'),
+          chkF(row, 'rePosition', 'Reposition'), numF(row, 'rePositionAmount', 'Threshold', '80px')),
+        h('div.cfggroup', { text: 'Luring' }),
+        h('div.row', null,
+          chkF(row, 'lure', 'Lure'), numF(row, 'lureCount', 'Lure count', '80px'),
+          chkF(row, 'lureCavebot', 'Lure via CaveBot')),
+        h('div.row', null,
+          chkF(row, 'dynamicLure', 'Dynamic lure'),
+          numF(row, 'lureMin', 'Min', '60px'), numF(row, 'lureMax', 'Max', '60px')),
+        h('div.row', null,
+          chkF(row, 'dynamicLureDelay', 'Slow CaveBot while pulling'),
+          numF(row, 'lureDelay', 'Delay (ms)', '80px'), numF(row, 'delayFrom', 'From count', '80px'),
+          chkF(row, 'closeLure', 'Close lure'), numF(row, 'closeLureAmount', 'Until count', '80px')),
+        h('div.cfggroup', { text: 'Misc' }),
+        h('div.row', null,
+          chkF(row, 'dontLoot', 'Don’t loot this corpse'),
+          chkF(row, 'diamondArrows', 'Diamond-arrows priority'),
+          chkF(row, 'rpSafe', 'PvP-safe (rpSafe)')));
+    }
+  });
+
+  var lootItems = listEditor(L.items, {
+    reorder: false, addLabel: '+ Add item id',
+    emptyText: 'No items configured.',
+    rowTitle: function (row) { return 'Item ' + (row.id || '—'); },
+    newRow: function () { return { id: 0, count: 0 }; },
+    makeRow: function (row) { return numF(row, 'id', 'Item id', '100px'); }
+  });
+  var lootContainers = listEditor(L.containers, {
+    reorder: false, addLabel: '+ Add backpack id',
+    emptyText: 'No loot backpacks configured — looting is off without one.',
+    rowTitle: function (row) { return 'Backpack ' + (row.id || '—'); },
+    newRow: function () { return { id: 0, count: 0 }; },
+    makeRow: function (row) { return numF(row, 'id', 'Item id', '100px'); }
+  });
+
+  var lootBody = h('div', null,
+    h('div.row', { style: { marginBottom: '8px' } },
+      numF(L, 'maxDanger', 'Max danger to loot at', '90px'),
+      numF(L, 'minCapacity', 'Stop below free capacity', '120px')),
+    chkF(L, 'everyItem', 'Treat the item list as an IGNORE list instead'),
+    h('div.hint', { style: { marginBottom: '6px' },
+      text: 'The loot list is by numeric item id only — no names, no counts.' }),
+    h('div.cfggroup', { text: 'Items' }), lootItems.el,
+    h('div.cfggroup', { text: 'Destination backpacks (by item id)' }), lootContainers.el);
+
+  return {
+    el: h('div', null,
+      h('div.cfggroup', { text: 'Targeting' }), targeting.el,
+      h('div.cfggroup', { text: 'Looting' }), lootBody),
+    getData: function () { return data; }
+  };
+}
+
+/* ---- CaveBot: the ordered waypoint list (docs/vbot/config-compat-cavebot.md) ---- */
+var CAVEBOT_WAYPOINT_TYPES = [
+  'goto', 'label', 'gotolabel', 'delay', 'use', 'usewith', 'say', 'npcsay', 'function',
+  'bank', 'buysupplies', 'cleartile', 'depositor', 'dpwithdraw', 'exanihur', 'follow', 'forge',
+  'imbuing', 'inwithdraw', 'lure', 'opendoors', 'poscheck', 'rushlure', 'sellall', 'stowdeposit',
+  'supplycheck', 'tasker', 'travel', 'turn', 'walkdelay', 'withdraw',
+  'config', 'extensions', 'staypositions'
+];
+var CAVEBOT_MULTILINE_TYPES = { config: 1, extensions: 1, staypositions: 1 };
+
+function buildCavebotEditor(data, ctx) {
+  var rows = Array.isArray(data) ? data : [];
+  var canExec = hasExec();
+  var listId = 'cb-wp-types-' + ctx.instanceId;
+  var datalist = h('datalist', { id: listId });
+  CAVEBOT_WAYPOINT_TYPES.forEach(function (t) { datalist.appendChild(h('option', { value: t })); });
+
+  var list = listEditor(rows, {
+    reorder: true, addLabel: '+ Add waypoint',
+    orderNote: 'Execution order: the bot runs this list top to bottom (label / gotolabel can jump around it).',
+    emptyText: 'No waypoints yet.',
+    rowTitle: function (row, i) { return (i + 1) + '. ' + (row.type || '?'); },
+    canDuplicate: function (row) { return canExec || String(row.type || '').toLowerCase() !== 'function'; },
+    /* bot/configschema.lua rejects an empty value outright ("an empty value
+       drops the whole waypoint on load") -- default to something a save can
+       actually accept, not a guaranteed 400 on the very first click. */
+    newRow: function () { return { type: 'goto', value: '0,0,0' }; },
+    makeRow: function (row, i, redraw) {
+      var t = String(row.type || '').toLowerCase();
+      var isFn = t === 'function';
+      var locked = isFn && !canExec;
+
+      var typeIn = h('input', { type: 'text', list: listId, value: row.type,
+        style: { width: '170px' }, disabled: locked });
+      typeIn.addEventListener('change', function () {
+        // bot/configschema.lua requires the type lowercase, trimmed, with no
+        // leading/trailing whitespace -- normalise here so a stray "Goto" or
+        // " goto" does not turn into a guaranteed 400 on Save.
+        var v = typeIn.value.trim().toLowerCase();
+        if (v === 'function' && !canExec) {
+          typeIn.value = row.type;
+          Toast.warn('Not permitted', 'Only an admin or a canExec account may create a function waypoint.');
+          return;
+        }
+        row.type = v;
+        redraw();
+      });
+
+      var valueEl;
+      if (isFn || CAVEBOT_MULTILINE_TYPES[t]) {
+        valueEl = taInput(row.value, isFn ? 8 : 3, '100%');
+      } else {
+        valueEl = tf(row.value, '380px');
+      }
+      valueEl.disabled = locked;
+      valueEl.addEventListener('change', function () { row.value = valueEl.value; });
+
+      return h('div', null,
+        field('Type', typeIn),
+        isFn ? h('div.warnbox', { text: 'This runs as Lua inside the bot. Every add or change to a ' +
+          'function waypoint’s body is written to the admin audit log with the full source — ' +
+          'exactly like the Console tab’s Lua execution.' }) : null,
+        field('Value', valueEl));
+    }
+  });
+
+  var notice = canExec ? null : h('div.warnbox', { text:
+    'Function waypoints run raw Lua inside the bot and are gated like the Console tab’s Lua execution: ' +
+    'creating or editing one is administrator-only unless this account has been granted the canExec capability.' });
+
+  return { el: h('div', null, datalist, notice, list.el), getData: function () { return rows; } };
+}
+
+function TabBotConfig(id) {
+  var el = h('div');
+  var KINDS = [
+    ['healbot',    'Healing',    buildHealbotEditor],
+    ['conditions', 'Conditions', buildConditionsEditor],
+    ['attackbot',  'Attack',     buildAttackEditor],
+    ['stances',    'Stances',    buildStancesEditor],
+    ['targetbot',  'Targeting',  buildTargetbotEditor],
+    ['cavebot',    'CaveBot',    buildCavebotEditor]
+  ];
+  KINDS.forEach(function (k) { el.appendChild(configCard(id, k[0], k[1], k[2])); });
+  return { el: el };
 }
 
 /* ---------- 9.3 characters & accounts ---------- */

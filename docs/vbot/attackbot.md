@@ -2,6 +2,8 @@
 
 # AttackBot — behaviour specification for a headless LuaJIT reimplementation
 
+> Implementation status per spell category / optimizer: **[docs/vbot/parity.md](parity.md) §2**.
+
 Source of truth: `D:\Claude\otclient_mehah1530\otclient\profiles\bot\vBot_4.8\vBot\AttackBot.lua`
 (3106 lines; referred to below as **AB**). Helpers live in
 `D:\Claude\otclient_mehah1530\otclient\profiles\bot\vBot_4.8\vBot\vlib.lua` (**VL**),

@@ -1930,6 +1930,18 @@ do
     h6:remove()
 end
 
+S('L. review fix: g_game fight-mode defaults match game.cpp construction')
+do
+    -- game.cpp:69-70: m_pvpMode = WhiteDove(0), m_safeFight = true.  Before the fix this
+    -- shim started safeFight at `false`, so a ported vBot script calling isSafeFight()
+    -- before ever calling a setter (or before the first live 0xA7 PlayerModes update) saw
+    -- the opposite of what the real client would report at the same point.
+    local H = newHost()
+    eq(H.g_game.isSafeFight(), true, 'isSafeFight defaults true, like m_safeFight at construction')
+    eq(H.g_game.getPVPMode(), 0, 'getPVPMode defaults to WhiteDove(0)')
+    eq(H.g_game.getChaseMode(), 0, 'getChaseMode defaults to DontChase(0)')
+end
+
 -- ============================================================================
 io.write('\n================ shim game suite (S1) ================\n')
 for _, m in ipairs(msgs) do io.write(m, '\n') end

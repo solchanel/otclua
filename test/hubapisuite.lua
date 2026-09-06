@@ -185,6 +185,58 @@ local inGame = false
 local exp, level = 42000000, 137
 local t0 = sys.nowMs()
 
+-- ---------------------------------------------------------- real bot wiring
+-- Work item N3 / CONFIGAPI.md: `config.get`/`config.set`/`config.list` are
+-- forwarded verbatim to control/commands.lua (work item N2) running against a
+-- REAL bot.new(...) instance wired to the profile directory the supervisor
+-- passed in `--bot-profile=`.  This is not a second mock of the config
+-- surface: it is the exact same module hub/api.lua would forward to if this
+-- were `main.lua`, so "running" and "stopped" (hub/botconfig.lua, reading the
+-- same directory) are two independent code paths over one real file tree.
+-- Every other test in this file passes a throwaway string ('crash',
+-- 'profile_1') as --bot-profile and never expects a real bot here, so this
+-- only activates for a directory that genuinely has vBot content in it.
+local FAKE_LC, REAL_COMMANDS
+do
+  local dir = FLAGS['bot-profile']
+  if type(dir) == 'string' and dir ~= '' and dir ~= 'crash' then
+    local okc, cfglib = pcall(require, 'bot.config')
+    -- A precise signal, not "the directory has anything in it at all": other
+    -- suites' worker runs (this one's own restart/backoff tests included)
+    -- leave a bare `profile_1/storage/` behind in the repo root from earlier
+    -- --dry-run passes, which is non-empty but is not a vBot profile.  Only a
+    -- directory that genuinely has HealBot.json wires a real bot here.
+    if okc and cfglib.fileExists(dir .. '/vBot_configs/profile_1/HealBot.json') then
+      local okcmd, commandsMod = pcall(require, 'control.commands')
+      local okb, botMod = pcall(require, 'bot.init')
+      local oks, stateMod = pcall(require, 'game.state')
+      local oke, eventsMod = pcall(require, 'lib.events')
+      if okcmd and okb and oks and oke then
+        local st = stateMod.new()
+        st.player = { id = 1, name = 'FakeBotPlayer', pos = { x = 1000, y = 1000, z = 7 },
+                      health = 500, maxHealth = 1000, mana = 200, maxMana = 400,
+                      level = 100, capacity = 900, states = 0, inventory = {} }
+        local bus = eventsMod.new()
+        local lc = {
+          log = { info = function() end, warn = function() end,
+                  error = function() end, debug = function() end },
+          sched = nil, state = st,
+          sender = setmetatable({}, { __index = function() return function() return 'ok' end end }),
+          events = { bus = bus, on = function(n, f) return bus:on(n, f) end,
+                     off = function(h) return bus:off(h) end,
+                     emit = function(n, d) return bus:emit(n, d) end },
+          config = { botProfile = dir, botVProfile = 1, dryRun = false },
+        }
+        local okn, b = pcall(botMod.new, lc, { profileDir = dir, vprofile = 1, autostart = false })
+        if okn then
+          local okw = pcall(b.wireModules, b, {})
+          if okw then lc.bot = b; FAKE_LC, REAL_COMMANDS = lc, commandsMod end
+        end
+      end
+    end
+  end
+end
+
 local function statusPayload()
   return { instance = NAME, state = inGame and 'online' or 'offline',
            loginState = inGame and 'online' or 'offline',
@@ -285,7 +337,19 @@ cmds['shutdown'] = function()
   return true
 end
 
+local REAL_FORWARDED = { ['bot.setCavebot'] = true, ['bot.setTargetbot'] = true,
+                         ['bot.listConfigs'] = true }
 local function dispatch(req)
+  -- config.* (work item N3), plus the config-selection commands it depends on
+  -- (bot.setCavebot/bot.setTargetbot), forward to the REAL control/commands.lua
+  -- against the REAL bot instance wired above, when one was built for this
+  -- worker -- so a config.get('cavebot') sees the SAME selection hub/api.lua
+  -- just pushed via instance.update, exactly as the real worker would.
+  if FAKE_LC and (tostring(req.cmd or ''):match('^config%.') or REAL_FORWARDED[req.cmd]) then
+    local ok, res = REAL_COMMANDS.dispatch({ LC = FAKE_LC }, req.cmd, req.args or {})
+    if not ok then return { id = req.id, ok = false, error = tostring(res) } end
+    return { id = req.id, ok = true, result = res }
+  end
   -- control/server.lua answers with `error` as a plain STRING; so do we, so the
   -- hub's normalisation is exercised rather than bypassed.
   local fn = cmds[tostring(req.cmd or '')]
@@ -1639,6 +1703,398 @@ runSuite('supervisor / the real worker binary (control/server.lua)', function()
   eq(reaped, true, '   and the process is really gone')
   sup:reap(2000)
   sup:uninstall()
+end)
+
+-- ============================================ 10. bot config API (work item N3) =
+-- CONFIGAPI.md: GET/PUT/list over the six vBot config kinds, routed to the
+-- live worker's control socket when running and to hub/botconfig.lua's direct
+-- file access when stopped.  The fake worker wires a REAL bot.new(...)
+-- instance (bot/init.lua + bot/healbot.lua + bot/attackbot.lua + ...) against
+-- a copy of the real vBot_4.8 reference profile, so "running" and "stopped"
+-- are two INDEPENDENT code paths reading and writing the SAME real files --
+-- not one mock agreeing with itself.
+runSuite('api / bot config (CONFIGAPI.md, work item N3)', function()
+  jar = {}
+  rpcOk(PORT, 'auth.login', { name = ADMIN.name, password = ADMIN.password })
+
+  -- ---- locate the real reference profile; skip cleanly if it is absent -----
+  local REF_PROFILE
+  do
+    local candidates = {
+      ROOT .. '/../otclient_mehah1530/otclient/profiles/bot/vBot_4.8',
+      'D:/Claude/otclient_mehah1530/otclient/profiles/bot/vBot_4.8',
+      '/mnt/d/Claude/otclient_mehah1530/otclient/profiles/bot/vBot_4.8',
+    }
+    for _, c in ipairs(candidates) do
+      local f = io.open(c .. '/vBot_configs/profile_1/HealBot.json', 'r')
+      if f then f:close(); REF_PROFILE = c; break end
+    end
+  end
+  if not REF_PROFILE then
+    check(true, 'SKIPPED: the reference vBot_4.8 profile is not present on this machine')
+    return
+  end
+
+  local cfglib = require('bot.config')
+  local isWin = package.config:sub(1, 1) == '\\'
+
+  -- Two short, RELATIVE bot-profile directories under the repo root.  Relative
+  -- (not the long temp DATA path) because hub/model.lua caps botProfile at 64
+  -- bytes; hub/supervisor.lua's Sup:profileDir resolves a relative value
+  -- against `workersDir` (=ROOT, the spawn cwd), and this fake worker's own
+  -- --bot-profile handling does the same by construction (relative to its cwd,
+  -- which the supervisor also sets to ROOT) -- so both paths land on the exact
+  -- same directory.  Cleaned up at the end of this suite either way.
+  local REL_A, REL_B = 'n3cfgtest_a', 'n3cfgtest_b'
+  local DIR_A, DIR_B = ROOT .. '/' .. REL_A, ROOT .. '/' .. REL_B
+
+  local function copyTree(src, dst)
+    cfglib.mkdirp(dst)
+    for _, name in ipairs(cfglib.listDir(src)) do
+      local sp, dp = src .. '/' .. name, dst .. '/' .. name
+      local f = io.open(sp, 'rb')
+      local data = f and f:read('*a')
+      if f then f:close() end
+      if data then cfglib.writeFileAtomic(dp, data) else copyTree(sp, dp) end
+    end
+  end
+  local function rmrfAbs(path)
+    if isWin then os.execute('rmdir /s /q "' .. path:gsub('/', '\\') .. '" 2>nul')
+    else os.execute('rm -rf "' .. path .. '"') end
+  end
+  for _, sub in ipairs{ 'cavebot_configs', 'targetbot_configs', 'vBot_configs', 'storage' } do
+    copyTree(REF_PROFILE .. '/' .. sub, DIR_A .. '/' .. sub)
+    copyTree(REF_PROFILE .. '/' .. sub, DIR_B .. '/' .. sub)
+  end
+
+  -- ---- an instance on DIR_A, owned by the administrator --------------------
+  local acc = rpcOk(PORT, 'account.create',
+                    { label = 'cfg-a', login = 'cfg-a-login', password = 'cfg-a-password-1' })
+  local ch = rpcOk(PORT, 'character.create',
+                   { accountId = acc.account.id, name = 'Cfgtestera', world = 'Gunzodus' })
+  local inst = rpcOk(PORT, 'instance.create', { characterId = ch.character.id })
+  local iid = inst.instance.id
+  rpcOk(PORT, 'instance.update',
+       { id = iid, patch = { botProfile = REL_A, cavebotConfig = 'bultaur_bottom',
+                             targetbotConfig = 'bultaur' } })
+
+  -- Value equality, not byte equality: lib/json.lua's encoder walks `pairs()`,
+  -- whose order is not guaranteed to match between two independently-decoded
+  -- tables holding the same data, so comparing json.encode(a) == json.encode(b)
+  -- is a false negative waiting to happen -- exactly what CONFIGAPI.md's own
+  -- compat test avoids by comparing DECODED values, not re-serialised bytes.
+  local function deepEq(a, b)
+    if a == b then return true end
+    if type(a) ~= type(b) or type(a) ~= 'table' then return false end
+    for k, v in pairs(a) do if not deepEq(v, b[k]) then return false end end
+    for k in pairs(b) do if a[k] == nil then return false end end
+    return true
+  end
+  local function eqData(got, want, desc)
+    local eqOk = deepEq(got, want)
+    local okj1, g = pcall(json.encode, got)
+    local okj2, w = pcall(json.encode, want)
+    return check(eqOk, desc, (not eqOk) and
+      (('got %s want %s'):format(okj1 and g:sub(1, 200) or '?', okj2 and w:sub(1, 200) or '?')) or nil)
+  end
+
+  local KINDS = { 'healbot', 'conditions', 'attackbot', 'stances', 'targetbot', 'cavebot' }
+
+  -- ================================== A. STOPPED path (hub/botconfig.lua) ===
+  local got = {}
+  for _, kind in ipairs(KINDS) do
+    local r = rpcOk(PORT, 'instance.configGet', { id = iid, kind = kind })
+    eq(r.kind, kind, 'GET ' .. kind .. ' (stopped): kind is echoed')
+    eq(r.source, 'profile', '   source=profile (a real file backs it)')
+    check(type(r.data) == 'table', '   data is a table')
+    got[kind] = r.data
+  end
+  eq(#got.healbot.itemTable, 3, 'healbot: the reference profile has 3 item rules')
+  eq(#got.healbot.spellTable, 2, '   and 2 spell rules')
+  eq(got.conditions.curePoison, false, "conditions: curePoison compat resolves from 'curePosion'")
+  eq(#got.attackbot, 8, 'attackbot: 8 entries in the active profile')
+  check(#got.stances.entries >= 1, 'stances: at least one entry from the real profile')
+  check(#got.cavebot >= 1, 'cavebot: at least one {type,value} pair')
+  check(#got.targetbot.targeting >= 1, 'targetbot: at least one targeting entry')
+
+  -- round trip every non-cavebot kind: PUT the same data back, GET again,
+  -- compare byte-for-byte (as JSON) -- "unknown fields survive unchanged" and
+  -- "ints stay ints" both fail loudly here if bot/config.lua's codec drifts.
+  for _, kind in ipairs{ 'healbot', 'conditions', 'attackbot', 'stances', 'targetbot' } do
+    local put = rpcOk(PORT, 'instance.configSet', { id = iid, kind = kind, data = got[kind] })
+    eq(put.applied, true, 'PUT ' .. kind .. ' (stopped) applies')
+    local r2 = rpcOk(PORT, 'instance.configGet', { id = iid, kind = kind })
+    eqData(r2.data, got[kind], '   ' .. kind .. ' round-trips to the identical value')
+  end
+
+  -- ---- MAJOR security-review finding regression: instance.configSet's audit
+  -- record must carry a real diff, not just `kind=X` -- reproducing the
+  -- finding's own live-probe scenarios (healbot itemTable[1].value 40 -> a
+  -- sentinel, an attackbot entry's `enabled` toggle) against a real hub.
+  do
+    local healSentinel = 918273
+    local mutatedHeal = { itemTable = {}, spellTable = got.healbot.spellTable }
+    for i, it in ipairs(got.healbot.itemTable) do
+      mutatedHeal.itemTable[i] = {}
+      for k, v in pairs(it) do mutatedHeal.itemTable[i][k] = v end
+    end
+    local origHealVal = mutatedHeal.itemTable[1].value
+    mutatedHeal.itemTable[1].value = healSentinel
+    rpcOk(PORT, 'instance.configSet', { id = iid, kind = 'healbot', data = mutatedHeal })
+    local audH = rpcOk(PORT, 'admin.audit', { limit = 500 })
+    local expectHeal = ('itemTable[1].value:%s->%s'):format(tostring(origHealVal), tostring(healSentinel))
+    local sawHealDiff = false
+    for _, r in ipairs(audH.rows or {}) do
+      if r.action == 'instance.config' and tostring(r.detail):find(expectHeal, 1, true) then
+        sawHealDiff = true
+        check(r.detail ~= 'kind=healbot',
+              'audit: healbot PUT detail is not just the bare kind (the pre-fix bug)', r.detail)
+      end
+    end
+    check(sawHealDiff, 'a healbot PUT audit record shows itemTable[1].value:old->new exactly ' ..
+          '(' .. expectHeal .. ')')
+    -- restore the original value so earlier round-trip assertions stay valid
+    rpcOk(PORT, 'instance.configSet', { id = iid, kind = 'healbot', data = got.healbot })
+  end
+
+  do
+    local mutatedAtk = {}
+    for i, e in ipairs(got.attackbot) do
+      mutatedAtk[i] = {}
+      for k, v in pairs(e) do mutatedAtk[i][k] = v end
+    end
+    local origEnabled = mutatedAtk[1].enabled
+    mutatedAtk[1].enabled = not origEnabled
+    rpcOk(PORT, 'instance.configSet', { id = iid, kind = 'attackbot', data = mutatedAtk })
+    local audA = rpcOk(PORT, 'admin.audit', { limit = 500 })
+    local expectAtk = ('[1].enabled:%s->%s'):format(tostring(origEnabled), tostring(not origEnabled))
+    local sawAtkDiff = false
+    for _, r in ipairs(audA.rows or {}) do
+      if r.action == 'instance.config' and tostring(r.detail):find('kind=attackbot', 1, true)
+         and tostring(r.detail):find(expectAtk, 1, true) then
+        sawAtkDiff = true
+      end
+    end
+    check(sawAtkDiff, 'an attackbot PUT audit record shows [1].enabled:old->new exactly ' ..
+          '(' .. expectAtk .. '), not just kind=attackbot')
+    rpcOk(PORT, 'instance.configSet', { id = iid, kind = 'attackbot', data = got.attackbot })
+  end
+
+  -- ---- invalid payload -> 400, never silently accepted ----------------------
+  local bad = rpc(PORT, 'instance.configSet',
+                  { id = iid, kind = 'healbot', data = { itemTable = 'not-an-array', spellTable = {} } })
+  eq(bad.status, 400, 'a structurally invalid healbot payload is rejected with 400')
+  eq(bad.err and bad.err.code, 'bad-request', '   code bad-request')
+  local bad2 = rpc(PORT, 'instance.configSet', { id = iid, kind = 'not-a-kind', data = {} })
+  eq(bad2.status, 400, 'an unknown kind is rejected with 400')
+  local bad3 = rpc(PORT, 'instance.configGet', { id = iid, kind = 'not-a-kind' })
+  eq(bad3.status, 400, '   for GET too')
+  -- neither bad payload actually changed anything
+  local afterBad = rpcOk(PORT, 'instance.configGet', { id = iid, kind = 'healbot' })
+  eqData(afterBad.data, got.healbot, '   a rejected PUT leaves the file exactly as it was')
+
+  -- ---- cross-user instance id -> 404, exactly like every other instance route
+  local adminJar = {}
+  for k, v in pairs(jar) do adminJar[k] = v end
+  jar = {}
+  rpcOk(PORT, 'auth.login', { name = USER.name, password = USER.password })
+  local cross = rpc(PORT, 'instance.configGet', { id = iid, kind = 'healbot' })
+  eq(cross.status, 404, "a plain user's cross-tenant id is refused 404 (not 403 -- no id oracle)")
+  local crossSet = rpc(PORT, 'instance.configSet', { id = iid, kind = 'healbot', data = got.healbot })
+  eq(crossSet.status, 404, '   for PUT too')
+  local crossList = rpc(PORT, 'instance.configList', { id = iid, kind = 'cavebot' })
+  eq(crossList.status, 404, '   and for the list route')
+  jar = {}
+  for k, v in pairs(adminJar) do jar[k] = v end
+
+  -- ================================================ B. list ================
+  local list = rpcOk(PORT, 'instance.configList', { id = iid, kind = 'cavebot' })
+  check(#list.names >= 1, 'config list: cavebot names come back (' .. #list.names .. ')')
+  eq(list.active, 'bultaur_bottom', '   active is the instance`s selected cavebot config')
+  local hlist = rpcOk(PORT, 'instance.configList', { id = iid, kind = 'healbot' })
+  eq(#hlist.names, 5, 'config list: healbot always has exactly 5 numbered profiles')
+
+  -- ============ C. the security rule: cavebot function bodies need canExec ==
+  -- A SEPARATE instance/profile (DIR_B) owned by the plain USER, so ownership
+  -- is not what is under test -- only the capability.
+  jar = {}
+  rpcOk(PORT, 'auth.login', { name = USER.name, password = USER.password })
+  local uacc = rpcOk(PORT, 'account.create',
+                     { label = 'cfg-b', login = 'cfg-b-login', password = 'cfg-b-password-1' })
+  local uch = rpcOk(PORT, 'character.create',
+                    { accountId = uacc.account.id, name = 'Cfgtesterb', world = 'Gunzodus' })
+  local uinst = rpcOk(PORT, 'instance.create', { characterId = uch.character.id })
+  local uiid = uinst.instance.id
+  rpcOk(PORT, 'instance.update', { id = uiid, patch = { botProfile = REL_B,
+                                                        cavebotConfig = 'bultaur_bottom' } })
+
+  local cb = rpcOk(PORT, 'instance.configGet', { id = uiid, kind = 'cavebot' })
+  check(#cb.data >= 1, 'the plain user can read their own cavebot config')
+
+  local gotoIdx
+  for i, w in ipairs(cb.data) do
+    if w.type == 'goto' then gotoIdx = i; break end
+  end
+  check(gotoIdx ~= nil, 'the route has at least one goto waypoint to edit')
+
+  local edited = {}
+  for i, w in ipairs(cb.data) do edited[i] = { type = w.type, value = w.value } end
+  if gotoIdx then edited[gotoIdx].value = '999,999,7' end
+  local putGoto = rpc(PORT, 'instance.configSet', { id = uiid, kind = 'cavebot', data = edited })
+  eq(putGoto.status, 200, 'a plain user with NO canExec may freely edit a goto waypoint value')
+
+  -- MAJOR security-review finding regression: an ORDINARY (non-function)
+  -- cavebot edit's audit record used to be `kind=cavebot name=X` -- no diff
+  -- at all.  admin.audit is admin-only, so borrow adminJar for the read and
+  -- put the plain user's session jar right back before the test continues.
+  if gotoIdx then
+    local prevJar = {}
+    for k, v in pairs(jar) do prevJar[k] = v end
+    jar = {}
+    for k, v in pairs(adminJar) do jar[k] = v end
+    local audG = rpcOk(PORT, 'admin.audit', { limit = 500 })
+    jar = prevJar
+    local expectGoto = ('[%d].value:'):format(gotoIdx)
+    local sawGotoDiff = false
+    for _, r in ipairs(audG.rows or {}) do
+      local d = tostring(r.detail)
+      if r.action == 'instance.config' and d:find('kind=cavebot', 1, true)
+         and d:find(expectGoto, 1, true) and d:find('999,999,7', 1, true) then
+        sawGotoDiff = true
+        check(not d:find('^kind=cavebot name=[^;]*$'),
+              'audit: ordinary cavebot PUT detail is not just kind+name (the pre-fix bug)', d)
+      end
+    end
+    check(sawGotoDiff, 'an ordinary (non-function) cavebot PUT audit record shows the changed ' ..
+          'waypoint (' .. expectGoto .. '..->999,999,7), not just kind+name')
+  end
+
+  local withFunc = {}
+  for i, w in ipairs(edited) do withFunc[i] = w end
+  withFunc[#withFunc + 1] = { type = 'function', value = 'return true' }
+  local putFunc = rpc(PORT, 'instance.configSet', { id = uiid, kind = 'cavebot', data = withFunc })
+  eq(putFunc.status, 403, 'the SAME user without canExec is refused adding a function waypoint')
+  eq(putFunc.err and putFunc.err.code, 'forbidden', '   code forbidden')
+  check(putFunc.err and tostring(putFunc.err.message):find('canExec', 1, true) ~= nil,
+        '   naming the capability an administrator can grant', putFunc.err and putFunc.err.message)
+
+  -- confirm the refused write really did not touch the file
+  local afterRefusal = rpcOk(PORT, 'instance.configGet', { id = uiid, kind = 'cavebot' })
+  eq(#afterRefusal.data, #edited, '   and the refused function body was never written')
+
+  -- grant canExec: the identical PUT now succeeds
+  jar = {}
+  for k, v in pairs(adminJar) do jar[k] = v end
+  rpcOk(PORT, 'admin.userUpdate', { id = ids.user, patch = { canExec = true } })
+  jar = {}
+  rpcOk(PORT, 'auth.login', { name = USER.name, password = USER.password })
+  local putFunc2 = rpc(PORT, 'instance.configSet', { id = uiid, kind = 'cavebot', data = withFunc })
+  eq(putFunc2.status, 200, 'the same user WITH canExec may add the function waypoint')
+  local afterGrant = rpcOk(PORT, 'instance.configGet', { id = uiid, kind = 'cavebot' })
+  local sawFunc = false
+  for _, w in ipairs(afterGrant.data) do if w.type == 'function' and w.value == 'return true' then sawFunc = true end end
+  check(sawFunc, '   and the function waypoint is really on disk now')
+
+  -- revoke again so later state is not affected
+  jar = {}
+  for k, v in pairs(adminJar) do jar[k] = v end
+  rpcOk(PORT, 'admin.userUpdate', { id = ids.user, patch = { canExec = false } })
+
+  -- MINOR security-review finding: relocating an already-approved function
+  -- waypoint (same exact body, new index -- cavebotFunctionBodyChanged
+  -- correctly sees no body change, by design) must succeed WITHOUT canExec,
+  -- but must be surfaced in the audit trail as a shape change instead of
+  -- being silently indistinguishable from an ordinary value edit.
+  do
+    local curData = rpcOk(PORT, 'instance.configGet', { id = uiid, kind = 'cavebot' })
+    local funcIdx
+    for i, w in ipairs(curData.data) do
+      if w.type == 'function' and w.value == 'return true' then funcIdx = i; break end
+    end
+    check(funcIdx ~= nil, 'the function waypoint from the earlier grant is present to relocate')
+    if funcIdx then
+      local relocated = { { type = 'goto', value = '5,5,7' } }  -- inserted BEFORE everything
+      for i, w in ipairs(curData.data) do relocated[#relocated + 1] = { type = w.type, value = w.value } end
+
+      jar = {}
+      rpcOk(PORT, 'auth.login', { name = USER.name, password = USER.password })  -- canExec is revoked
+      local putReloc = rpc(PORT, 'instance.configSet', { id = uiid, kind = 'cavebot', data = relocated })
+      eq(putReloc.status, 200,
+         'relocating a function waypoint (same body, new index) succeeds WITHOUT canExec')
+
+      jar = {}
+      for k, v in pairs(adminJar) do jar[k] = v end
+      local audR = rpcOk(PORT, 'admin.audit', { limit = 500 })
+      local sawNote = false
+      for _, r in ipairs(audR.rows or {}) do
+        if r.action == 'instance.config' and
+           tostring(r.detail):find('function-waypoint position/count changed', 1, true) then
+          sawNote = true
+        end
+      end
+      check(sawNote, 'the relocation is flagged in the audit trail even though canExec was not required')
+    end
+  end
+
+  -- =========================== D. the RUNNING path (the live worker) ========
+  local started = rpcOk(PORT, 'instance.start', { ids = { iid } })
+  eq(started.results[1].ok, true, 'the config-test instance starts')
+  local upOk = waitFor(function() return hub.sup:state(iid) == 'online' end, 15000)
+  eq(upOk, true, 'the fake worker (with a REAL bot instance wired in) comes up')
+  -- push the selection onto the now-live bot, exactly as a real login does
+  rpcOk(PORT, 'instance.update',
+       { id = iid, patch = { cavebotConfig = 'bultaur_bottom', targetbotConfig = 'bultaur' } })
+
+  for _, kind in ipairs(KINDS) do
+    local r = rpcOk(PORT, 'instance.configGet', { id = iid, kind = kind })
+    eqData(r.data, got[kind], 'GET ' .. kind .. ' (running) matches the stopped-path value exactly')
+  end
+
+  -- a PUT while running, through the live module, really persists to disk
+  local ab = rpcOk(PORT, 'instance.configGet', { id = iid, kind = 'attackbot' })
+  local mutated = {}
+  for i, e in ipairs(ab.data) do
+    mutated[i] = {}
+    for k, v in pairs(e) do mutated[i][k] = v end
+  end
+  mutated[1].enabled = not mutated[1].enabled
+  local putRunning = rpcOk(PORT, 'instance.configSet', { id = iid, kind = 'attackbot', data = mutated })
+  eq(putRunning.applied, true, 'PUT attackbot (running) applies through the live module')
+
+  rpcOk(PORT, 'instance.stop', { ids = { iid } })
+  waitFor(function() return hub.sup:state(iid) == 'stopped' end, 15000)
+  local afterStop = rpcOk(PORT, 'instance.configGet', { id = iid, kind = 'attackbot' })
+  eq(afterStop.data[1].enabled, mutated[1].enabled,
+     '   and the running-path PUT is still there after the worker stops (it really wrote the file)')
+
+  -- =============================== E. audit ==================================
+  local aud = rpcOk(PORT, 'admin.audit', { limit = 500 })
+  local putCount, deniedFuncCount, sawFullBody = 0, 0, false
+  for _, r in ipairs(aud.rows or {}) do
+    if r.action == 'instance.config' then
+      putCount = putCount + 1
+      if r.outcome == 'denied' and tostring(r.detail):find('canExec', 1, true) then
+        deniedFuncCount = deniedFuncCount + 1
+      end
+      if tostring(r.detail):find('FUNCTION BODY CHANGED', 1, true) and
+         tostring(r.detail):find('return true', 1, true) then
+        sawFullBody = true
+      end
+    end
+  end
+  check(putCount > 0, 'every config PUT is audited as instance.config (' .. putCount .. ' records)')
+  check(deniedFuncCount > 0, '   including the canExec refusal, marked denied')
+  check(sawFullBody, '   and the function-body change is audited with the FULL new body')
+
+  -- ---- cleanup --------------------------------------------------------------
+  rpcOk(PORT, 'instance.delete', { id = iid })
+  jar = {}
+  rpcOk(PORT, 'auth.login', { name = USER.name, password = USER.password })
+  rpcOk(PORT, 'instance.delete', { id = uiid })
+  jar = {}
+  for k, v in pairs(adminJar) do jar[k] = v end
+  rmrfAbs(DIR_A)
+  rmrfAbs(DIR_B)
 end)
 
 -- ===================================================================== report

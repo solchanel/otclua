@@ -87,6 +87,15 @@ var ENDPOINTS = {
   // {channel:number, text} -> {}
   'instances.say':    { method: 'POST',   path: '/api/instances/:id/chat', params: ['id'] },
 
+  /* ---- bot config (CONFIGAPI.md) ------------------------------------ */
+  // kind ∈ healbot|conditions|attackbot|stances|targetbot|cavebot
+  // -> {kind, data, source:'profile'|'default', editable}
+  'config.get':        { method: 'GET', path: '/api/instances/:id/config/:kind', params: ['id', 'kind'] },
+  // {data} -> {kind, applied:true}    PUTs the WHOLE kind's data; 400 on a schema mismatch
+  'config.set':        { method: 'PUT', path: '/api/instances/:id/config/:kind', params: ['id', 'kind'] },
+  // -> {names:[...], active}   profile numbers (healbot/attackbot) or file names (cavebot/targetbot)
+  'config.list':       { method: 'GET', path: '/api/instances/:id/config/:kind/list', params: ['id', 'kind'] },
+
   /* ---- game accounts ------------------------------------------------ */
 
   // -> {accounts:[{id,label,login,ownerUserId,ownerName,has2fa,characterCount}]}

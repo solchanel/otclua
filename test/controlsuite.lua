@@ -466,15 +466,16 @@ runSuite('parsers and name rules (pure)', function()
     truthy(not control._constantTimeEqual('abcdef', 'abcdef '), 'a trailing space matters')
     truthy(not control._constantTimeEqual(nil, 'abcdef'), 'nil never matches')
 
-    -- The command table is exactly PANEL.md's list.
+    -- The command table is exactly PANEL.md's list, plus CONFIGAPI.md's three
+    -- config.* commands (work item N2).
     local want = { 'status', 'login', 'logout', 'relogin', 'bot.enable', 'bot.setCavebot',
                    'bot.setTargetbot', 'bot.listConfigs', 'bot.reload', 'script.put',
                    'script.remove', 'script.list', 'exec', 'stats', 'shutdown',
-                   'bot.setMacro', 'say' }
+                   'bot.setMacro', 'say', 'config.get', 'config.set', 'config.list' }
     local have = {}
     for _, n2 in ipairs(commands.names()) do have[n2] = true end
     for _, n2 in ipairs(want) do truthy(have[n2], 'command ' .. n2 .. ' exists') end
-    eq(#commands.names(), #want, 'no commands beyond PANEL.md\'s list')
+    eq(#commands.names(), #want, 'no commands beyond PANEL.md\'s + CONFIGAPI.md\'s list')
 end)
 
 -- ===========================================================================
@@ -1793,6 +1794,400 @@ runSuite('the hub lists configs for an instance that has never run', function()
     local res2 = H['instance.configs'](fake2, { id = 'i2' }, {}, function() end)
     eq(res2.source, 'cache', 'an empty profile directory falls through to the cache')
     eq(res2.cavebot[1], 'cached', 'and returns what a worker last reported')
+end)
+
+-- ===========================================================================
+-- N2 -- bot/configschema.lua + control/commands.lua's config.get/set/list
+-- ===========================================================================
+-- deep compare that ignores table identity/order -- fresh from bot_f3.lua's suite
+local function deepEq(a, b, path)
+    path = path or ''
+    if a == b then return true end
+    if type(a) ~= 'table' or type(b) ~= 'table' then
+        return false, ('%s: %s ~= %s'):format(path, tostring(a), tostring(b))
+    end
+    for k, v in pairs(a) do
+        local ok, why = deepEq(v, b[k], path .. '.' .. tostring(k))
+        if not ok then return false, why end
+    end
+    for k in pairs(b) do
+        if a[k] == nil then return false, path .. '.' .. tostring(k) .. ': missing in A' end
+    end
+    return true
+end
+
+local function deepCopy(v)
+    if type(v) ~= 'table' then return v end
+    local t = {}
+    for k, vv in pairs(v) do t[k] = deepCopy(vv) end
+    return t
+end
+
+local function readAll(path)
+    local f = io.open(path, 'rb')
+    if not f then return nil end
+    local s = f:read('*a'); f:close()
+    return s
+end
+
+--- Writes a self-contained fixture profile with real (if minimal) files for
+--- all six kinds: HealBot.json/AttackBot.json (profile 1, one rule each),
+--- cavebot_configs/testroute.cfg (goto + label + one function waypoint),
+--- targetbot_configs/testtargets.json (one targeting entry, one loot item).
+--- Stances has no dedicated file (CONFIGAPI.md: storage.stances) so nothing is
+--- pre-seeded for it -- config.get is expected to answer `source == 'default'`
+--- until the first config.set.
+--- Collapses a literal "/name/.." segment (ROOT is built as `<dir>/..` and
+--- never resolved -- see the top of this file) so the result is safe to pass
+--- as --bot-profile, which refuses any ".." path component outright.
+local function collapseDotDot(p)
+    local prev
+    repeat
+        prev = p
+        p = p:gsub('^[^/]+/%.%./', '')   -- a leading "seg/../" (ROOT itself has no leading slash)
+        p = p:gsub('/[^/]+/%.%.', '')    -- an interior "/seg/.."
+    until p == prev
+    return p
+end
+
+local function buildN2Profile()
+    local dir = collapseDotDot(tmpPath('n2profile'):gsub('%.tmp$', ''))
+    local cfg = require('bot.config')
+    local healbotlib   = require('bot.healbot')
+    local attackbotlib = require('bot.attackbot')
+    cfg.mkdirp(dir .. '/vBot_configs/profile_1')
+    cfg.mkdirp(dir .. '/cavebot_configs')
+    cfg.mkdirp(dir .. '/targetbot_configs')
+    cfg.mkdirp(dir .. '/storage')
+
+    local hb = { currentHealBotProfile = 1, healbot = {},
+                ConditionPanel = healbotlib.defaultConditionPanel() }
+    for i = 1, 5 do hb.healbot[i] = healbotlib.blankProfile(i) end
+    hb.healbot[1].enabled = true
+    hb.healbot[1].itemTable  = { { enabled = true, sign = '<', origin = 'HP%',
+                                   item = 266, value = 50, index = 1 } }
+    hb.healbot[1].spellTable = { { enabled = true, sign = '<', origin = 'HP%',
+                                   spell = 'exura', cost = 20, value = 60, index = 1 } }
+    writeFile(dir .. '/vBot_configs/profile_1/HealBot.json', json.encode(hb))
+
+    local ab = { currentBotProfile = 1, AttackBot = {} }
+    for i = 1, 5 do ab.AttackBot[i] = attackbotlib.blankProfile(i) end
+    ab.AttackBot[1].enabled = true
+    ab.AttackBot[1].attackTable = { {
+        spell = 'exori', itemId = 0, category = 1, patternCategory = 1, pattern = 7,
+        count = 1, orMore = true, minHp = 0, maxHp = 100, mana = 0, cooldown = 2000,
+        monsters = true, enabled = true,
+    } }
+    writeFile(dir .. '/vBot_configs/profile_1/AttackBot.json', json.encode(ab))
+
+    writeFile(dir .. '/cavebot_configs/testroute.cfg', cfg.encodeCfg{
+        { 'goto', '1000,1000,7' }, { 'label', 'start' }, { 'function', 'return true' },
+    })
+
+    writeFile(dir .. '/targetbot_configs/testtargets.json', json.encode{
+        targeting = { { name = 'rat', priority = 1, danger = 1, maxDistance = 7, chase = true } },
+        looting = { items = { { id = 3031, count = 1 } }, containers = { { id = 1987 } },
+                   everyItem = false, maxDanger = 10, minCapacity = 100 },
+    })
+    return dir
+end
+
+local function removeN2Profile(dir)
+    os.remove(dir .. '/vBot_configs/profile_1/HealBot.json')
+    os.remove(dir .. '/vBot_configs/profile_1/AttackBot.json')
+    os.remove(dir .. '/vBot_configs/profile_1')
+    os.remove(dir .. '/vBot_configs')
+    os.remove(dir .. '/cavebot_configs/testroute.cfg')
+    os.remove(dir .. '/cavebot_configs')
+    os.remove(dir .. '/targetbot_configs/testtargets.json')
+    os.remove(dir .. '/targetbot_configs')
+    os.remove(dir .. '/storage/profile_1.json')
+    os.remove(dir .. '/storage')
+    os.remove(dir)
+end
+
+runSuite('bot/configschema.lua validates precisely (pure)', function()
+    local schema = require('bot.configschema')
+
+    truthy(schema.validate('healbot', { itemTable = {}, spellTable = {} }),
+           'an empty healbot table validates')
+    local ok1, err1 = schema.validate('healbot',
+        { itemTable = { { enabled = true, sign = '>', origin = 'HP%', item = 'x', value = 1 } },
+          spellTable = {} })
+    truthy(not ok1, 'a wrong-typed item id is rejected', err1)
+    local ok2, err2 = schema.validate('healbot',
+        { itemTable = { { enabled = true, sign = '>', origin = 'HP%', value = 1 } },  -- no `item`
+          spellTable = {} })
+    truthy(not ok2, 'a missing required field is rejected', err2)
+    local ok3, err3 = schema.validate('healbot',
+        { itemTable = { { enabled = true, sign = 'x', origin = 'HP%', item = 1, value = 1 } },
+          spellTable = {} })
+    truthy(not ok3, 'an out-of-enum sign is rejected', err3)
+
+    truthy(schema.validate('attackbot', {}), 'an empty attackTable validates')
+    local ok4 = schema.validate('attackbot', { attackTable = {} })
+    truthy(not ok4, 'attackbot data must be the bare array, not an object wrapping it')
+
+    local C = require('bot.healbot').defaultConditionPanel()
+    C.curePoison = C.curePosion
+    truthy(schema.validate('conditions', C), 'the real default ConditionPanel (+curePoison) validates')
+    local C2 = deepCopy(C); C2.bogusField = 1
+    local ok5, err5 = schema.validate('conditions', C2)
+    truthy(not ok5, 'an unknown top-level field is rejected (strict top level)', err5)
+
+    truthy(schema.validate('cavebot', {}), 'an empty cavebot route validates')
+    truthy(schema.validate('cavebot', { { type = 'goto', value = '1,2,3' } }),
+           'a normal waypoint validates')
+    local ok6, err6 = schema.validate('cavebot', { { type = 'GOTO', value = '1,2,3' } })
+    truthy(not ok6, 'an uppercase type is rejected', err6)
+    local ok7, err7 = schema.validate('cavebot', { { type = 'goto', value = '' } })
+    truthy(not ok7, 'an empty value is rejected', err7)
+    local ok8, err8 = schema.validate('cavebot', { { type = 'function', value = 'a\nb]]c' } })
+    truthy(not ok8, 'a multi-line value containing "]]" is rejected', err8)
+    local ok9, err9 = schema.validate('cavebot', { { type = 'goto', value = '[[oops' } })
+    truthy(not ok9, 'a single-line value starting with "[[" is rejected', err9)
+    local ok10, err10 = schema.validate('cavebot',
+        { { type = 'goto:evil', value = '1,2,3' } })
+    truthy(not ok10, 'a type containing ":" is rejected', err10)
+
+    local oldPairs     = { { 'goto', '1,1,7' }, { 'function', 'A' } }
+    local reordered     = { { 'function', 'A' }, { 'goto', '1,1,7' } }
+    local changedBody   = { { 'function', 'B' }, { 'goto', '1,1,7' } }
+    local valueOnly     = { { 'goto', '9,9,9' }, { 'function', 'A' } }
+    eq(schema.cavebotFunctionBodyChanged(oldPairs, reordered), false,
+       'reordering the same function body is NOT a body change')
+    eq(schema.cavebotFunctionBodyChanged(oldPairs, changedBody), true,
+       'editing the function body IS a body change')
+    eq(schema.cavebotFunctionBodyChanged(oldPairs, valueOnly), false,
+       'changing a non-function waypoint value is NOT a body change')
+end)
+
+runSuite('config.get/set/list against a running bot instance (in-process, all six kinds)', function()
+    local dir = buildN2Profile()
+
+    -- a fake sender: records every call generically, so H:_say -> sh:say ->
+    -- sender:talk/talkSpell all "send a packet" without any real socket.
+    local function fakeSender()
+        local calls = {}
+        local S = { calls = calls }
+        return setmetatable(S, { __index = function(_, k)
+            return function(...) calls[#calls + 1] = { method = k, ... }; return true end
+        end })
+    end
+
+    local LC = { log = require('lib.log'), sys = sys, sched = require('lib.sched'),
+                events = require('lib.events').new(), config = { dryRun = false, bot = true } }
+    LC.state = require('game.state').new()
+    LC.state.player.pos = { x = 1000, y = 1000, z = 7 }
+    LC.state.player.health, LC.state.player.maxHealth = 100, 100
+    LC.state.player.mana, LC.state.player.maxMana     = 100, 100
+    LC.sender = fakeSender()
+
+    local botmod = require('bot.init')
+    local ok, b = pcall(botmod.new, LC, { profileDir = dir, vprofile = 1 })
+    truthy(ok, 'a bot builds on the N2 scratch profile', tostring(b))
+    if not ok then removeN2Profile(dir); return end
+    LC.bot = b
+    b.inGame = true                 -- the HealBot / AttackBot death+offline gate
+    b:wireModules{}                 -- main.lua's startBot() does this before :start()
+    b:start()
+
+    local ctx = { LC = LC, server = { instanceName = 'n2', startedMs = sys.nowMs() } }
+    local function call(cmd, args) return commands.dispatch(ctx, cmd, args) end
+
+    local okc = call('bot.setCavebot', { name = 'testroute' })
+    local okt = call('bot.setTargetbot', { name = 'testtargets' })
+    truthy(okc, 'the fixture cavebot route selects')
+    truthy(okt, 'the fixture targetbot config selects')
+
+    -- ----------------------------------------------------------------------
+    -- config.list
+    -- ----------------------------------------------------------------------
+    local lok, lres = call('config.list', { kind = 'healbot' })
+    truthy(lok, 'config.list healbot ok', tostring(lres))
+    if lok then eq(lres.active, 1, 'healbot reports profile 1 active') end
+    local lok2, lres2 = call('config.list', { kind = 'cavebot' })
+    truthy(lok2, 'config.list cavebot ok', tostring(lres2))
+    if lok2 then eq(lres2.active, 'testroute', 'cavebot reports the selected route as active') end
+
+    -- ----------------------------------------------------------------------
+    -- GET / SET / GET, all six kinds -- lossless round trip
+    -- ----------------------------------------------------------------------
+    local KINDS = { 'healbot', 'conditions', 'attackbot', 'stances', 'targetbot', 'cavebot' }
+    local firstGet = {}
+    for _, kind in ipairs(KINDS) do
+        local ok1, r1 = call('config.get', { kind = kind })
+        truthy(ok1, ('config.get %s succeeds'):format(kind), tostring(r1))
+        if ok1 then
+            firstGet[kind] = r1
+            eq(r1.kind, kind, kind .. ': config.get echoes the kind')
+            truthy(r1.source == 'profile' or r1.source == 'default',
+                   kind .. ': source is "profile" or "default"', tostring(r1.source))
+            local ok2, r2 = call('config.set', { kind = kind, data = deepCopy(r1.data) })
+            truthy(ok2, ('config.set %s (echoing GET, unmodified) is accepted'):format(kind), tostring(r2))
+            local ok3, r3 = call('config.get', { kind = kind })
+            truthy(ok3, ('config.get %s a second time succeeds'):format(kind), tostring(r3))
+            if ok2 and ok3 then
+                local same, why = deepEq(r1.data, r3.data)
+                truthy(same, ('%s: GET/SET/GET round trip is lossless'):format(kind), why)
+            end
+        end
+    end
+
+    -- ----------------------------------------------------------------------
+    -- invalid payload: REJECTED, not coerced -- and the file is untouched
+    -- ----------------------------------------------------------------------
+    local hbPath = dir .. '/vBot_configs/profile_1/HealBot.json'
+    local before = readAll(hbPath)
+    local okBad1, errBad1 = call('config.set', { kind = 'healbot', data = {
+        itemTable = { { enabled = true, sign = '>', origin = 'HP%', item = 'not-a-number', value = 1 } },
+        spellTable = {} } })
+    truthy(not okBad1, 'a wrong-typed field is rejected outright', tostring(errBad1))
+    local okBad2, errBad2 = call('config.set', { kind = 'healbot', data = {
+        itemTable = { { enabled = true, sign = '>', origin = 'HP%', value = 1 } },  -- no `item`
+        spellTable = {} } })
+    truthy(not okBad2, 'a missing required field is rejected outright', tostring(errBad2))
+    local okBad3, errBad3 = call('config.set', { kind = 'cavebot',
+        data = { { type = 'goto', value = '' } } })
+    truthy(not okBad3, 'an invalid cavebot payload (empty value) is rejected outright', tostring(errBad3))
+    local after = readAll(hbPath)
+    eq(after, before, 'HealBot.json is byte-for-byte untouched by the rejected writes')
+
+    -- ----------------------------------------------------------------------
+    -- a HealBot threshold change actually changes what the running bot does
+    -- ----------------------------------------------------------------------
+    LC.state.player.health, LC.state.player.maxHealth = 70, 100   -- 70% HP
+    local firedBefore = b.modules.healbot:spellTick()
+    truthy(firedBefore == nil, 'at 70%% HP, the "HP%% < 60" exura rule does not fire yet')
+
+    local okr, r = call('config.get', { kind = 'healbot' })
+    truthy(okr, 'config.get healbot for the threshold edit')
+    local edited = deepCopy(r.data)
+    edited.spellTable[1].value = 80    -- "HP% < 80" now covers 70%
+    local oks, sres = call('config.set', { kind = 'healbot', data = edited })
+    truthy(oks, 'config.set healbot (raised threshold) is accepted', tostring(sres))
+
+    -- clear IN PLACE: the fake sender's closures captured this exact table,
+    -- so replacing the field with a fresh {} would silently orphan them.
+    for i = #LC.sender.calls, 1, -1 do LC.sender.calls[i] = nil end
+    local fired = b.modules.healbot:spellTick()
+    truthy(fired ~= nil, 'after raising the threshold, the SAME rule now fires on the next tick')
+    local sentSpell, callDesc = false, {}
+    for _, c in ipairs(LC.sender.calls) do
+        local parts = { tostring(c.method) }
+        for _, a in ipairs(c) do
+            parts[#parts + 1] = tostring(a)
+            if a == 'exura' then sentSpell = true end
+        end
+        callDesc[#callDesc + 1] = concat(parts, ',')
+    end
+    truthy(sentSpell, 'and "exura" reached the sender -- the actual packet the tick would send',
+           '[' .. concat(callDesc, ' | ') .. ']')
+
+    -- ----------------------------------------------------------------------
+    -- cavebot function-body-change detection: changed / reordered / value-only
+    -- ----------------------------------------------------------------------
+    local okg, base = call('config.get', { kind = 'cavebot' })
+    truthy(okg, 'config.get cavebot for the diff tests')
+    truthy(okg and #base.data == 3, 'the fixture route has its 3 waypoints', tostring(base and #base.data))
+
+    -- (a) pure reorder of the same three waypoints (same function body, moved)
+    local reordered = { deepCopy(base.data[3]), deepCopy(base.data[1]), deepCopy(base.data[2]) }
+    local okR, resR = call('config.set', { kind = 'cavebot', data = reordered })
+    truthy(okR, 'config.set (reorder) does not error', tostring(resR))
+    if okR then
+        eq(resR.needsExec, false, 'a pure reorder needs no exec capability')
+        eq(resR.applied, true, 'and IS applied')
+    end
+    call('config.set', { kind = 'cavebot', data = deepCopy(base.data), execCapability = true })  -- restore
+
+    -- (b) editing a non-function value only
+    local valueOnly = deepCopy(base.data)
+    valueOnly[1].value = '2000,2000,7'
+    local okV, resV = call('config.set', { kind = 'cavebot', data = valueOnly })
+    truthy(okV, 'config.set (value-only edit) does not error', tostring(resV))
+    if okV then
+        eq(resV.needsExec, false, 'a goto value edit needs no exec capability')
+        eq(resV.applied, true, 'and IS applied')
+    end
+    call('config.set', { kind = 'cavebot', data = deepCopy(base.data), execCapability = true })  -- restore
+
+    -- (c) changing the function body -- refused without execCapability, honestly flagged
+    local changed = deepCopy(base.data)
+    for _, p in ipairs(changed) do if p.type == 'function' then p.value = 'return false' end end
+    local okC, resC = call('config.set', { kind = 'cavebot', data = changed })
+    truthy(okC, 'config.set itself does not error on a function-body change', tostring(resC))
+    if okC then
+        eq(resC.applied, false, 'but it is NOT applied without execCapability')
+        eq(resC.needsExec, true, 'needsExec is reported honestly')
+    end
+
+    -- the SAME payload, with the capability asserted, IS applied
+    local okC2, resC2 = call('config.set', { kind = 'cavebot', data = changed, execCapability = true })
+    truthy(okC2, 'the same change succeeds once execCapability is asserted', tostring(resC2))
+    if okC2 then
+        eq(resC2.applied, true, 'and applied is now true')
+        eq(resC2.needsExec, false, 'needsExec is false once granted')
+    end
+    local okg2, after2 = call('config.get', { kind = 'cavebot' })
+    if okg2 then
+        local sawNewBody = false
+        for _, p in ipairs(after2.data) do
+            if p.type == 'function' and p.value == 'return false' then sawNewBody = true end
+        end
+        truthy(sawNewBody, 'the new function body is really in effect after the exec-asserted write')
+    end
+
+    b:stop()
+    removeN2Profile(dir)
+end)
+
+runSuite('config.get/set/list over the real control socket (spawned worker, all six kinds)', function()
+    local dir = buildN2Profile()
+    local cw, cwerr = startWorker{ '--bot', '--bot-profile=' .. dir, '--bot-vprofile=1' }
+    truthy(cw, 'the N2 fixture worker starts', tostring(cwerr))
+    if not cw then removeN2Profile(dir); return end
+
+    local selc = rpc(cw, { id = 1, cmd = 'bot.setCavebot', args = { name = 'testroute' } })
+    eq(selc.json.ok, true, 'bot.setCavebot selects the fixture route over RPC', selc.json.error)
+    local selt = rpc(cw, { id = 2, cmd = 'bot.setTargetbot', args = { name = 'testtargets' } })
+    eq(selt.json.ok, true, 'bot.setTargetbot selects the fixture config over RPC', selt.json.error)
+
+    local lst = rpc(cw, { id = 3, cmd = 'config.list', args = { kind = 'attackbot' } })
+    eq(lst.json.ok, true, 'config.list attackbot ok over the wire', lst.json.error)
+    if lst.json.ok then eq(lst.json.result.active, 1, 'attackbot profile 1 is active') end
+
+    local KINDS = { 'healbot', 'conditions', 'attackbot', 'stances', 'targetbot', 'cavebot' }
+    local id = 10
+    for _, kind in ipairs(KINDS) do
+        id = id + 1
+        local g1 = rpc(cw, { id = id, cmd = 'config.get', args = { kind = kind } })
+        eq(g1.json.ok, true, ('config.get %s ok over the wire'):format(kind), g1.json.error)
+        if g1.json.ok then
+            id = id + 1
+            local s1 = rpc(cw, { id = id, cmd = 'config.set',
+                                 args = { kind = kind, data = g1.json.result.data } })
+            eq(s1.json.ok, true, ('config.set %s (echoing GET) is accepted over the wire'):format(kind),
+               s1.json.error)
+            id = id + 1
+            local g2 = rpc(cw, { id = id, cmd = 'config.get', args = { kind = kind } })
+            eq(g2.json.ok, true, ('config.get %s again ok over the wire'):format(kind), g2.json.error)
+            if g2.json.ok then
+                local same, why = deepEq(g1.json.result.data, g2.json.result.data)
+                truthy(same, ('%s: GET/SET/GET over the real control socket is lossless'):format(kind), why)
+            end
+        end
+    end
+
+    -- one rejection, over the wire: wrong type is refused, not coerced
+    local bad = rpc(cw, { id = 99, cmd = 'config.set', args = { kind = 'attackbot',
+        data = { { category = 'not-a-number', patternCategory = 1, pattern = 1, spell = 'x',
+                  itemId = 0, count = 1, minHp = 0, maxHp = 100, mana = 0, cooldown = 1,
+                  monsters = true, enabled = true } } } })
+    eq(bad.json.ok, false, 'a wrong-typed attackbot field is refused over the wire')
+
+    cw:stop()
+    removeN2Profile(dir)
 end)
 
 -- ===========================================================================

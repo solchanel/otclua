@@ -2,6 +2,8 @@
 
 # CaveBot behaviour specification (vBot 4.8) for a headless LuaJIT client
 
+> Implementation status per action type: **[docs/vbot/parity.md](parity.md) §1**.
+
 Everything below is BEHAVIOUR unless explicitly marked **[WIDGET]**. Where vBot stores a value in a
 widget, the persisted location is named.
 
