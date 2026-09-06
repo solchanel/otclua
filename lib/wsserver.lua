@@ -12,13 +12,44 @@ and then hands the connection over:
     local wsserver = require('lib.wsserver')
 
     -- inside the HTTP route for GET /ws
-    local ws, err = wsserver.upgrade(conn, req, {
-        pending    = leftoverBytes,          -- bytes httpserver read past the headers
+    local sock, pending = res:upgrade()      -- httpserver hands the socket over
+    local ws, err = wsserver.upgrade(sock, req, {
+        pending    = pending,                -- bytes httpserver read past the headers
+        allowedOrigins = { 'https://panel.example' },   -- see ORIGIN below
         maxMessage = 1024 * 1024,
         onMessage  = function (ws, msg, isBinary) ... end,
         onClose    = function (ws, code, reason) ... end,
         onError    = function (ws, message) ... end,
     })
+
+httpserver.websocketRoute(wsserver, opts) does that whole dance, and answers a refused
+handshake with an ordinary HTTP status BEFORE the socket is detached.
+
+--------------------------------------------------------------------------- ORIGIN
+A browser attaches the hub's session cookie to a WebSocket handshake no matter which
+page opened it, and the WebSocket handshake is NOT subject to CORS: without an Origin
+check, any page the operator visits can drive an authenticated panel session (which per
+PANEL.md means `exec {code}` inside every worker, `script.put`, and the game-account
+credentials).  So the check is not optional here and the default is DENY:
+
+    allowedOrigins = nil        same-origin only (the DEFAULT): the Origin's host must
+                                equal the Host header's host, and their ports must
+                                agree whenever both state one.  Scheme is not compared,
+                                because the hub sits behind nginx/Caddy terminating TLS.
+    allowedOrigins = { ... }    an explicit list; entries may be full origins
+                                ('https://panel.example') or bare authorities
+                                ('panel.example:8443').  Matching is case-insensitive
+                                and normalises away a default port (80/443).
+    allowedOrigins = function (origin, req) -> boolean       any policy you like.
+    allowedOrigins = '*'        allow every origin.  Say this out loud before you use it.
+    allowNoOrigin = true        allow a handshake with NO Origin header at all, i.e. a
+                                non-browser client (curl, another Lua process).  Default
+                                false: a browser always sends Origin, so a missing one
+                                is either a native client or an attempt to dodge the
+                                check, and the hub has to opt into that deliberately.
+
+A mismatch is 403 with no upgrade.  This closes cross-site WebSocket hijacking; DNS
+rebinding needs the Host header pinned as well -- httpserver's opts.allowedHosts.
 
 `conn` only has to be socket-like: `conn:send(str)`, `conn:recv(max)`, `conn:close()`.
 A lib/socket.lua socket additionally offers `.outboxLen` / `:flush()` / `.peerHost`,
@@ -44,8 +75,12 @@ Callbacks are `onMessage(ws, message, isBinary)`, `onClose(ws, code, reason)` (f
 exactly once, for every reason including an abnormal disconnect) and `onError(ws, msg)`.
 
 ------------------------------------------------------------------------ options
+    allowedOrigins origin policy, see ORIGIN above       (default: same-origin only)
+    allowNoOrigin  accept a handshake with no Origin header        (default false)
+    maxConnections refuse (503) past this many live connections, 0 = no cap (default 0)
     pending        string of bytes already read from the socket   (default '')
     maxMessage     bytes, enforced per frame AND across fragments (default 1 MiB)
+    frameTimeout   ms a single frame may take to arrive in full   (default 30000)
     fragmentSize   outgoing payloads larger than this are fragmented (default 64 KiB)
     pingInterval   ms of silence before an automatic ping, 0 disables (default 30000)
     pongTimeout    ms to wait for the pong before reaping the peer  (default 10000)
@@ -129,6 +164,7 @@ local DEFAULTS = {
     closeTimeout  = 5000,
     lingerTimeout = 5000,
     maxOutbox     = 8 * 1024 * 1024,
+    frameTimeout  = 30000,
 }
 wsserver.defaults = DEFAULTS
 
@@ -287,10 +323,30 @@ local function newQueue()
     return setmetatable({ c = {}, head = 1, tail = 0, off = 0, len = 0 }, Q)
 end
 
+-- One Lua array slot per push costs ~9 bytes of structural overhead per BYTE when a
+-- peer dribbles its payload one byte at a time -- maxMessage bounds the declared
+-- payload but not that, so a 1 MiB limit really meant ~10 MB per connection.  Small
+-- pushes are therefore concatenated into the tail chunk until it reaches COALESCE
+-- bytes: the slot count drops by up to COALESCE and the copying stays bounded at
+-- COALESCE/2 bytes per byte received (a 64 KiB recv never copies at all).
+-- Concatenating into c[tail] is safe while head == tail: `off` indexes that same
+-- string from the left and the bytes before it do not move.
+local COALESCE = 512
+Q.COALESCE = COALESCE
+
 function Q:push(s)
     local n = #s
     if n == 0 then return end
-    self.tail = self.tail + 1
+    local t = self.tail
+    if t >= self.head then
+        local last = self.c[t]
+        if #last + n <= COALESCE then
+            self.c[t] = last .. s
+            self.len  = self.len + n
+            return
+        end
+    end
+    self.tail = t + 1
     self.c[self.tail] = s
     self.len = self.len + n
 end
@@ -376,6 +432,105 @@ function wsserver.acceptKey(key)
     return base64.encode(sha1.sha1(key .. wsserver.GUID))
 end
 
+--==========================================================================================
+-- origin policy  (see the ORIGIN block in the header comment)
+--==========================================================================================
+
+local liveCount = 0          -- defined here so checkRequest can enforce maxConnections
+local liveSet                -- (assigned with the shared timer, below)
+
+local DEFAULT_PORT = { http = '80', https = '443', ws = '80', wss = '443' }
+
+--- "user@[::1]:8080/x" -> "[::1]", "8080".  Returns nil when there is no host.
+local function splitAuthority(auth)
+    if type(auth) ~= 'string' then return nil end
+    auth = auth:match('^%s*(.-)%s*$'):match('^([^/?#]*)')
+    if not auth or auth == '' then return nil end
+    auth = auth:gsub('^[^@]*@', '')
+    local host, port = auth:match('^(%[[^%]]*%]):(%d+)$')
+    if not host then host, port = auth:match('^(%[[^%]]*%])$'), nil end
+    if not host then host, port = auth:match('^([^:%[%]]+):(%d+)$') end
+    if not host then host, port = auth:match('^([^:%[%]]+)$'), nil end
+    if not host or host == '' then return nil end
+    return slower(host), port or ''
+end
+wsserver._splitAuthority = splitAuthority
+
+--- Normalise an origin ("https://Panel.Example:443") or a bare authority
+--- ("panel.example:8443") to host, port -- with a scheme's default port removed so
+--- "https://x" and "x:443" compare equal.  Returns nil when it cannot be parsed.
+local function normOrigin(s)
+    if type(s) ~= 'string' then return nil end
+    s = s:match('^%s*(.-)%s*$')
+    if s == '' or slower(s) == 'null' then return nil end
+    if s:find('%s') then return nil end            -- more than one origin: refuse
+    local scheme, rest = s:match('^(%a[%w+.%-]*)://(.*)$')
+    local host, port = splitAuthority(rest or s)
+    if not host then return nil end
+    if scheme then
+        scheme = slower(scheme)
+        if port == '' then port = DEFAULT_PORT[scheme] or '' end
+        if port ~= '' and DEFAULT_PORT[scheme] == port then port = '' end
+    end
+    return host, port
+end
+wsserver.normaliseOrigin = normOrigin
+
+--- Decide whether this handshake's Origin may open a socket.
+--- Returns true, or false plus the reason for the 403.
+function wsserver.originAllowed(req, opts)
+    opts = opts or {}
+    local h = (type(req) == 'table') and (req.headers or req.header) or nil
+    local raw = hget(h, 'origin')
+    local policy = opts.allowedOrigins
+
+    if raw == nil or raw:match('^%s*$') then
+        -- No Origin at all: not a browser (or a browser told not to say).  Allowed
+        -- only when the caller asked for it -- otherwise the check is trivially
+        -- bypassed by omitting the header.
+        if opts.allowNoOrigin then return true end
+        return false, 'missing Origin header (set allowNoOrigin for non-browser clients)'
+    end
+    if policy == '*' or policy == true then return true end
+    if type(policy) == 'function' then
+        local ok, allowed = pcall(policy, raw, req)
+        if ok and allowed then return true end
+        return false, 'origin ' .. raw .. ' is not allowed'
+    end
+
+    local ohost, oport = normOrigin(raw)
+    if not ohost then return false, 'unusable Origin header' end
+
+    if type(policy) == 'table' then
+        for i = 1, #policy do
+            local ahost, aport = normOrigin(policy[i])
+            if ahost == ohost and (aport == oport or aport == '' or oport == '') then
+                return true
+            end
+        end
+        return false, 'origin ' .. raw .. ' is not in the allow-list'
+    end
+    if policy ~= nil then return false, 'origin ' .. raw .. ' is not allowed' end
+
+    -- default: same origin as the Host this request was addressed to
+    local hostHdr = hget(h, 'host')
+    if hostHdr == nil or hostHdr == '' then
+        return false, 'no Host header to compare the Origin against'
+    end
+    local hhost, hport = splitAuthority(hostHdr)
+    if not hhost then return false, 'unusable Host header' end
+    if hhost ~= ohost then
+        return false, 'cross-origin handshake from ' .. raw .. ' (Host is ' .. hostHdr .. ')'
+    end
+    -- The scheme is deliberately not compared and a port is only compared when both
+    -- sides state one: a TLS terminator in front of the hub legitimately shows the
+    -- browser :443 while the hub itself is addressed on another port.
+    if hport ~= '' and oport ~= '' and hport ~= oport then
+        return false, 'cross-origin handshake from ' .. raw .. ' (Host is ' .. hostHdr .. ')'
+    end
+    return true
+end
+
 --- Validate an upgrade request.
 --- Returns  accept, chosenProtocol            on success
 ---          nil, { status, message, headers } on rejection
@@ -411,6 +566,19 @@ function wsserver.checkRequest(req, opts)
         return nil, { status = 400, message = 'Sec-WebSocket-Key is not 16 base64 bytes' }
     end
 
+    -- Origin LAST among the syntax checks and BEFORE the upgrade: a browser sends the
+    -- session cookie on a cross-site WebSocket and CORS does not apply, so this is the
+    -- only thing standing between a page the operator visits and the panel's API.
+    local originOk, why = wsserver.originAllowed(req, opts)
+    if not originOk then
+        return nil, { status = 403, message = why or 'origin not allowed' }
+    end
+
+    local cap = tonumber(opts.maxConnections) or 0
+    if cap > 0 and liveCount >= cap then
+        return nil, { status = 503, message = 'too many websocket connections' }
+    end
+
     local chosen = nil
     if opts.protocols and #opts.protocols > 0 then
         local offered = hget(h, 'sec-websocket-protocol') or ''
@@ -429,8 +597,9 @@ function wsserver.checkRequest(req, opts)
 end
 
 local STATUS_TEXT = {
-    [400] = 'Bad Request', [405] = 'Method Not Allowed', [426] = 'Upgrade Required',
-    [500] = 'Internal Server Error',
+    [400] = 'Bad Request', [403] = 'Forbidden', [405] = 'Method Not Allowed',
+    [426] = 'Upgrade Required', [500] = 'Internal Server Error',
+    [503] = 'Service Unavailable',
 }
 
 local function httpError(conn, status, message, headers)
@@ -451,8 +620,8 @@ end
 -- shared timer -- one sched.every() for every connection in the process, not one each
 --==========================================================================================
 
-local liveSet   = {}    -- ws -> true, every connection that still owns a socket
-local liveCount = 0
+liveSet = {}            -- ws -> true, every connection that still owns a socket
+                        -- (liveSet / liveCount are declared with the origin policy)
 local timerId   = nil
 local schedRef  = nil
 
@@ -643,12 +812,28 @@ end
 --- test) can deliver bytes itself, one at a time if it likes.
 function WS:feed(data)
     if data == nil or #data == 0 then return end
-    self.bytesIn  = self.bytesIn + #data
-    self.lastRecv = sys.nowMs()
-    self.awaitingPong = false
+    self.bytesIn = self.bytesIn + #data
     if self.state == 'closed' then return end        -- discard anything after a failure
+    -- NOTE: lastRecv and awaitingPong are deliberately NOT touched here.  Resetting the
+    -- idle timer on every BYTE made a peer that dribbles one byte per (idleTimeout/2)
+    -- immortal and stopped pongTimeout from ever firing.  Progress is a completed
+    -- FRAME (stamped in _parse) and a pong is a PONG frame (cleared in _control).
     self.q:push(data)
     self:_parse()
+    if self.state == 'closed' then return end
+    -- Whatever is left after parsing is ONE half-delivered frame, so it is already
+    -- bounded by the maxMessage check in the header validation; this is belt and
+    -- braces for a parser that somehow fails to consume.
+    if self.q.len > self.maxMessage + 65536 then
+        return self:_fail(wsserver.CLOSE_TOO_BIG, 'receive buffer exceeded')
+    end
+    -- ...and a half-delivered frame gets its own deadline, so a peer that dribbles
+    -- forever cannot hold maxMessage of queue for as long as it likes.
+    if self.q.len > 0 then
+        if not self.frameStartedAt then self.frameStartedAt = sys.nowMs() end
+    else
+        self.frameStartedAt = nil
+    end
 end
 
 function WS:_parse()
@@ -734,6 +919,7 @@ function WS:_parse()
         if #payload > 0 then payload = xorMask(payload, key) end
 
         self.framesIn = self.framesIn + 1
+        self.lastRecv = sys.nowMs()      -- a WHOLE frame arrived: that is progress
         if isControl then
             if not self:_control(op, payload) then return end
         else
@@ -943,6 +1129,14 @@ function WS:_tick(now)
         self:destroy(wsserver.CLOSE_ABNORMAL, 'idle timeout')
         return
     end
+    -- a frame that started arriving and never finished (a dribbling peer holding up
+    -- to maxMessage of queue), independently of whether bytes keep trickling in
+    if self.frameStartedAt and self.frameTimeout > 0
+       and now - self.frameStartedAt > self.frameTimeout then
+        self:_report('frame delivery timeout')
+        self:_fail(wsserver.CLOSE_POLICY, 'frame delivery timeout')
+        return
+    end
     if self.awaitingPong then
         if self.pongTimeout > 0 and now - self.pingSentAt >= self.pongTimeout then
             self:_report('ping timeout')
@@ -1024,11 +1218,13 @@ function wsserver.upgrade(conn, req, opts)
         closeTimeout  = optNum(opts, 'closeTimeout'),
         lingerTimeout = optNum(opts, 'lingerTimeout'),
         maxOutbox     = optNum(opts, 'maxOutbox'),
+        frameTimeout  = optNum(opts, 'frameTimeout'),
 
         frag = {}, fragN = 0, fragLen = 0, fragOp = nil, fragUtf8 = '',
         bytesIn = 0, bytesOut = #concat(resp), framesIn = 0,
         messagesIn = 0, messagesOut = 0,
         lastRecv = sys.nowMs(), awaitingPong = false, pingSentAt = 0,
+        frameStartedAt = nil,
         closeSent = false, closeFired = false,
 
         onMessage = opts.onMessage, onClose = opts.onClose, onError = opts.onError,

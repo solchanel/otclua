@@ -97,6 +97,27 @@ arguments SECRET.  What each OS exposes:
       of an unrelated process, and it leaves no trace after the child exits.
       `h:write()` does the same for anything the hub sends later.
 
+      This is ENFORCED, not advised: process.spawn REFUSES a command line that
+      carries a recognised secret (--password=, --proxy-auth=, --proxyAuth:, a
+      value after a bare --token, ... -- case-insensitively, with '=' or ':' as
+      the separator).  opts.allowSecretsInArgv = true overrides it deliberately.
+
+      The proxy credential PANEL.md needs therefore travels like this:
+
+          local h = process.spawn{
+              cmd = { worker, '--headless', '--proxy=' .. host .. ':' .. port },
+              stdinData = 'proxy-auth ' .. user .. ':' .. pass .. '\n',
+              -- stdin stays open afterwards for the control protocol
+          }
+
+      and the worker reads that first line before anything else.  Nothing in
+      argv, nothing in the environment (which is 0400 but is still inherited by
+      every grandchild), nothing on disk.
+
+      opts.secretArgs = { 5, 'somevalue' } masks argv positions / literal values
+      in h:describe() outright, for the cases the denylist cannot recognise
+      (`-p hunter2`): redaction by denylist is exposure by omission.
+
 ================================================================================
 Platform notes
 ================================================================================
@@ -196,6 +217,9 @@ local function feedLines(tail, chunk, maxLine, emit)
     end
     if from > 1 then tail = tail:sub(from) end
     -- A child that never emits a newline must not grow the buffer without bound.
+    -- maxLine < 1 would emit '' forever without shortening the tail -- an infinite
+    -- loop inside the reactor -- and 0 is a plausible spelling of "no limit".
+    if not maxLine or maxLine < 1 then maxLine = 1 end
     while #tail > maxLine do
         emit(tail:sub(1, maxLine))
         tail = tail:sub(maxLine + 1)
@@ -204,31 +228,84 @@ local function feedLines(tail, chunk, maxLine, emit)
 end
 
 local DEFAULT_REDACT = { 'password', 'passwd', 'pass', 'token', 'secret',
-                         'proxy%-auth', 'auth', 'key', 'apikey' }
+                         'proxy%-auth', 'auth', 'key', 'apikey', 'credential' }
+
+--- Does `a` look like `--<something-secret><sep>VALUE`?  Returns the flag part
+--- (including the separator) and the value.  Matching is case-INSENSITIVE and both
+--- '=' and ':' count as separators, so --proxyAuth=u:p and --password:pw are caught
+--- as well as --password=pw.  Dots are allowed inside the flag name (--proxy.pass=).
+local function secretArgParts(a, patterns)
+    local low = a:lower()
+    for _, p in ipairs(patterns) do
+        local flag = low:match('^(%-%-?[%w%-_.]*' .. p .. '[%w%-_.]*[:=])')
+        if flag then return a:sub(1, #flag), a:sub(#flag + 1) end
+    end
+    return nil
+end
+
+--- Is `a` a bare secret-looking FLAG, i.e. the value is the next element?
+local function isSecretFlag(a, patterns)
+    local low = a:lower()
+    for _, p in ipairs(patterns) do
+        if low:match('^%-%-?[%w%-_.]*' .. p .. '[%w%-_.]*$') then return true end
+    end
+    return false
+end
 
 --- Build a copy of the command line with secret-looking values masked.
-local function redactCmd(cmd, patterns)
+--- `secretArgs` (optional) is the authoritative list: array indices into cmd, and/or
+--- literal values, that MUST be masked whatever they are spelled like.  The pattern
+--- list is only a safety net -- redaction by denylist is exposure by omission, which
+--- is why process.spawn refuses to put a recognised secret in argv at all.
+local function redactCmd(cmd, patterns, secretArgs)
+    local byIndex, byValue = {}, {}
+    if type(secretArgs) == 'table' then
+        for _, v in ipairs(secretArgs) do
+            if type(v) == 'number' then byIndex[v] = true
+            elseif type(v) == 'string' and v ~= '' then byValue[v] = true end
+        end
+    end
     local out = {}
     for i = 1, #cmd do
         local a = tostring(cmd[i])
-        local done = false
-        for _, p in ipairs(patterns) do
-            -- --password=VALUE  /  --proxy-auth=user:pass
-            local head = a:match('^(%-%-?[%w%-_]*' .. p .. '[%w%-_]*=)')
-            if head then out[i] = head .. '***'; done = true; break end
-        end
-        if not done then
-            -- `--password VALUE` as two elements: mask the element AFTER a flag
-            local prev = i > 1 and tostring(cmd[i - 1]) or ''
-            for _, p in ipairs(patterns) do
-                if prev:match('^%-%-?[%w%-_]*' .. p .. '[%w%-_]*$') then
-                    out[i] = '***'; done = true; break
+        if byIndex[i] then
+            out[i] = '***'
+        elseif byValue[a] then
+            out[i] = '***'
+        else
+            local flag = secretArgParts(a, patterns)
+            if flag then
+                out[i] = flag .. '***'
+            elseif i > 1 and isSecretFlag(tostring(cmd[i - 1]), patterns)
+                   and not byIndex[i - 1] then
+                out[i] = '***'                  -- `--password VALUE` as two elements
+            else
+                -- a value that merely CONTAINS a listed secret is masked too
+                local masked = a
+                for v in pairs(byValue) do
+                    if masked:find(v, 1, true) then masked = '***' end
                 end
+                out[i] = masked
             end
         end
-        if not done then out[i] = a end
     end
     return out
+end
+
+--- Find the first argument that would publish a secret through argv.
+--- Returns the index and a description, or nil when the command line is clean.
+local function secretInArgv(cmd, patterns)
+    for i = 1, #cmd do
+        local a = tostring(cmd[i])
+        local flag, value = secretArgParts(a, patterns)
+        if flag and value ~= '' then
+            return i, a:sub(1, #flag - 1)
+        end
+        if i > 1 and isSecretFlag(tostring(cmd[i - 1]), patterns) and a ~= '' then
+            return i, tostring(cmd[i - 1])
+        end
+    end
+    return nil
 end
 
 --- Validate + normalise opts.cmd into a plain array of strings.
@@ -839,6 +916,15 @@ local function setNonBlock(fd)
     return fcntl3(fd, F_SETFL, bit.bor(fl, O_NONBLOCK)) ~= -1
 end
 
+-- Writing to a child that has exited (or closed its stdin) raises SIGPIPE, whose
+-- DEFAULT disposition kills the WRITER -- so a hub that sends one byte to a worker
+-- which died a moment ago dies with it, taking every other worker down.  Ask for the
+-- error instead: write() then fails with EPIPE and _flushStdin closes the pipe.
+-- lib/socket.lua does the same inside socket.init(); doing it here too means
+-- lib/process.lua is safe on its own, and setting SIG_IGN twice is harmless.
+cdef 'void* signal(int, void*);'
+pcall(function() C.signal(13, ffi.cast('void*', 1)) end)      -- SIGPIPE -> SIG_IGN
+
 backend = {}
 
 function backend.spawn(h, opts)
@@ -1042,12 +1128,17 @@ function backend.tryWait(h)
     return nil, low                                     -- WIFSIGNALED
 end
 
+-- Both of these are last-line guards: a pid whose child has been reaped belongs to
+-- the kernel again and may already have been handed to an unrelated process of this
+-- user.  Never signal one.
 function backend.signalGraceful(h)
+    if h._reaped or h._exited then return true end
     C.kill(h._pid, SIGTERM)
     return true
 end
 
 function backend.forceKill(h)
+    if h._reaped or h._exited then return end
     C.kill(h._pid, SIGKILL)
 end
 
@@ -1106,6 +1197,13 @@ function Handle:write(data)
     data = tostring(data)
     if self._stdinGone then return nil, 'stdin is closed' end
     if self._stdinClosePending then return nil, 'stdin is closing' end
+    -- A worker that stops reading stdin (wedged, stopped, or merely busy) would
+    -- otherwise make the hub buffer every byte it sends it, with no error and no
+    -- bound.  Refuse instead, so the caller can back off or restart the worker.
+    if self._stdinQLen + #data > self.maxStdinQueue then
+        return nil, ('stdin queue full (%d + %d > %d bytes)')
+                    :format(self._stdinQLen, #data, self.maxStdinQueue)
+    end
     if #data > 0 then
         self._stdinQ[#self._stdinQ + 1] = data
         self._stdinQLen = self._stdinQLen + #data
@@ -1200,12 +1298,11 @@ function Handle:poll()
         if not self._errEof then self:_drain('stderr') end
     end
 
-    -- forceful escalation of a graceful stop
-    if self._killAt and not self._killed and sys.nowMs() >= self._killAt then
-        self._killed = true
-        backend.forceKill(self)
-    end
-
+    -- Reap FIRST.  The escalation below must never fire at a pid we no longer own:
+    -- once waitpid() has reaped the child the pid is free for reuse, yet the handle
+    -- stays out of _done for the whole drain window (a grandchild can hold the
+    -- capture pipe open), and kill(pid, SIGKILL) would then hit whatever process of
+    -- this user happens to have inherited the number.
     if not self._exited then
         local code, signal = backend.tryWait(self)
         if code ~= nil or signal ~= nil then
@@ -1214,10 +1311,19 @@ function Handle:poll()
             self._signal  = signal
             self._endMs   = sys.nowMs()
             self._drainAt = self._endMs + self.drainMs
+            self._killAt  = nil
         end
     end
 
+    -- forceful escalation of a graceful stop
+    if self._killAt and not self._killed and not self._exited and not self._reaped
+       and sys.nowMs() >= self._killAt then
+        self._killed = true
+        backend.forceKill(self)
+    end
+
     if self._exited then
+        self._killAt = nil
         -- The process is gone but its output may still be sitting in the pipe.
         -- Keep draining until both pipes report EOF, or the drain window ends
         -- (a grandchild could hold the write end open forever).
@@ -1245,14 +1351,44 @@ function Handle:poll()
     return 'running'
 end
 
---- Ask the child to stop.  NON-BLOCKING: the forceful escalation happens in a
---- later poll().  Graceful means, in order:
+-- The escalation from "asked to stop" to SIGKILL / TerminateProcess is applied by
+-- poll().  Relying on the caller to happen to call poll() after the grace expires
+-- means a child that ignores SIGTERM outlives its grace window whenever the poll
+-- cadence lapses (a busy reactor turn, a hub that only polls on demand, a shutdown
+-- path that stops several children and then waits).  So stop() also arms a one-shot
+-- timer on lib/sched.lua when one is available: the deadline is then enforced by the
+-- reactor itself, and poll() remains the fallback for a program without a reactor.
+local schedMod            -- nil = not looked for yet, false = not available
+local function armEscalation(h, ms)
+    if h._escalationArmed then return end
+    if schedMod == nil then
+        local ok, m = pcall(require, 'lib.sched')
+        schedMod = (ok and type(m) == 'table' and type(m.after) == 'function') and m or false
+    end
+    if not schedMod then return end
+    h._escalationArmed = true
+    local ok = pcall(schedMod.after, ms + 1, function()
+        h._escalationArmed = false
+        if h._done then return end
+        pcall(h.poll, h)
+        -- The kill itself is asynchronous: the child still has to die and be
+        -- reaped, and the pipes still have to reach EOF.  Follow up a bounded
+        -- number of times so the handle really leaves the registry even in a
+        -- program whose only heartbeat is the reactor.
+        h._escalationTicks = (h._escalationTicks or 0) + 1
+        if not h._done and h._escalationTicks < 60 then armEscalation(h, 50) end
+    end)
+    if not ok then h._escalationArmed = false end
+end
+
+--- Ask the child to stop.  NON-BLOCKING: the forceful escalation happens on the
+--- sched timer armed here, or in a later poll().  Graceful means, in order:
 ---   1. opts.stopCommand written to stdin (if configured)
 ---   2. stdin closed -> the child sees EOF        (unless closeStdinOnStop=false)
 ---   3. POSIX only: SIGTERM
 --- and after graceMs, TerminateProcess / SIGKILL.
 function Handle:stop(graceMs)
-    if self._done or self._exited then return true end
+    if self._done or self._exited or self._reaped then return true end
     graceMs = tonumber(graceMs) or process.DEFAULT_GRACE_MS
     if graceMs < 0 then graceMs = 0 end
     if not self._stopping then
@@ -1270,13 +1406,15 @@ function Handle:stop(graceMs)
     if graceMs == 0 then
         self._killed = true
         backend.forceKill(self)
+    else
+        armEscalation(self, graceMs)
     end
     return true
 end
 
 --- Kill now, no grace.
 function Handle:kill()
-    if self._done or self._exited then return true end
+    if self._done or self._exited or self._reaped then return true end
     self._stopping = true
     self._killed   = true
     backend.forceKill(self)
@@ -1308,6 +1446,23 @@ function process.spawn(opts)
     local cmd, err = normaliseCmd(opts.cmd)
     if not cmd then return nil, err end
 
+    -- A secret in argv is not a secret: on Linux /proc/<pid>/cmdline is mode 0444, so
+    -- every local user and every `ps` reads it for as long as the child lives (and
+    -- h:describe()'s '***' only ever affected OUR log line, never the argv the kernel
+    -- publishes).  Refuse it here so the hub cannot regress into doing it, and use
+    -- the private stdin pipe instead:
+    --     process.spawn{ cmd = { worker, '--proxy=host:port' },
+    --                    stdinData = 'proxy-auth ' .. user .. ':' .. pass .. '\n' }
+    -- opts.allowSecretsInArgv = true is the deliberate, documented override.
+    local redactPatterns = opts.redact or DEFAULT_REDACT
+    if not opts.allowSecretsInArgv then
+        local at, which = secretInArgv(cmd, redactPatterns)
+        if at then
+            return nil, ('process.spawn: refusing to place a secret in argv (%s, argument %d)'
+                         .. ' -- pass it on stdin with opts.stdinData'):format(which, at)
+        end
+    end
+
     local env
     env, err = normaliseEnv(opts.env)
     if opts.env ~= nil and not env then return nil, err end
@@ -1326,7 +1481,10 @@ function process.spawn(opts)
     h.onExit            = opts.onExit
     h.stopCommand       = opts.stopCommand
     h.closeStdinOnStop  = opts.closeStdinOnStop
-    h.maxLineBytes      = tonumber(opts.maxLineBytes) or process.DEFAULT_MAX_LINE
+    -- 0 (a plausible spelling of "no limit") used to hang the reactor in feedLines
+    h.maxLineBytes      = math.max(1024, tonumber(opts.maxLineBytes)
+                                         or process.DEFAULT_MAX_LINE)
+    h.maxStdinQueue     = math.max(4096, tonumber(opts.maxStdinQueue) or (1024 * 1024))
     h.drainMs           = tonumber(opts.drainMs) or 2000
     h.name              = opts.name
     -- Linux only: SIGTERM when the hub dies.  opts.deathSignal = false disables,
@@ -1334,7 +1492,7 @@ function process.spawn(opts)
     if opts.deathSignal == false then h.deathSignal = 0
     elseif type(opts.deathSignal) == 'number' then h.deathSignal = opts.deathSignal
     else h.deathSignal = 15 end
-    h.redactedCmd       = redactCmd(cmd, opts.redact or DEFAULT_REDACT)
+    h.redactedCmd       = redactCmd(cmd, redactPatterns, opts.secretArgs)
 
     h._stdinQ, h._stdinQLen = {}, 0
     h._tailOut, h._tailErr  = '', ''
@@ -1411,5 +1569,7 @@ sys.atExit(function() pcall(process.reapAll, 1500) end)
 -- exposed for the test suite
 process._feedLines = feedLines
 process._redactCmd = redactCmd
+process._secretInArgv = secretInArgv
+process._backend = backend       -- so a test can observe that forceKill is NOT called
 
 return process

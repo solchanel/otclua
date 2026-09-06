@@ -300,7 +300,12 @@ local function withServer(opts, fn)
         maxHeaderBytes = opts.maxHeaderBytes or 4096,
         maxBodyBytes = opts.maxBodyBytes or (64 * 1024),
         idleTimeoutMs = opts.idleTimeoutMs or 15000,
+        headerTimeoutMs = opts.headerTimeoutMs or 15000,
+        requestTimeoutMs = opts.requestTimeoutMs or 15000,
+        allowBareLF = opts.allowBareLF,
+        allowedHosts = opts.allowedHosts,
         maxRequests = opts.maxRequests or 100,
+        maxConnections = opts.maxConnections,
         maxWriteBacklog = opts.maxWriteBacklog,
         sendBufferBytes = opts.sendBufferBytes,
         sweepMs = opts.sweepMs or 100,
@@ -1028,6 +1033,327 @@ runSuite('throughput (trivial handler)', function()
         note('%s', benchLine)
         check(done > 100, 'the benchmark completed a meaningful number of requests', done)
         check(rps > 50, 'throughput is sane', string.format('%.0f req/s', rps))
+    end)
+end)
+
+-- ============================================ 11. review regressions (hub) ==
+-- One block per finding from the adversarial review of the hub primitives.  Each
+-- of these FAILS against the code as it was reviewed and passes against the fix.
+
+-- BLOCKER 1: a socket handed to another protocol stayed in server.conns, so the
+-- idle sweep wrote a raw "HTTP/1.1 408" into the middle of the established stream
+-- and closed the TCP connection behind the new owner's back.
+runSuite('res:upgrade() detaches the connection (blocker)', function()
+    local taken = {}
+    local opts = {
+        idleTimeoutMs = 200, sweepMs = 40, headerTimeoutMs = 500,
+        onRequest = function(req, res)
+            if req.path == '/ws' then
+                local sock, pending = res:upgrade()
+                taken[#taken + 1] = { sock = sock, pending = pending, req = req }
+                return
+            end
+            return res:text(200, 'plain')
+        end,
+    }
+    withServer(opts, function(s, port)
+        local c = newClient(port)
+        -- the bytes past the header block must come back as `pending`
+        c:rawNoExpect('GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\n' ..
+                      'Upgrade: websocket\r\nConnection: Upgrade\r\n\r\nLEFTOVER-BYTES')
+        check(pump(function() return #taken == 1 end, 2000), 'the route ran and detached')
+        local t = taken[1]
+        check(t and t.sock ~= nil, 'res:upgrade() returned the socket')
+        eq(t and t.pending, 'LEFTOVER-BYTES', 'and every byte read past the head')
+
+        eq(s:stats().connections, 0, 'the detached connection is gone from stats()')
+        eq(s:stats().active, 0, '   and from the live count that maxConnections uses')
+        eq(s:stats().upgrades, 1, 'the upgrade is counted separately')
+
+        -- survive well past idleTimeoutMs (200 ms): the sweep must not touch it
+        pump(nil, 900)
+        eq(s:stats().connections, 0, 'still not tracked after several sweeps')
+        check(not c.closed, 'the socket the new owner holds is still open')
+        eq(#c.responses, 0, 'no HTTP response was ever written to it')
+        check(not (c.rx or ''):find('408', 1, true),
+              'no 408 was injected into the handed-over stream', tostring(c.rx))
+
+        -- it is a working socket: the new owner speaks its own protocol on it
+        t.sock:send('OWNED-BY-THE-NEW-PROTOCOL')
+        check(pump(function() return (c.rx or ''):find('OWNED', 1, true) ~= nil end, 2000),
+              'the new owner can still write to the peer')
+
+        -- other connections are unaffected
+        local c2 = newClient(port)
+        c2:request('GET', '/plain')
+        check(waitFor(c2, 1, 2000), 'the server still serves everybody else')
+        eq(take(c2).status, 200, '   with a normal response')
+
+        -- closing is the new owner's job, and doing it must not double-close
+        t.sock:close()
+        s:stop()                       -- must not touch the detached socket either
+        pump(nil, 50)
+        check(true, 'closing the detached socket and stopping the server is clean')
+    end)
+end)
+
+-- MAJOR: idleTimeoutMs is a SLIDING window that any byte resets, so one byte per
+-- (idleTimeout/2) held a connection, and its buffered body, forever.
+runSuite('absolute request deadlines (slow loris)', function()
+    withServer({ idleTimeoutMs = 30000, headerTimeoutMs = 250,
+                 requestTimeoutMs = 400, sweepMs = 40 }, function(s, port)
+        -- a head delivered one byte per 60 ms: every byte resets `last`, so only an
+        -- absolute deadline can ever end this
+        local c = newClient(port)
+        local head = 'GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Pad: '
+        local sent = 0
+        local t0 = sys.nowMs()
+        while sys.nowMs() - t0 < 1200 and not c.closed do
+            sent = sent + 1
+            c:rawNoExpect(head:sub(sent, sent) ~= '' and head:sub(sent, sent) or 'a')
+            pump(nil, 60)
+        end
+        check(c.closed or #c.responses > 0, 'the drip-fed connection was ended',
+              ('after %d bytes'):format(sent))
+        local r = c.responses[1]
+        eq(r and r.status, 408, 'with 408 Request Timeout')
+        check(s:stats().deadlines >= 1, 'stats counted an absolute deadline',
+              s:stats().deadlines)
+        check(pump(function() return s:stats().active == 0 end, 2000),
+              'and the connection slot was returned', s:stats().active)
+
+        -- a complete head, then a body dribbled forever: requestTimeoutMs is the cap
+        local c2 = newClient(port)
+        c2:raw('POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 400\r\n\r\n', 'POST')
+        local t1 = sys.nowMs()
+        while sys.nowMs() - t1 < 1500 and #c2.responses == 0 do
+            c2:rawNoExpect('x')
+            pump(nil, 60)
+        end
+        eq(c2.responses[1] and c2.responses[1].status, 408,
+           'a body that never ends hits the request deadline')
+    end)
+
+    -- and the absolute head deadline must NOT break ordinary keep-alive idling
+    withServer({ idleTimeoutMs = 2000, headerTimeoutMs = 150, sweepMs = 40 },
+    function(s, port)
+        local c = newClient(port)
+        c:request('GET', '/hello')
+        check(waitFor(c, 1, 2000), 'first request answered')
+        take(c)
+        pump(nil, 600)                 -- 4x headerTimeoutMs of doing nothing
+        eq(s:stats().active, 1, 'an idle keep-alive connection is not killed by it')
+        c:request('GET', '/hello')
+        check(waitFor(c, 1, 2000), 'and it is still usable')
+        eq(take(c).body, 'hello GET', '   second request on the same connection')
+    end)
+end)
+
+-- MAJOR: the chunked decoder rebuilt the input buffer once per chunk-size line,
+-- once per data take and once per terminator -- O(bytes^2 / chunkSize).
+runSuite('chunked decoding is linear in the bytes received', function()
+    withServer({ maxBodyBytes = 1024 * 1024 }, function(s, port)
+        local N = 131072                      -- a 128 KB body delivered as 131072 1-byte chunks
+        local parts = { 'POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\n',
+                        'Transfer-Encoding: chunked\r\n\r\n' }
+        for _ = 1, N do parts[#parts + 1] = '1\r\nz\r\n' end
+        parts[#parts + 1] = '0\r\n\r\n'
+        local wire = table.concat(parts)
+        local c = newClient(port)
+        local t0 = sys.nowMs()
+        c:raw(wire, 'POST')
+        local ok = waitFor(c, 1, 20000)
+        local elapsed = sys.nowMs() - t0
+        check(ok, 'the 1-byte-chunk body was answered')
+        local d = ok and json.decode(take(c).body)
+        eq(d and d.len, N, 'every chunk arrived exactly once')
+        eq(d and d.body, string.rep('z', N), '   and in order')
+        note('%d one-byte chunks (%.0f KB on the wire) decoded in %d ms',
+             N, #wire / 1024, elapsed)
+        -- measured on this machine: 1290 ms with the O(n^2) decoder, 61 ms with the fix
+        check(elapsed < 400, 'decoding stayed linear', elapsed .. ' ms')
+    end)
+end)
+
+-- MAJOR: chunk-size was a PREFIX match, so "5junk" was 5 and "0x5" was 0 -- the
+-- last chunk -- after which the real body was eaten as trailers and the bytes
+-- behind it were dispatched as a pipelined request.
+runSuite('chunk-size lines are parsed whole (request smuggling)', function()
+    withServer(nil, function(s, port)
+        local seen = 0
+        local c = newClient(port)
+        c:raw('POST /echo HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n' ..
+              '5junk\r\nHELLO\r\n0\r\n\r\n', 'POST')
+        check(waitFor(c, 1, 2000), 'answered')
+        eq(take(c).status, 400, 'junk after the hex chunk size -> 400')
+
+        local c2 = newClient(port)
+        c2:raw('POST /E HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n' ..
+               '0x5\r\nHELLO\r\n0\r\n\r\n' ..
+               'GET /SMUGGLED HTTP/1.1\r\nHost: h\r\n\r\n', 'POST')
+        check(waitFor(c2, 1, 2000), 'answered')
+        eq(take(c2).status, 400, '"0x5" is not a chunk size -> 400')
+        pump(nil, 200)
+        eq(#c2.responses, 0, 'and nothing behind it was dispatched as a second request')
+
+        -- a chunk extension is still legal
+        local c3 = newClient(port)
+        c3:raw('POST /echo HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n' ..
+               '4;name=value\r\nabcd\r\n0\r\n\r\n', 'POST')
+        check(waitFor(c3, 1, 2000), 'chunk extension answered')
+        local d = json.decode(take(c3).body)
+        eq(d and d.body, 'abcd', '   and decoded normally')
+
+        -- an absurdly long hex value cannot reach tonumber
+        local c4 = newClient(port)
+        c4:raw('POST /echo HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n' ..
+               string.rep('f', 20) .. '\r\n', 'POST')
+        check(waitFor(c4, 1, 2000), 'answered')
+        eq(take(c4).status, 400, 'a 20-digit chunk size -> 400')
+    end)
+end)
+
+-- MAJOR: a bare LF was accepted as framing in three places.  Behind a proxy that
+-- requires CRLF, that is a request-smuggling desync (RFC 9112 2.2).
+runSuite('framing is CRLF only (bare LF is not a line terminator)', function()
+    local seen
+    local function recorder(req, res)
+        seen[#seen + 1] = req.method .. ' ' .. req.rawPath
+        return res:text(200, 'dispatched')
+    end
+    withServer({ onRequest = recorder, headerTimeoutMs = 400, sweepMs = 40 },
+    function(s, port)
+        seen = {}
+        -- an LF-only message is not a message at all: it never terminates, so it is
+        -- never parsed and the absolute head deadline eventually closes it
+        local c = newClient(port)
+        c:raw('POST /A HTTP/1.1\nHost: h\nContent-Length: 5\n\nHELLO', 'POST')
+        pump(nil, 300)
+        eq(#seen, 0, 'a request framed entirely with bare LF is never dispatched')
+        check(pump(function() return #c.responses > 0 or c.closed end, 2000),
+              'the head deadline ends it')
+        eq(c.responses[1] and c.responses[1].status, 408, '   with 408, not 200')
+
+        seen = {}
+        local c2 = newClient(port)
+        c2:raw('GET /B1 HTTP/1.1\nHost: h\n\nGET /B2 HTTP/1.1\nHost: h\n\n', 'GET')
+        pump(nil, 300)
+        eq(#seen, 0, 'a bare-LF head cannot smuggle one request, let alone two')
+
+        seen = {}
+        local c3 = newClient(port)
+        c3:raw('POST /C HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n' ..
+               '5\nHELLO\n0\n\n', 'POST')
+        check(waitFor(c3, 1, 2000), 'answered')
+        eq(take(c3).status, 400, 'a chunked body framed with bare LF -> 400')
+        eq(#seen, 0, '   and the handler never saw it')
+
+        -- a single LF-terminated line inside an otherwise CRLF head is still a desync
+        seen = {}
+        local c4 = newClient(port)
+        c4:raw('GET /D HTTP/1.1\r\nHost: h\nX-Smuggle: 1\r\n\r\n', 'GET')
+        check(waitFor(c4, 1, 2000), 'answered')
+        eq(take(c4).status, 400, 'a single bare-LF header line -> 400')
+        eq(#seen, 0, '   and the handler never saw it either')
+    end)
+
+    -- opt-in tolerance for hand-typed clients
+    withServer({ allowBareLF = true }, function(s, port)
+        local c = newClient(port)
+        c:raw('GET /hello HTTP/1.1\nHost: h\n\n', 'GET')
+        check(waitFor(c, 1, 2000), 'answered')
+        eq(take(c).status, 200, 'opts.allowBareLF = true restores the old tolerance')
+    end)
+end)
+
+-- MINOR x2: the response framing was not authoritative -- a handler could set
+-- Content-Length itself (response desync) and a header set twice went out twice
+-- (browsers honour the FIRST Content-Type: stored XSS).
+runSuite('the server owns the response framing', function()
+    local function routes(req, res)
+        if req.path == '/dupCL' then
+            res:header('Content-Length', '0')
+            return res:send(200, 'PIPELINED-BODY-BYTES')
+        elseif req.path == '/dupCT' then
+            res:header('Content-Type', 'text/html')
+            return res:json(200, { a = 1 })
+        elseif req.path == '/cookies2' then
+            return res:send(200, 'ck', { ['Set-Cookie'] = { 'a=1', 'b=2' } })
+        end
+        return res:send(404, 'x')
+    end
+    withServer({ onRequest = routes }, function(s, port)
+        local function count(head, name)
+            local n = 0
+            for line in head:gmatch('[^\r\n]+') do
+                if line:lower():find('^' .. name .. ':') then n = n + 1 end
+            end
+            return n
+        end
+        local c = newClient(port)
+        c:request('GET', '/dupCL')
+        check(waitFor(c, 1, 2000), 'answered')
+        local r = take(c)
+        eq(count(r.head, 'content%-length'), 1, 'exactly one Content-Length')
+        eq(r.headers['content-length'], '20', '   and it is the real body length')
+        eq(r.body, 'PIPELINED-BODY-BYTES', '   so the peer stays in sync')
+
+        c:request('GET', '/dupCT')
+        check(waitFor(c, 1, 2000), 'answered')
+        r = take(c)
+        eq(count(r.head, 'content%-type'), 1, 'exactly one Content-Type')
+        eq(r.headers['content-type'], 'application/json; charset=utf-8',
+           '   and it is the one res:json chose (last writer wins)')
+
+        c:request('GET', '/cookies2')
+        check(waitFor(c, 1, 2000), 'answered')
+        r = take(c)
+        eq(count(r.head, 'set%-cookie'), 2, 'Set-Cookie is still allowed to repeat')
+    end)
+end)
+
+-- MINOR: a repeated Content-Length was merged into "5, 5", so the framing was safe
+-- but every handler saw a string tonumber() cannot read (RFC 9112 6.3: reject).
+runSuite('repeated framing headers are refused', function()
+    withServer(nil, function(s, port)
+        local c = newClient(port)
+        c:raw('POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n' ..
+              'Content-Length: 5\r\n\r\nHELLO', 'POST')
+        check(waitFor(c, 1, 2000), 'answered')
+        eq(take(c).status, 400, 'a duplicated Content-Length -> 400')
+
+        local c2 = newClient(port)
+        c2:raw('GET /hello HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n', 'GET')
+        check(waitFor(c2, 1, 2000), 'answered')
+        eq(take(c2).status, 400, 'a duplicated Host -> 400')
+
+        local c3 = newClient(port)
+        c3:raw('GET /hello HTTP/1.1\r\nHost: h\r\nAccept: a\r\nAccept: b\r\n\r\n', 'GET')
+        check(waitFor(c3, 1, 2000), 'answered')
+        eq(take(c3).status, 200, 'an ordinary header may still repeat')
+    end)
+end)
+
+-- BLOCKER 2 (the HTTP half): pinning Host is what closes DNS rebinding against a
+-- loopback-bound hub -- an Origin check alone cannot, because a rebound name makes
+-- the request genuinely same-origin.
+runSuite('opts.allowedHosts pins the authority (DNS rebinding)', function()
+    withServer({ allowedHosts = { '127.0.0.1', 'localhost' } }, function(s, port)
+        local c = newClient(port)
+        c:raw('GET /hello HTTP/1.1\r\nHost: 127.0.0.1:' .. port .. '\r\n\r\n', 'GET')
+        check(waitFor(c, 1, 2000), 'answered')
+        eq(take(c).status, 200, 'an allowed Host (with a port) is served')
+
+        local c2 = newClient(port)
+        c2:raw('GET /hello HTTP/1.1\r\nHost: rebind.evil.example\r\n\r\n', 'GET')
+        check(waitFor(c2, 1, 2000), 'answered')
+        eq(take(c2).status, 400, 'a Host that is not on the list -> 400')
+    end)
+    withServer(nil, function(s, port)
+        local c = newClient(port)
+        c:raw('GET /hello HTTP/1.1\r\nHost: anything.example\r\n\r\n', 'GET')
+        check(waitFor(c, 1, 2000), 'answered')
+        eq(take(c).status, 200, 'without the option any Host is accepted (default)')
     end)
 end)
 

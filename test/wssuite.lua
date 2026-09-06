@@ -327,6 +327,7 @@ do
     local key16 = base64.encode(srep('\7', 16))
     local function req(over)
         local h = { ['Host'] = 'localhost', ['Upgrade'] = 'websocket',
+                    ['Origin'] = 'http://localhost',
                     ['Connection'] = 'Upgrade', ['Sec-WebSocket-Key'] = key16,
                     ['Sec-WebSocket-Version'] = '13' }
         for k, v in pairs(over or {}) do
@@ -361,7 +362,7 @@ do
     local r8 = { method = 'get', headers = { ['upgrade'] = 'WebSocket',
                  ['CONNECTION'] = { 'keep-alive', 'Upgrade' },
                  ['sec-websocket-key'] = key16, ['Sec-Websocket-Version'] = ' 13 ' } }
-    eq(wsserver.checkRequest(r8), wsserver.acceptKey(key16),
+    eq(wsserver.checkRequest(r8, { allowNoOrigin = true }), wsserver.acceptKey(key16),
        'header names are matched case-insensitively, repeats are joined, values trimmed')
 
     -- subprotocol negotiation
@@ -449,6 +450,7 @@ local function newOffline(opts)
     local ws = assert(wsserver.upgrade(c, {
         method = 'GET', path = '/ws',
         headers = { Upgrade = 'websocket', Connection = 'Upgrade',
+                    Host = 'localhost', Origin = 'http://localhost',
                     ['Sec-WebSocket-Key'] = key, ['Sec-WebSocket-Version'] = '13' },
     }, o))
     c.mark = #c.out          -- everything up to here is the 101 response
@@ -684,7 +686,8 @@ do
         local ws = assert(wsserver.upgrade(c, { method = 'GET', headers = {
             Upgrade = 'websocket', Connection = 'Upgrade',
             ['Sec-WebSocket-Key'] = key, ['Sec-WebSocket-Version'] = '13' } },
-            { register = false, autoTimer = false, maxOutbox = 4096, fragmentSize = 512 }))
+            { register = false, autoTimer = false, allowNoOrigin = true,
+              maxOutbox = 4096, fragmentSize = 512 }))
         local closed, errs = {}, 0
         ws.onClose = function (_, cd, rs) closed.code, closed.reason = cd, rs end
         ws.onError = function () errs = errs + 1 end
@@ -809,6 +812,12 @@ local function newClient(port, opts)
         'Sec-WebSocket-Key: ' .. c.key,
         'Sec-WebSocket-Version: ' .. (opts.version or '13'),
     }
+    -- a browser always sends Origin; by default this client behaves like one that
+    -- was served BY the hub, i.e. same-origin (opts.origin overrides, opts.noOrigin
+    -- omits it entirely, which is what a non-browser client looks like)
+    if not opts.noOrigin then
+        lines[#lines + 1] = 'Origin: ' .. (opts.origin or ('http://127.0.0.1:' .. port))
+    end
     if opts.protocol then lines[#lines + 1] = 'Sec-WebSocket-Protocol: ' .. opts.protocol end
     s:send(concat(lines, '\r\n') .. '\r\n\r\n')
     return c
@@ -1288,6 +1297,309 @@ do
          :format(N, dt, throughput.rps, throughput.rps * 2, throughput.mib))
 
     c:close(); srv:stop()
+end
+
+-- ================================================ review regressions (hub) ==
+-- BLOCKER 2: the handshake never looked at Origin.  A browser attaches the hub's
+-- session cookie to a cross-site WebSocket and CORS does not apply, so without this
+-- any page the operator visits could drive an authenticated panel session.
+suite('origin policy (blocker)')
+do
+    local key16 = base64.encode(srep('\3', 16))
+    local function req(over)
+        local h = { Host = 'panel.example:8443', Upgrade = 'websocket',
+                    Connection = 'Upgrade', ['Sec-WebSocket-Key'] = key16,
+                    ['Sec-WebSocket-Version'] = '13',
+                    Origin = 'https://panel.example:8443' }
+        for k, v in pairs(over or {}) do if v == false then h[k] = nil else h[k] = v end end
+        return { method = 'GET', path = '/ws', headers = h }
+    end
+    local function status(r, o)
+        local a, e = wsserver.checkRequest(r, o)
+        if a then return 101 end
+        return e and e.status, e and e.message
+    end
+
+    -- the DEFAULT is same-origin, not allow-all
+    eq(status(req()), 101, 'default policy: a same-origin handshake is accepted')
+    eq(status(req({ Origin = 'https://evil.example' })), 403,
+       'default policy: a foreign Origin is refused with 403')
+    eq(status(req({ Origin = 'https://panel.example.evil.com' })), 403,
+       '   a suffix of the real host is still foreign')
+    eq(status(req({ Origin = 'https://panel.example:9999' })), 403,
+       '   the same host on another port is another origin')
+    eq(status(req({ Origin = 'null' })), 403, '   Origin: null (a sandboxed frame) is refused')
+    eq(status(req({ Origin = 'https://a.example https://b.example' })), 403,
+       '   two origins in one header are refused')
+
+    -- a missing Origin is a non-browser client: allowed only when asked for
+    eq(status(req({ Origin = false })), 403, 'a missing Origin is refused by default')
+    eq(status(req({ Origin = false }), { allowNoOrigin = true }), 101,
+       '   and accepted with allowNoOrigin = true')
+    eq(status(req({ Origin = '' })), 403, '   an empty Origin counts as missing')
+
+    -- explicit allow-lists
+    eq(status(req({ Origin = 'https://panel.example' }),
+              { allowedOrigins = { 'https://panel.example' } }), 101,
+       'allowedOrigins list: a listed origin is accepted')
+    eq(status(req({ Origin = 'https://Panel.Example:443' }),
+              { allowedOrigins = { 'https://panel.example' } }), 101,
+       '   case and the default port are normalised away')
+    eq(status(req({ Origin = 'http://localhost:8080' }),
+              { allowedOrigins = { 'localhost:8080' } }), 101,
+       '   a bare authority is a valid list entry')
+    eq(status(req({ Origin = 'https://evil.example' }),
+              { allowedOrigins = { 'https://panel.example' } }), 403,
+       '   anything else is 403 even when it matches Host')
+    eq(status(req({ Origin = 'https://evil.example', Host = 'evil.example' }),
+              { allowedOrigins = { 'https://panel.example' } }), 403,
+       '   including a request whose Host agrees with the foreign Origin')
+
+    -- predicate and the explicit wildcard
+    eq(status(req({ Origin = 'https://x.internal' }),
+              { allowedOrigins = function (o) return o:find('%.internal$') ~= nil end }), 101,
+       'allowedOrigins predicate: accepted')
+    eq(status(req({ Origin = 'https://x.example' }),
+              { allowedOrigins = function (o) return o:find('%.internal$') ~= nil end }), 403,
+       '   refused')
+    eq(status(req({ Origin = 'https://anything.example' }), { allowedOrigins = '*' }), 101,
+       "allowedOrigins = '*' opts out of the check deliberately")
+
+    -- the Origin check runs before the upgrade and nothing is upgraded
+    eq(status(req({ Origin = 'https://evil.example', Host = false })), 403,
+       'no Host to compare against is also a refusal, not a pass')
+
+    -- and the refusal is a real HTTP response on the socket, with no 101
+    local c = fakeConn()
+    local ws, msg, st = wsserver.upgrade(c, req({ Origin = 'https://evil.example' }),
+                                         { register = false, autoTimer = false })
+    eq(ws, nil, 'wsserver.upgrade refuses a cross-origin handshake')
+    eq(st, 403, '   with status 403')
+    local wire = concat(c.out)
+    check(wire:find('403', 1, true) ~= nil, '   and writes a 403 response', wire:sub(1, 40))
+    check(wire:find('101', 1, true) == nil, '   and never a 101')
+    check(msg and msg:find('evil.example', 1, true) ~= nil, '   naming the origin', msg)
+
+    -- maxConnections is a cap the hub can lean on now that upgraded sockets no
+    -- longer count against httpserver's own maxConnections
+    local held = newOffline()                  -- one registered live connection
+    local n = wsserver.count()
+    check(n >= 1, 'there is at least one live connection to count', n)
+    eq(status(req(), { maxConnections = n + 1 }), 101, 'maxConnections: below the cap, accepted')
+    eq(status(req(), { maxConnections = n }), 503, '   at the cap, refused with 503')
+    held:destroy(1000, 'done')
+    eq(status(req(), { maxConnections = n }), 101, '   and accepted again once one is freed')
+end
+
+suite('origin policy over a real connection')
+do
+    sched.reset()
+    local srv = startServer({ pingInterval = 0, idleTimeout = 0 })
+    local ok = newClient(srv.port)
+    check(runUntil(function () return ok.handshook end, 4000),
+          'a same-origin browser handshake is upgraded')
+    eq(ok.status, 101, '   101 Switching Protocols')
+
+    local evil = newClient(srv.port, { origin = 'https://evil.example' })
+    check(runUntil(function () return evil.status ~= nil end, 4000), 'the foreign origin answers')
+    eq(evil.status, 403, '   with 403 Forbidden')
+    eq(evil.handshook, false, '   and no upgrade happened')
+    eq(srv.rejected, 1, '   the server counted the rejection')
+
+    local nonBrowser = newClient(srv.port, { noOrigin = true })
+    check(runUntil(function () return nonBrowser.status ~= nil end, 4000),
+          'a client with no Origin at all answers')
+    eq(nonBrowser.status, 403, '   403 by default (allowNoOrigin is opt-in)')
+
+    ok:close(); evil:close(); nonBrowser:close(); srv:stop()
+
+    sched.reset()
+    local srv2 = startServer({ pingInterval = 0, idleTimeout = 0, allowNoOrigin = true })
+    local cli = newClient(srv2.port, { noOrigin = true })
+    check(runUntil(function () return cli.handshook end, 4000),
+          'allowNoOrigin = true lets a non-browser client in')
+    cli:close(); srv2:stop()
+end
+
+-- MAJOR: WS:feed() reset the idle timer (and cleared awaitingPong) on every BYTE,
+-- so a peer dribbling one byte per (idleTimeout/2) was immortal and could hold a
+-- half-delivered frame of up to maxMessage for as long as it liked.
+suite('idle and ping deadlines measure PROGRESS, not bytes')
+do
+    -- a controlled clock: wsserver reads sys.nowMs() through the module table
+    local realNow = sys.nowMs
+    local fake = realNow()
+    sys.nowMs = function () return fake end
+
+    local okAll, err = pcall(function ()
+        -- 1. dribbling one byte per 100 ms with a 300 ms idle timeout
+        local ws = newOffline({ idleTimeout = 300, pingInterval = 0, frameTimeout = 0 })
+        local closed = {}
+        ws.onClose = function (_, code, reason) closed.code, closed.reason = code, reason end
+        for _ = 1, 30 do
+            fake = fake + 100
+            ws:feed('\x82')                      -- one byte of a frame header
+            ws:_tick(fake)
+            if ws.state == 'closed' then break end
+        end
+        eq(ws.state, 'closed', 'a peer that only dribbles bytes is reaped by the idle timeout')
+        eq(closed.reason, 'idle timeout', '   with the idle-timeout reason')
+
+        -- 2. a complete frame IS progress and keeps the connection alive
+        local ws2, c2 = newOffline({ idleTimeout = 300, pingInterval = 0, frameTimeout = 0 })
+        local got = {}
+        ws2.onMessage = function (_, m) got[#got + 1] = m end
+        for _ = 1, 10 do
+            fake = fake + 100
+            ws2:feed(mkFrame(0x1, 'tick'))
+            ws2:_tick(fake)
+        end
+        eq(ws2.state, 'open', 'a peer that completes frames stays open')
+        eq(#got, 10, '   and every message was delivered')
+        drain(c2)
+
+        -- 3. a half-delivered frame gets its own deadline
+        local ws3 = newOffline({ idleTimeout = 0, pingInterval = 0, frameTimeout = 500 })
+        local closed3 = {}
+        ws3.onClose = function (_, code, reason) closed3.code, closed3.reason = code, reason end
+        local big = mkFrame(0x1, srep('x', 400))
+        ws3:feed(ssub(big, 1, 20))               -- the frame starts but never finishes
+        fake = fake + 200
+        ws3:_tick(fake)
+        eq(ws3.state, 'open', 'a frame still inside its delivery window is left alone')
+        fake = fake + 400
+        ws3:feed(ssub(big, 21, 30))              -- more bytes must not reset the deadline
+        ws3:_tick(fake)
+        eq(ws3.state, 'closed', 'a frame that never finishes is failed after frameTimeout')
+        eq(closed3.code, 1008, '   with 1008 (policy violation)')
+
+        -- 4. awaitingPong is cleared by a PONG, not by any inbound byte
+        local ws4 = newOffline({ idleTimeout = 0, pingInterval = 100, pongTimeout = 300,
+                                 frameTimeout = 0 })
+        local closed4 = {}
+        ws4.onClose = function (_, code, reason) closed4.code, closed4.reason = code, reason end
+        fake = fake + 150
+        ws4:_tick(fake)
+        eq(ws4.awaitingPong, true, 'the automatic ping went out')
+        fake = fake + 100
+        ws4:feed('\x8a')                         -- one byte: NOT a pong frame
+        ws4:_tick(fake)
+        eq(ws4.awaitingPong, true, '   a stray byte does not count as a pong')
+        fake = fake + 300
+        ws4:_tick(fake)
+        eq(ws4.state, 'closed', '   so the pong timeout still fires')
+        eq(closed4.reason, 'ping timeout', '   with the ping-timeout reason')
+
+        -- 5. and a real PONG does clear it
+        local ws5 = newOffline({ idleTimeout = 0, pingInterval = 100, pongTimeout = 300,
+                                 frameTimeout = 0 })
+        fake = fake + 150
+        ws5:_tick(fake)
+        eq(ws5.awaitingPong, true, 'ping sent')
+        ws5:feed(mkFrame(0xa, ''))
+        eq(ws5.awaitingPong, false, '   a PONG frame clears it')
+        fake = fake + 400
+        ws5:_tick(fake)
+        eq(ws5.state, 'open', '   and the connection survives')
+    end)
+    sys.nowMs = realNow
+    check(okAll, 'the deadline block ran', err)
+end
+
+-- MINOR: one Lua array slot per push meant ~9 bytes of structural overhead per
+-- BYTE when a peer delivered its payload one byte at a time.
+suite('the receive queue coalesces byte-at-a-time delivery')
+do
+    local q = wsserver._newQueue()
+    local N = 60000
+    for i = 1, N do q:push(schar(i % 256)) end
+    local slots = q.tail - q.head + 1
+    eq(q.len, N, 'every byte is accounted for')
+    check(slots <= N / 100, ('%d bytes are held in %d chunks, not %d'):format(N, slots, N),
+          slots)
+    -- and the bytes still come out in exactly the right order across the chunks
+    local head = q:peek(5)
+    eq(head, schar(1, 2, 3, 4, 5), 'peek() reads across coalesced chunks')
+    local all = q:take(N)
+    eq(#all, N, 'take() returns everything')
+    local wrong = 0
+    for i = 1, N do if sbyte(all, i) ~= i % 256 then wrong = wrong + 1 end end
+    eq(wrong, 0, '   byte for byte')
+    eq(q.len, 0, '   and the queue is empty afterwards')
+
+    -- a large push is never copied into the tail chunk
+    local q2 = wsserver._newQueue()
+    q2:push('ab')
+    q2:push(srep('z', 4096))
+    eq(q2.tail - q2.head + 1, 2, 'a 4 KB push gets its own slot (no quadratic copying)')
+end
+
+-- BLOCKER 1, end to end: lib/httpserver.lua hands a real socket over and forgets it.
+suite('end to end: httpserver upgrades to a websocket')
+do
+    sched.reset()
+    wsserver.rearmTimer()
+    local httpserver = require('lib.httpserver')
+    local live, closes = {}, {}
+    local wsopts = {
+        pingInterval = 0, idleTimeout = 0,
+        onOpen = function (ws) live[#live + 1] = ws end,
+        onMessage = function (ws, m) ws:send('echo:' .. m) end,
+        onClose = function (ws, code) closes[#closes + 1] = code end,
+    }
+    local route = httpserver.websocketRoute(wsserver, wsopts)
+    local hs = httpserver.new{
+        host = '127.0.0.1', port = 0, sched = sched,
+        idleTimeoutMs = 250, headerTimeoutMs = 250, requestTimeoutMs = 250, sweepMs = 40,
+        log = { debug = function () end, info = function () end,
+                warn = function () end, error = function () end },
+        onRequest = function (req, res)
+            if req.path == '/ws' then return route(req, res) end
+            return res:text(200, 'plain')
+        end,
+    }
+    local port = assert(hs:start())
+
+    local c = newClient(port)
+    check(runUntil(function () return c.handshook end, 4000),
+          'the HTTP server upgraded the connection')
+    eq(c.status, 101, '   101 Switching Protocols')
+    check(c:acceptOk(), '   with a correct Sec-WebSocket-Accept')
+    eq(#live, 1, '   and wsserver owns one connection')
+    eq(hs:stats().connections, 0, 'the upgraded socket is gone from the HTTP stats')
+    eq(hs:stats().upgrades, 1, '   counted as an upgrade instead')
+
+    c:sendFrame(0x1, 'hello')
+    check(runUntil(function () return #c.msgs > 0 end, 4000), 'a message round-trips')
+    eq(c.msgs[1] and c.msgs[1].data, 'echo:hello', '   through the handed-over socket')
+
+    -- the whole point: survive far longer than the HTTP idle timeout (250 ms)
+    runUntil(function () return false end, 1200)
+    eq(live[1] and live[1].state, 'open', 'still open 1.2 s later (5x idleTimeoutMs)')
+    eq(#closes, 0, '   and onClose never fired behind wsserver back')
+    check(not c.dead, '   the client still has a live socket')
+    check((c.rbuf or ''):find('408', 1, true) == nil,
+          '   and no 408 was injected into the frame stream')
+    c:sendFrame(0x1, 'again')
+    check(runUntil(function () return #c.msgs > 1 end, 4000), '   and it still echoes')
+
+    -- a refused handshake is answered on the HTTP layer, before any detach
+    local evil = newClient(port, { origin = 'https://evil.example' })
+    check(runUntil(function () return evil.status ~= nil end, 4000), 'a foreign origin answers')
+    eq(evil.status, 403, '   403 from the HTTP layer')
+    eq(hs:stats().upgrades, 1, '   and nothing was detached for it')
+
+    -- closing from the websocket side, then stopping the server: no double close
+    live[1]:close(1000, 'bye')
+    check(runUntil(function () return c.closeFrame ~= nil end, 4000),
+          'the close frame reaches the peer over the handed-over socket')
+    c:sendFrame(0x8, be16(1000) .. 'bye')                -- the peer echoes it
+    check(runUntil(function () return #closes > 0 end, 4000), 'the close handshake completes')
+    eq(closes[1], 1000, '   with the code we sent')
+    c:close(); evil:close()
+    hs:stop()
+    runUntil(function () return false end, 60)
+    check(true, 'server stop after an upgrade is clean')
 end
 
 suite('cleanup')

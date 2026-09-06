@@ -797,6 +797,203 @@ else
 end
 
 --=============================================================================
+-- Review regressions.  Each of these fails against the code as it was reviewed.
+--=============================================================================
+head('R1 poll() never signals a pid that has already been reaped')
+do
+    -- The escalation used to run BEFORE waitpid() and without checking whether the
+    -- child was already gone.  Once waitpid() has reaped it the pid belongs to the
+    -- kernel again -- but the handle stays out of _done for the whole drain window
+    -- (a grandchild can hold the capture pipe open), so kill(pid, SIGKILL) would
+    -- land on whatever process of this user had since been given that number.
+    local backend = process._backend
+    check(backend ~= nil, 'the backend is reachable for this test')
+    local h = process.spawn{ cmd = { LUAJIT, '-e', 'os.exit(0)' } }
+    check(h ~= nil, 'spawn succeeded')
+    if h and backend then
+        pumpUntil(function() return not h:isRunning() end, 15000)
+        eq(h:exitCode(), 0, 'the child exited and was reaped')
+        eq(h._killAt, nil, 'a handle that exited carries no pending kill deadline')
+
+        -- reproduce the drain window by hand: reaped, but not yet _done
+        local kills, realKill = 0, backend.forceKill
+        backend.forceKill = function() kills = kills + 1 end
+        h.onExit = nil
+        h._done, h._killed = false, false
+        h._killAt = sys.nowMs() - 1              -- a stop() armed before it exited
+        local ok = pcall(h.poll, h)
+        backend.forceKill = realKill
+        check(ok, 'poll() over a reaped handle does not raise')
+        eq(kills, 0, 'and it sends NO signal to the reaped pid')
+    end
+end
+
+--=============================================================================
+head('R2 the kill escalation is enforced by the reactor, not only by poll()')
+do
+    -- stop() used to leave the escalation entirely to whoever happened to call
+    -- poll(): a child that ignores SIGTERM outlived its grace whenever the poll
+    -- cadence lapsed.  Here NOTHING calls process.pollAll(): only sched ticks.
+    local sched = require('lib.sched')
+    sched.reset()
+    local out = {}
+    local h = process.spawn{
+        cmd = { LUAJIT, '-e', C_STUBBORN },
+        onLine = function(l, s) if s == 'stdout' then out[#out + 1] = l end end,
+    }
+    check(h ~= nil, 'spawn succeeded')
+    if h then
+        pumpUntil(function() return out[1] == 'ready' end, 15000)
+        eq(out[1], 'ready', 'the stubborn child is up')
+        local t0 = sys.nowMs()
+        h:stop(300)
+        -- drive ONLY the reactor
+        local deadline = sys.nowMs() + 6000
+        while sys.nowMs() < deadline and h:isRunning() do sched.tick(5) end
+        local dt = sys.nowMs() - t0
+        check(not h:isRunning(), 'the grace deadline was enforced without a single poll()',
+              ('%.0f ms'):format(dt))
+        check(dt >= 250, ('   after the grace period (%.0f ms)'):format(dt))
+        check(dt < 5000, ('   and promptly (%.0f ms)'):format(dt))
+        -- and it is fully reaped, not merely signalled
+        local deadline2 = sys.nowMs() + 3000
+        while sys.nowMs() < deadline2 and process.count() > 0 do sched.tick(5) end
+        eq(process.count(), 0, '   and the handle was reaped, leaving nothing registered')
+        if process.isLinux then eq(h:exitSignal(), 9, '   by SIGKILL') end
+    end
+    sched.reset()
+end
+
+--=============================================================================
+head('R3 Handle:write() has a bounded stdin queue')
+do
+    local h = process.spawn{
+        cmd = { LUAJIT, '-e', C_STUBBORN },       -- never reads stdin
+        maxStdinQueue = 128 * 1024,
+    }
+    check(h ~= nil, 'spawn succeeded')
+    if h then
+        local chunk = string.rep('x', 64 * 1024)
+        local refused, err, accepted = false, nil, 0
+        for _ = 1, 200 do
+            local ok, e = h:write(chunk)
+            if ok then accepted = accepted + 1
+            else refused, err = true, e; break end
+        end
+        check(refused, 'a worker that stops reading stdin cannot make the hub buffer forever',
+              ('accepted %d x 64 KiB'):format(accepted))
+        check(err and tostring(err):find('stdin queue full', 1, true) ~= nil,
+              '   and the caller is told why', tostring(err))
+        check(h:pendingStdin() <= 128 * 1024, '   the queue stayed inside the cap',
+              h:pendingStdin())
+        -- Draining that queue into a child that has since died must not raise
+        -- SIGPIPE, whose default disposition would kill the HUB (every other
+        -- worker with it).  Reaching this line at all is the assertion.
+        h:kill()
+        pumpUntil(function() return not h:isRunning() end, 15000)
+        local ok2, err2 = h:write('after the child is gone\n')
+        eq(ok2, nil, 'writing to a dead child fails instead of signalling the hub')
+        check(err2 ~= nil, '   with an error string', tostring(err2))
+        check(process.count() >= 0, '   and the supervisor is still alive')
+    end
+end
+
+--=============================================================================
+head('R4 maxLineBytes <= 0 cannot hang the reactor')
+do
+    -- feedLines used to loop forever with maxLine == 0 (emit '' and never shorten
+    -- the tail), and process.spawn accepted 0 because it is truthy in Lua.
+    local n = 0
+    local ok, err = pcall(process._feedLines, '', string.rep('a', 15), 0,
+                          function()
+                              n = n + 1
+                              if n > 1000 then error('feedLines did not terminate', 0) end
+                          end)
+    check(ok, 'feedLines terminates with maxLineBytes = 0', err)
+    check(n <= 1000, '   after a bounded number of emits', n)
+    local ok2 = pcall(process._feedLines, '', string.rep('a', 15), -5,
+                      function()
+                          n = n + 1
+                          if n > 2000 then error('feedLines did not terminate', 0) end
+                      end)
+    check(ok2, 'and with a negative maxLineBytes')
+
+    local h = process.spawn{ cmd = { LUAJIT, '-e', 'os.exit(0)' }, maxLineBytes = 0 }
+    check(h ~= nil, 'spawn with maxLineBytes = 0 succeeded')
+    if h then
+        check(h.maxLineBytes >= 1024, 'the value is clamped on the way in', h.maxLineBytes)
+        pumpUntil(function() return not h:isRunning() end, 15000)
+    end
+end
+
+--=============================================================================
+head('R5 a secret can no longer be placed in argv, and redaction is not a denylist')
+do
+    -- PANEL.md asks for --proxy-auth=user:pass; on Linux /proc/<pid>/cmdline is
+    -- mode 0444, so that is a public password for the life of the worker.
+    local h, err = process.spawn{
+        cmd = { LUAJIT, '-e', 'os.exit(0)', '--proxy-auth=hubuser:S3cr3tProxyPw' },
+    }
+    eq(h, nil, 'process.spawn refuses --proxy-auth=user:pass')
+    check(err and err:find('stdin', 1, true) ~= nil, '   and points at the stdin path', err)
+    check(err and err:find('proxy%-auth') ~= nil, '   naming the offending argument', err)
+
+    local h2, err2 = process.spawn{ cmd = { LUAJIT, '-e', 'os.exit(0)', '--proxyAuth:u:p' } }
+    eq(h2, nil, 'the camelCase / colon spelling is refused too')
+    local h3, err3 = process.spawn{ cmd = { LUAJIT, '-e', 'os.exit(0)', '--PASSWORD=x' } }
+    eq(h3, nil, 'and it is case-insensitive')
+    local h4 = process.spawn{ cmd = { LUAJIT, '-e', 'os.exit(0)', '--token', 'abc123' } }
+    eq(h4, nil, 'the two-element form (--token VALUE) is refused as well')
+
+    -- the escape hatch is explicit, and what it lets through is still masked
+    local h5 = process.spawn{
+        cmd = { LUAJIT, '-e', 'os.exit(0)', '--proxy-auth=hubuser:S3cr3tProxyPw' },
+        allowSecretsInArgv = true,
+    }
+    check(h5 ~= nil, 'allowSecretsInArgv = true is a deliberate override')
+    if h5 then
+        check(not h5:describe():find('S3cr3tProxyPw', 1, true),
+              '   and describe() still masks the value', h5:describe())
+        pumpUntil(function() return not h5:isRunning() end, 15000)
+    end
+
+    -- the ordinary path: the credential goes down the private stdin pipe
+    local got = {}
+    local h6 = process.spawn{
+        -- ('proxy=...' rather than '--proxy=...' only because LuaJIT itself would
+        -- try to parse a leading '--' as one of ITS options)
+        cmd = { LUAJIT, '-e', C_SECRET, 'proxy=127.0.0.1:8080' },
+        stdinData = 'hubuser:S3cr3tProxyPw\n',
+        onLine = function(l, s) if s == 'stdout' then got[#got + 1] = l end end,
+    }
+    check(h6 ~= nil, 'the same credential on stdin spawns normally')
+    if h6 then
+        pumpUntil(function() return not h6:isRunning() end, 15000)
+        eq(got[2], 'secret=hubuser:S3cr3tProxyPw', 'the worker read it from stdin')
+        check(not h6.cmdline:find('S3cr3tProxyPw', 1, true),
+              '   and it appears nowhere in argv', h6.cmdline)
+        check(h6.cmdline:find('proxy=127%.0%.0%.1:8080') ~= nil,
+              '   while the non-secret part is still on the command line', h6.cmdline)
+    end
+
+    -- redaction: case, ':' separators and camelCase are recognised now, and
+    -- secretArgs masks by position or value whatever the spelling
+    local r = process._redactCmd({ 'lj', 'main.lua', '--proxyAuth=u:p', '--PASSWORD:hunter2',
+                                   '-p', 'hunter2', '--character=Bob' },
+                                 { 'password', 'proxy%-auth', 'auth' },
+                                 { 6 })
+    eq(r[3], '--proxyAuth=***', 'camelCase --proxyAuth= is masked')
+    eq(r[4], '--PASSWORD:***', 'an upper-case flag with a colon separator is masked')
+    eq(r[6], '***', 'secretArgs masks -p\'s value, which no denylist could recognise')
+    eq(r[7], '--character=Bob', 'and nothing else is touched')
+    local r2 = process._redactCmd({ 'lj', '--url=https://u:hunter2@h/' }, { 'password' },
+                                  { 'hunter2' })
+    check(not table.concat(r2, ' '):find('hunter2', 1, true),
+          'a value listed in secretArgs is masked wherever it is embedded',
+          table.concat(r2, ' '))
+end
+
+--=============================================================================
 head('S18 no zombies, an empty registry, no globals')
 do
     eq(process.count(), 0, 'no handle is still registered')
